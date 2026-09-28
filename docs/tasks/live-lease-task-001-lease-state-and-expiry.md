@@ -1,6 +1,7 @@
 # Live Lease Task 001: Lease State And Expiry
 
-Status: Ready - 2026-09-27. It needs ADR 0002 to be Accepted.
+Status: Implemented - 2026-09-27. The review changed the lock order in
+`expire_leases` and `keepalive`. The commit message gives the reason.
 
 Every criterion is mechanical. This service has no user interface, so it has
 no visual criteria.

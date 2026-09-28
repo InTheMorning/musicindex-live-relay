@@ -1,6 +1,7 @@
 # Live Lease Task 002: Keepalive Route And Documents
 
-Status: Ready - 2026-09-27. It needs task 001.
+Status: Implemented - 2026-09-27. The review changed the lock order in
+`expire_leases` and `keepalive`. The commit message gives the reason.
 
 Every criterion is mechanical. This service has no user interface, so it has
 no visual criteria.
@@ -108,7 +109,7 @@ Read:
 - tests/api.rs
 - README.md
 - docs/interoperability.md
-- /home/citizen/.agents/skills/asd-ste100/SKILL.md (for all document prose)
+- ~/.agents/skills/asd-ste100/SKILL.md (for all document prose)
 
 Goal:
 - Add POST /v1/liveitems/{event_id}/keepalive and the lease fields on GET .../metadata. Document the contract.

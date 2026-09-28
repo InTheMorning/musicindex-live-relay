@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed - 2026-09-27.
+Accepted - 2026-09-27.
+
+Proposed 2026-09-27. The operator accepted it on the same day.
 
 This ADR comes from `docs/plans/live-lease-heartbeat-proposal.md`. It answers
 the five open questions in that proposal.
