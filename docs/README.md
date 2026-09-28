@@ -19,7 +19,7 @@ station runs continuously.
 
 - [ADR 0001: Reserved live items](adr/0001-reserved-live-items.md) — a durable
   event class for stations and repeating shows
-- [ADR 0002: A live event is a lease](adr/0002-live-lease.md) — Accepted. An
+- [ADR 0002: A live event is a lease](adr/0002-live-lease.md) — Implemented. An
   event goes off air when its broadcaster stops the keepalive
 
 ## Plans

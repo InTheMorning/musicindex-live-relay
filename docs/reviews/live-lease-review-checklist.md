@@ -37,4 +37,11 @@ Reviewed work:
 
 ## Review Result
 
-Status: Open - 2026-09-27. No packet is complete.
+Status: Pass - 2026-09-28. Both packets are merged, and each required check
+holds on `master`.
+
+The review changed the lock order in `expire_leases` and `keepalive`.
+`expire_leases` checks the lease again under the event write lock, so it never
+removes a snapshot that a publish wrote after the first check. The keepalive
+renews while it holds the read lock, so an expiry cannot remove the snapshot
+between its check and the renewal.

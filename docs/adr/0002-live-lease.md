@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted - 2026-09-27.
+Implemented - 2026-09-28.
+
+Implemented 2026-09-28: live lease tasks 001 and 002 are merged. The review is
+`docs/reviews/live-lease-review-checklist.md`.
+
+Accepted 2026-09-27.
 
 Proposed 2026-09-27. The operator accepted it on the same day.
 
