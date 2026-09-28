@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use musicindex_live_relay::{AppConfig, RelayState, app, spawn_cleanup_task};
+use musicindex_live_relay::{AppConfig, RelayState, app, spawn_cleanup_task, spawn_lease_task};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -17,6 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = RelayState::new(config);
 
     spawn_cleanup_task(state.clone());
+    spawn_lease_task(state.clone());
 
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "listening");

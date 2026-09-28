@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -6,8 +12,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use musicindex_live_relay::{
-    AppConfig, CreateEventResponse, LatestMetadataResponse, PublishMetadataResponse, RelayState,
-    app,
+    AppConfig, CreateEventResponse, KeepaliveResponse, LatestMetadataResponse,
+    PublishMetadataResponse, RelayState, app,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -16,6 +22,20 @@ use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     app(RelayState::new(AppConfig::for_tests()))
+}
+
+/// Builds a router backed by an injected, manually driven clock.
+///
+/// Returns the router, the `RelayState` handle (to call `expire_leases`
+/// directly), and the clock so a test can set the current time without a
+/// real sleep.
+fn test_app_with(config: AppConfig) -> (axum::Router, RelayState, Arc<AtomicU64>) {
+    let clock = Arc::new(AtomicU64::new(1));
+    let state = RelayState::with_clock(config, {
+        let clock = clock.clone();
+        Arc::new(move || clock.load(Ordering::SeqCst))
+    });
+    (app(state.clone()), state, clock)
 }
 
 async fn read_json<T: DeserializeOwned>(response: axum::response::Response) -> T {
@@ -83,6 +103,25 @@ async fn publish(
         )
         .await
         .expect("publish response")
+}
+
+async fn keepalive(
+    router: axum::Router,
+    event_id: &str,
+    token: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/liveitems/{event_id}/keepalive"));
+
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+
+    router
+        .oneshot(builder.body(Body::empty()).expect("keepalive request"))
+        .await
+        .expect("keepalive response")
 }
 
 async fn next_sse_chunk(body: &mut Body) -> String {
@@ -493,4 +532,188 @@ async fn reconnect_with_last_event_id_replays_only_missed_events() {
     let second = next_sse_chunk(&mut body).await;
     assert!(second.contains("id: 3"), "{second}");
     assert!(second.contains("\"index\":3"), "{second}");
+}
+
+#[tokio::test]
+async fn keepalive_returns_200_with_lease_fields() {
+    let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+    let created = create_event(router.clone()).await;
+
+    let response = publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        json!({"title": "Live"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = keepalive(router, &created.event_id, Some(&created.broadcaster_token)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: KeepaliveResponse = read_json(response).await;
+    assert_eq!(body.event_id, created.event_id);
+    assert!(!body.lease_expires_at.is_empty());
+    assert_eq!(body.keepalive_interval_secs, 30);
+}
+
+#[tokio::test]
+async fn keepalive_without_bearer_token_returns_401() {
+    let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+    let created = create_event(router.clone()).await;
+    publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        json!({"title": "Live"}),
+    )
+    .await;
+
+    let response = keepalive(router, &created.event_id, None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn keepalive_with_wrong_token_returns_403() {
+    let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+    let created = create_event(router.clone()).await;
+    publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        json!({"title": "Live"}),
+    )
+    .await;
+
+    let response = keepalive(router, &created.event_id, Some("wrong")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn keepalive_for_unknown_event_returns_404() {
+    let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+
+    let response = keepalive(router, "missing", Some("token")).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn keepalive_with_no_snapshot_returns_409() {
+    let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+    let created = create_event(router.clone()).await;
+
+    let response = keepalive(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = read_json(response).await;
+    assert_eq!(body["error"], "lease_expired");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/liveitems/{}/remoteValue", created.event_id))
+                .body(Body::empty())
+                .expect("remoteValue request"),
+        )
+        .await
+        .expect("remoteValue response");
+    let body: Value = read_json(response).await;
+    assert_eq!(body, json!({}));
+}
+
+#[tokio::test]
+async fn keepalive_after_expiry_returns_409_and_does_not_restore_snapshot() {
+    let (router, state, clock) = test_app_with(AppConfig {
+        lease: Duration::from_secs(10),
+        ..AppConfig::for_tests()
+    });
+    let created = create_event(router.clone()).await;
+
+    let response = publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        json!({"title": "Live"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    clock.store(11, Ordering::SeqCst); // renewed_at=1, now-renewed_at=10 >= lease
+    assert_eq!(state.expire_leases().await, 1);
+
+    let response = keepalive(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = read_json(response).await;
+    assert_eq!(body["error"], "lease_expired");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/liveitems/{}/remoteValue", created.event_id))
+                .body(Body::empty())
+                .expect("remoteValue request"),
+        )
+        .await
+        .expect("remoteValue response");
+    let body: Value = read_json(response).await;
+    assert_eq!(body, json!({}), "the removed snapshot must not come back");
+}
+
+#[tokio::test]
+async fn keepalive_returns_429_when_rate_limited() {
+    let (router, _state, _clock) = test_app_with(AppConfig {
+        max_publishes_per_event_per_sec: 1,
+        ..AppConfig::for_tests()
+    });
+    let created = create_event(router.clone()).await;
+
+    let response = publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        json!({"title": "Live"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = keepalive(router, &created.event_id, Some(&created.broadcaster_token)).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn latest_metadata_includes_renewed_at_and_lease_expires_at() {
+    let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+    let created = create_event(router.clone()).await;
+
+    let response = publish(
+        router.clone(),
+        &created.event_id,
+        Some(&created.broadcaster_token),
+        json!({"title": "Live"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                .body(Body::empty())
+                .expect("latest request"),
+        )
+        .await
+        .expect("latest response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: LatestMetadataResponse = read_json(response).await;
+    assert!(!body.renewed_at.is_empty());
+    assert!(!body.lease_expires_at.is_empty());
 }

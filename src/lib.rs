@@ -40,6 +40,8 @@ const DEFAULT_MAX_SSE_CONNECTIONS: usize = 1_000;
 const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC: u32 = 20;
 const DEFAULT_MAX_CREATES_PER_SEC: u32 = 50;
+const DEFAULT_LEASE_SECS: u64 = 90;
+const MIN_LEASE_SECS: u64 = 10;
 const METADATA_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const REPLAY_CAPACITY: usize = 100;
 const BROADCAST_CAPACITY: usize = 128;
@@ -54,6 +56,7 @@ pub struct AppConfig {
     pub ttl: Duration,
     pub max_publishes_per_event_per_sec: u32,
     pub max_creates_per_sec: u32,
+    pub lease: Duration,
 }
 
 impl AppConfig {
@@ -68,6 +71,7 @@ impl AppConfig {
                 DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
             )?,
             max_creates_per_sec: env_parse("MAX_CREATES_PER_SEC", DEFAULT_MAX_CREATES_PER_SEC)?,
+            lease: Duration::from_secs(parse_lease_secs()?),
         })
     }
 
@@ -79,8 +83,21 @@ impl AppConfig {
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             max_publishes_per_event_per_sec: DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
             max_creates_per_sec: DEFAULT_MAX_CREATES_PER_SEC,
+            lease: Duration::from_secs(DEFAULT_LEASE_SECS),
         }
     }
+}
+
+fn parse_lease_secs() -> Result<u64, ConfigError> {
+    let secs = env_parse("LEASE_SECS", DEFAULT_LEASE_SECS)?;
+    if secs < MIN_LEASE_SECS {
+        return Err(ConfigError {
+            key: "LEASE_SECS",
+            value: secs.to_string(),
+            message: format!("must be {MIN_LEASE_SECS} or more"),
+        });
+    }
+    Ok(secs)
 }
 
 #[derive(Debug)]
@@ -226,6 +243,7 @@ impl RelayState {
             ));
         }
         event.touch(now);
+        event.renew_lease(now);
 
         let mut inner = event.inner.write().await;
         inner.seq += 1;
@@ -253,7 +271,13 @@ impl RelayState {
             event_id: event_id.to_string(),
             accepted: true,
             seq,
+            lease_secs: self.inner.config.lease.as_secs(),
+            keepalive_interval_secs: self.keepalive_interval_secs(),
         })
+    }
+
+    fn keepalive_interval_secs(&self) -> u64 {
+        self.inner.config.lease.as_secs() / 3
     }
 
     pub async fn latest_metadata(
@@ -266,12 +290,64 @@ impl RelayState {
             .latest
             .clone()
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "metadata_not_found"))?;
+        drop(inner);
+
+        let renewed_at = event.renewed_at.load(Ordering::Relaxed);
+        let lease_expires_at = renewed_at + self.inner.config.lease.as_secs();
 
         Ok(LatestMetadataResponse {
             event_id: snapshot.event_id,
             seq: snapshot.seq,
             updated_at: snapshot.updated_at,
+            renewed_at: format_timestamp(renewed_at),
+            lease_expires_at: format_timestamp(lease_expires_at),
             metadata: snapshot.metadata,
+        })
+    }
+
+    /// Renews the lease of an event that a broadcaster keeps on air.
+    ///
+    /// The order of checks is: the event exists, the token matches, the
+    /// publish rate limit allows the request, and the event holds a
+    /// snapshot. Only a request that clears every check renews the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`, `403 invalid_token`,
+    /// `429 publish_rate_limited`, or `409 lease_expired`.
+    pub async fn keepalive(
+        &self,
+        event_id: &str,
+        token: &str,
+    ) -> Result<KeepaliveResponse, ApiError> {
+        let event = self.get_event(event_id).await?;
+        if !event.token_matches(token) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
+        }
+
+        let now = self.now();
+        if !event.try_acquire_publish_slot(now, self.inner.config.max_publishes_per_event_per_sec) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "publish_rate_limited",
+            ));
+        }
+
+        // Renew while the read lock is held. `expire_leases` needs the write
+        // lock to remove the snapshot, so it cannot remove it between this
+        // check and the renewal.
+        let inner = event.inner.read().await;
+        if inner.latest.is_none() {
+            return Err(ApiError::new(StatusCode::CONFLICT, "lease_expired"));
+        }
+        event.renew_lease(now);
+        drop(inner);
+        event.touch(now);
+
+        Ok(KeepaliveResponse {
+            event_id: event_id.to_string(),
+            lease_expires_at: format_timestamp(now + self.inner.config.lease.as_secs()),
+            keepalive_interval_secs: self.keepalive_interval_secs(),
         })
     }
 
@@ -326,6 +402,66 @@ impl RelayState {
         let before = events.len();
         events.retain(|_, event| event.last_activity.load(Ordering::Relaxed) >= cutoff);
         before - events.len()
+    }
+
+    /// Clears the snapshot of each event whose lease has expired.
+    ///
+    /// An event's lease expires when it holds a snapshot and
+    /// `now - renewed_at` is at least `LEASE_SECS`. Clearing a lease removes
+    /// the snapshot, advances `seq`, adds a `{}` update to the replay buffer,
+    /// and emits `{}` to the SSE and Socket.IO subscribers. An event with no
+    /// snapshot is left as is. Expiry never removes the event itself and
+    /// never changes its idle-TTL activity time.
+    ///
+    /// Returns the count of events cleared this way.
+    pub async fn expire_leases(&self) -> usize {
+        let now = self.now();
+        let lease_secs = self.inner.config.lease.as_secs();
+
+        let candidates: Vec<(String, Arc<LiveEventState>)> = self
+            .inner
+            .events
+            .read()
+            .await
+            .iter()
+            .map(|(event_id, event)| (event_id.clone(), Arc::clone(event)))
+            .collect();
+
+        let mut expired_count = 0;
+        for (event_id, event) in candidates {
+            let renewed_at = event.renewed_at.load(Ordering::Relaxed);
+            if now.saturating_sub(renewed_at) < lease_secs {
+                continue;
+            }
+
+            let mut inner = event.inner.write().await;
+            // Check the lease again under the write lock. A publish renews the
+            // lease before it takes this lock, so a publish that arrived after
+            // the first check is visible here, and its snapshot stays.
+            let renewed_at = event.renewed_at.load(Ordering::Relaxed);
+            if inner.latest.is_none() || now.saturating_sub(renewed_at) < lease_secs {
+                continue;
+            }
+            inner.latest = None;
+            inner.seq += 1;
+            let snapshot = MetadataSnapshot {
+                event_id: event_id.clone(),
+                seq: inner.seq,
+                updated_at: format_timestamp(now),
+                metadata: json!({}),
+            };
+            inner.replay.push_back(snapshot.clone());
+            while inner.replay.len() > REPLAY_CAPACITY {
+                inner.replay.pop_front();
+            }
+            drop(inner);
+
+            let _ = event.sender.send(snapshot);
+            self.emit_socket_remote_value(&event_id, &json!({})).await;
+            expired_count += 1;
+        }
+
+        expired_count
     }
 
     fn attach_socket_io(&self, io: SocketIo) {
@@ -386,6 +522,7 @@ fn unique_event_id(events: &HashMap<String, Arc<LiveEventState>>) -> String {
 struct LiveEventState {
     token_hash: [u8; 32],
     last_activity: AtomicU64,
+    renewed_at: AtomicU64,
     publish_window: AtomicU64,
     inner: RwLock<LiveEventInner>,
     sender: broadcast::Sender<MetadataSnapshot>,
@@ -403,6 +540,7 @@ impl LiveEventState {
         Self {
             token_hash,
             last_activity: AtomicU64::new(now),
+            renewed_at: AtomicU64::new(now),
             publish_window: AtomicU64::new(0),
             inner: RwLock::new(LiveEventInner {
                 seq: 0,
@@ -427,6 +565,10 @@ impl LiveEventState {
 
     fn touch(&self, now: u64) {
         self.last_activity.store(now, Ordering::Relaxed);
+    }
+
+    fn renew_lease(&self, now: u64) {
+        self.renewed_at.store(now, Ordering::Relaxed);
     }
 }
 
@@ -490,6 +632,8 @@ pub struct PublishMetadataResponse {
     pub event_id: String,
     pub accepted: bool,
     pub seq: u64,
+    pub lease_secs: u64,
+    pub keepalive_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,7 +641,16 @@ pub struct LatestMetadataResponse {
     pub event_id: String,
     pub seq: u64,
     pub updated_at: String,
+    pub renewed_at: String,
+    pub lease_expires_at: String,
     pub metadata: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeepaliveResponse {
+    pub event_id: String,
+    pub lease_expires_at: String,
+    pub keepalive_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,6 +704,7 @@ pub fn app(state: RelayState) -> Router {
         )
         .route("/v1/liveitems/{event_id}/remoteValue", get(remote_value))
         .route("/v1/liveitems/{event_id}/events", get(events))
+        .route("/v1/liveitems/{event_id}/keepalive", post(keepalive_route))
         .layer(CorsLayer::permissive())
         .with_state(state)
         .layer(socket_layer)
@@ -567,6 +721,24 @@ pub fn spawn_cleanup_task(state: RelayState) -> tokio::task::JoinHandle<()> {
             let expired = state.cleanup_expired().await;
             if expired > 0 {
                 tracing::info!(expired, "expired inactive live items");
+            }
+        }
+    })
+}
+
+/// Spawns the background task that expires leases each second.
+///
+/// The task calls [`RelayState::expire_leases`] on a one-second tick for the
+/// life of the process.
+pub fn spawn_lease_task(state: RelayState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+
+        loop {
+            ticker.tick().await;
+            let expired = state.expire_leases().await;
+            if expired > 0 {
+                tracing::info!(expired, "expired live leases");
             }
         }
     })
@@ -597,6 +769,15 @@ async fn latest_metadata(
     Path(event_id): Path<String>,
 ) -> Result<Json<LatestMetadataResponse>, ApiError> {
     Ok(Json(state.latest_metadata(&event_id).await?))
+}
+
+async fn keepalive_route(
+    AxumState(state): AxumState<RelayState>,
+    Path(event_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<KeepaliveResponse>, ApiError> {
+    let token = bearer_token(&headers)?;
+    Ok(Json(state.keepalive(&event_id, token).await?))
 }
 
 async fn remote_value(
@@ -752,6 +933,10 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     fn test_state(now: u64) -> (RelayState, Arc<AtomicU64>) {
+        test_state_with_lease(now, DEFAULT_LEASE_SECS)
+    }
+
+    fn test_state_with_lease(now: u64, lease_secs: u64) -> (RelayState, Arc<AtomicU64>) {
         let clock = Arc::new(AtomicU64::new(now));
         let state = RelayState::with_clock(
             AppConfig {
@@ -761,6 +946,7 @@ mod tests {
                 ttl: Duration::from_secs(10),
                 max_publishes_per_event_per_sec: DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
                 max_creates_per_sec: DEFAULT_MAX_CREATES_PER_SEC,
+                lease: Duration::from_secs(lease_secs),
             },
             {
                 let clock = clock.clone();
@@ -1073,5 +1259,166 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn publish_response_reports_default_lease_and_keepalive_interval() {
+        let (state, _) = test_state(1);
+        let created = state.create_event().await.expect("create event");
+
+        let response = state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"title": "Live"})),
+            )
+            .await
+            .expect("publish");
+
+        assert_eq!(response.lease_secs, DEFAULT_LEASE_SECS);
+        assert_eq!(response.keepalive_interval_secs, DEFAULT_LEASE_SECS / 3);
+    }
+
+    #[tokio::test]
+    async fn expire_leases_does_not_clear_a_snapshot_before_the_lease_duration() {
+        let (state, clock) = test_state_with_lease(1, 10);
+        let created = state.create_event().await.expect("create event");
+        state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"title": "Live"})),
+            )
+            .await
+            .expect("publish");
+
+        clock.store(10, Ordering::SeqCst); // renewed_at=1, now-renewed_at=9 < 10
+        assert_eq!(state.expire_leases().await, 0);
+
+        let latest = state
+            .latest_metadata(&created.event_id)
+            .await
+            .expect("snapshot still present");
+        assert_eq!(latest.metadata, json!({"title": "Live"}));
+    }
+
+    #[tokio::test]
+    async fn expire_leases_clears_the_snapshot_at_the_lease_duration() {
+        let (state, clock) = test_state_with_lease(1, 10);
+        let created = state.create_event().await.expect("create event");
+        state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"title": "Live"})),
+            )
+            .await
+            .expect("publish");
+
+        clock.store(11, Ordering::SeqCst); // renewed_at=1, now-renewed_at=10 >= 10
+        assert_eq!(state.expire_leases().await, 1);
+
+        let event = state.get_event(&created.event_id).await.expect("event");
+        let inner = event.inner.read().await;
+        assert!(inner.latest.is_none(), "snapshot should be cleared");
+        drop(inner);
+
+        let err = state
+            .latest_metadata(&created.event_id)
+            .await
+            .expect_err("expired event has no metadata");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, "metadata_not_found");
+    }
+
+    #[tokio::test]
+    async fn sse_reconnect_after_expiry_receives_empty_object() {
+        let (state, clock) = test_state_with_lease(1, 10);
+        let created = state.create_event().await.expect("create event");
+        let published = state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"title": "Live"})),
+            )
+            .await
+            .expect("publish");
+
+        clock.store(11, Ordering::SeqCst);
+        assert_eq!(state.expire_leases().await, 1);
+
+        let subscription = state
+            .subscribe(&created.event_id, Some(published.seq))
+            .await
+            .expect("subscribe with last-event-id before the expiry");
+
+        assert_eq!(subscription.replay.len(), 1);
+        let replayed = &subscription.replay[0];
+        assert_eq!(replayed.seq, published.seq + 1);
+        assert_eq!(replayed.metadata, json!({}));
+    }
+
+    #[tokio::test]
+    async fn publish_after_expiry_brings_the_event_back_on_air() {
+        let (state, clock) = test_state_with_lease(1, 10);
+        let created = state.create_event().await.expect("create event");
+        state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"title": "First"})),
+            )
+            .await
+            .expect("publish");
+
+        clock.store(11, Ordering::SeqCst);
+        assert_eq!(state.expire_leases().await, 1);
+
+        clock.store(12, Ordering::SeqCst);
+        state
+            .publish_metadata(
+                &created.event_id,
+                &created.broadcaster_token,
+                PublishMetadataRequest(json!({"title": "Back"})),
+            )
+            .await
+            .expect("publish after expiry");
+
+        let latest = state
+            .latest_metadata(&created.event_id)
+            .await
+            .expect("event is on air again");
+        assert_eq!(latest.metadata, json!({"title": "Back"}));
+    }
+
+    #[tokio::test]
+    async fn expire_leases_does_not_change_an_event_with_no_snapshot() {
+        let (state, clock) = test_state_with_lease(1, 10);
+        let created = state.create_event().await.expect("create event");
+
+        clock.store(1_000, Ordering::SeqCst);
+        assert_eq!(state.expire_leases().await, 0);
+
+        let event = state.get_event(&created.event_id).await.expect("event");
+        assert_eq!(event.last_activity.load(Ordering::Relaxed), 1);
+        assert!(event.inner.read().await.latest.is_none());
+    }
+
+    #[test]
+    fn lease_secs_below_minimum_is_a_configuration_error() {
+        // SAFETY: this test is the only one in the suite that reads or
+        // writes LEASE_SECS, so no other test races this mutation of the
+        // process environment.
+        unsafe {
+            std::env::set_var("LEASE_SECS", "5");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("LEASE_SECS");
+        }
+
+        let err = result.expect_err("a lease below the minimum is rejected");
+        assert!(err.to_string().contains("LEASE_SECS"));
     }
 }

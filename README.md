@@ -22,6 +22,7 @@ By default the relay binds to `127.0.0.1:8018`. It serves these routes at whatev
 ```text
 POST /v1/liveitems
 GET  /v1/liveitems/{event_id}/metadata
+POST /v1/liveitems/{event_id}/keepalive
 GET  /v1/liveitems/{event_id}/remoteValue
 GET  /v1/liveitems/{event_id}/events
 GET  /socket.io/*
@@ -30,6 +31,27 @@ GET  /socket.io/*
 The public URLs advertised in RSS should be based on the deployment's external origin. The `api.musicindex.org` examples below show the MusicIndex deployment, not a hosting requirement.
 
 All state is process-local. Restarting the process drops live items, broadcaster tokens, latest snapshots, and replay buffers.
+
+## The Lease
+
+Each event holds a lease in memory. A publish or a keepalive renews the
+lease and sets `renewed_at` to the current time. The event stays on air
+while it holds a snapshot and the time since `renewed_at` is less than
+`LEASE_SECS`.
+
+`LEASE_SECS` sets the lease duration. The default is 90 seconds. The value
+must be 10 seconds or more. The relay computes the keepalive interval as
+`LEASE_SECS / 3`, rounded down, and returns it to the broadcaster. The
+broadcaster does not select this interval.
+
+When a lease expires, the relay removes the event snapshot, advances
+`seq`, and sends `{}` one time to `remoteValue`, the SSE stream, and
+Socket.IO. The event itself stays. A reserved event keeps its identifier
+and its token. The next publish brings the event back on air.
+
+A background task checks all leases each second. No transport serves the
+removed snapshot after an expiry. The replay buffer does not serve it
+either.
 
 ## API
 
@@ -102,7 +124,7 @@ For compatibility with the widely used Socket.IO live value implementation, the 
 }
 ```
 
-On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, broadcasts a Socket.IO `remoteValue` event, and also broadcasts the same raw payload over SSE for fallback clients.
+On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, broadcasts a Socket.IO `remoteValue` event, and also broadcasts the same raw payload over SSE for fallback clients. The publish also renews the event lease. See "The Lease" above.
 
 Response:
 
@@ -110,9 +132,13 @@ Response:
 {
   "event_id": "<event_id>",
   "accepted": true,
-  "seq": 1
+  "seq": 1,
+  "lease_secs": 90,
+  "keepalive_interval_secs": 30
 }
 ```
+
+`lease_secs` is the current `LEASE_SECS` value. `keepalive_interval_secs` is the maximum time between a publish and the next keepalive.
 
 Status codes:
 
@@ -126,6 +152,38 @@ Status codes:
 The `Bearer` scheme is matched case-insensitively (`bearer`, `BEARER`, etc.).
 
 The relay distinguishes the wrapped form from the direct form by exact key match: a request body is treated as wrapped only when the JSON object has exactly the two keys `event_id` and `metadata`. Any object with additional keys (or different keys) is treated as a direct live value payload.
+
+### Keep The Event Alive
+
+```http
+POST /v1/liveitems/{event_id}/keepalive
+Authorization: Bearer <broadcaster_token>
+```
+
+A broadcaster sends a keepalive between publishes to keep the event lease
+alive. The relay ignores the request body. Send the request with no body.
+
+Response:
+
+```json
+{
+  "event_id": "<event_id>",
+  "lease_expires_at": "2026-09-27T18:00:00Z",
+  "keepalive_interval_secs": 30
+}
+```
+
+Status codes:
+
+- `401` when the bearer token is missing or malformed.
+- `403` when the bearer token is wrong.
+- `404` when the event does not exist.
+- `409` with error code `lease_expired` when the event holds no snapshot. Publish to bring the event back on air.
+- `429` when the per-event publish rate limit is exceeded. A keepalive shares this limit with a publish.
+
+The `Bearer` scheme is matched case-insensitively (`bearer`, `BEARER`, etc.), the same as a publish.
+
+A keepalive never restores a removed snapshot. Only a publish brings an event back on air.
 
 ### Read Latest Metadata
 
@@ -142,11 +200,16 @@ Response:
   "event_id": "<event_id>",
   "seq": 1,
   "updated_at": "2026-04-27T12:34:56Z",
+  "renewed_at": "2026-04-27T12:34:56Z",
+  "lease_expires_at": "2026-04-27T12:36:26Z",
   "metadata": {}
 }
 ```
 
-Returns `404` when the event does not exist or no metadata has been published yet.
+`renewed_at` is the time of the last publish or keepalive. `lease_expires_at` is `renewed_at` plus `LEASE_SECS`.
+
+Returns `404` when the event does not exist, no metadata has been
+published yet, or the event lease has expired. See "The Lease" above.
 
 The Socket.IO-compatible raw payload is also available at:
 
@@ -383,6 +446,7 @@ Configuration is read from environment variables.
 | `EVENT_TTL_SECS` | `86400` | Time before inactive events expire. |
 | `MAX_CREATES_PER_SEC` | `50` | Global cap on `POST /v1/liveitems` per second. Returns 429 when exceeded. |
 | `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Returns 429 when exceeded. |
+| `LEASE_SECS` | `90` | Lease duration for an event. Must be 10 or more. See "The Lease" above. |
 
 Metadata request bodies are limited to 64 KiB. The body limit applies only to `POST /v1/liveitems/{event_id}/metadata`; other routes are unconstrained.
 

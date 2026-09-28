@@ -59,6 +59,10 @@ fields in its event registry, because this service cannot list them later.
 `404` tells the operator that the event no longer exists. Keep that status code
 stable.
 
+A lease expiry also gives a `404`, with the error code `metadata_not_found`.
+The event continues to exist, and a new publish brings it back on air.
+See "A lease expires" below.
+
 ## Limits That Consumers Work Around
 
 ### State is in memory
@@ -78,6 +82,23 @@ default is 24 hours.
 An event therefore dies with no restart. A weekly show that reserves an
 identifier on Monday finds it gone on Saturday. Consumers see the same `404`
 for both death modes, so no consumer needs to separate them.
+
+### A lease expires
+
+ADR 0002 adds a lease to each event. A publish or a keepalive renews the
+lease. The broadcaster can stop before the idle TTL passes, and the event
+then goes off air immediately.
+
+A lease expiry removes the snapshot but keeps the event. `GET
+/v1/liveitems/{event_id}/metadata` then gives `404` with the error code
+`metadata_not_found`, not `event_not_found`. A client that reads the error
+code can tell a lease expiry from a removed event. A client that reads only
+the status code cannot.
+
+For `v4vmm`, a lease expiry means the event is off air. It does not mean
+the event is dead. The event identifier and the stored token do not become
+invalid. A broadcaster that resumes publishing brings the same event back
+on air with no new identifier.
 
 ### No list route and no delete route
 
