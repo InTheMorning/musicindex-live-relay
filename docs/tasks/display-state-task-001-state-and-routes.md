@@ -1,6 +1,6 @@
 # Display State Task 001: The Display State And Its Routes
 
-Status: Ready - 2026-10-04. Do after ADR 0001 task 005.
+Status: Implemented - 2026-10-04.
 
 Every criterion is mechanical.
 
@@ -110,3 +110,38 @@ not touch the live value routes or the ADRs. Run the test commands.
 
 At the end, report: 1. files changed 2. tests run 3. behavior changed
 4. deviations from task 5. unresolved concerns.
+
+## Review Result
+
+Reviewed 2026-10-04. The present tests did not change. `Cargo.lock` did not
+change. The full gate passes.
+
+The review added one change. The first version cleared the display state only
+when a lease expiry also cleared a snapshot. An event with a display state and
+no snapshot then kept its display state. ADR 0003 says that the display state
+clears when the lease ends. `expire_leases` now also clears the display state
+of an event with no snapshot. A test covers this case, and it fails when the
+clear is removed. The count that `expire_leases` gives still counts only the
+cleared snapshots.
+
+Lock order: the display code takes only the `display` lock. It never holds
+the `display` lock and the `inner` lock at the same time. It sends after it
+releases the lock.
+
+The review accepts these decisions of the task:
+
+- The display publish gives `{event_id, accepted, seq}`.
+- An expiry with a display state that is `null` already sends nothing.
+- The root of the body holds only `track`. An unknown key gives
+  `400 invalid_display`. Publisher display task 004 must not send the
+  `schema` key of `display.json`.
+- `README.md` and `docs/interoperability.md` changed in this task, not in
+  task 002.
+
+Known limits:
+
+- The replay buffer holds at most 100 display states of 8 KiB for each
+  reserved event. That is about 800 KiB. The memory limit in ADR 0003 counts
+  only the images.
+- Socket.IO has no runtime test. The display code has its own sender and
+  never calls the Socket.IO emit.

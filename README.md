@@ -28,6 +28,9 @@ GET  /v1/liveitems/{event_id}/metadata
 POST /v1/liveitems/{event_id}/keepalive
 GET  /v1/liveitems/{event_id}/remoteValue
 GET  /v1/liveitems/{event_id}/events
+POST /v1/liveitems/{event_id}/display
+GET  /v1/liveitems/{event_id}/display
+GET  /v1/liveitems/{event_id}/display/events
 GET  /socket.io/*
 ```
 
@@ -455,6 +458,134 @@ When `Last-Event-ID` is present and valid, the relay replays buffered events wit
 The replay buffer is in memory only. After a restart, a reserved item has an empty replay buffer, and its `seq` starts again at zero. See "Restart And Idle TTL" above.
 
 The stream also sends periodic keepalive comments.
+
+### Display State
+
+ADR 0003 adds an optional display path for a private app. Only a reserved
+item has a display state. The display path does not share data with the live
+value. `remoteValue`, `/events`, Socket.IO and the metadata route do not send
+a display state. A display route does not send a live value.
+
+A display state is one JSON object:
+
+```json
+{
+  "track": {
+    "artist": "Artist",
+    "title": "Title",
+    "artwork": { "sha256": "<64 lowercase hex characters>", "mime": "image/jpeg" }
+  }
+}
+```
+
+- The object has only the key `track`.
+- `track` is `null` when nothing plays. Send `null` explicitly.
+- A `track` object has only the keys `artist`, `title` and `artwork`.
+  `artist` and `title` are strings.
+- `artwork` has one of three forms:
+  - `{"sha256": "…", "mime": "…"}`. `sha256` is 64 lowercase hexadecimal
+    characters. `mime` is `image/jpeg` or `image/png`.
+  - `{"url": "…"}`. The URL uses `http` or `https`, and it has at most 2,048
+    characters. The relay does not fetch the image. A client loads it.
+  - `null` when the track has no image.
+
+The display state is in memory only. A restart gives `{"track": null}`, a
+display `seq` of zero and an empty display replay buffer.
+
+When the lease of an item expires, the relay also sets its display state to
+`{"track": null}` and sends that state on `/display/events`. If the display
+state is `{"track": null}` at the expiry, the relay sends nothing more. A display
+publish does not renew the lease. See "The Lease" above.
+
+#### Publish The Display State
+
+```http
+POST /v1/liveitems/{event_id}/display
+Authorization: Bearer <broadcaster_token>
+Content-Type: application/json
+```
+
+The body is a display state. The body limit is 8 KiB. A display publish uses
+the per-event publish rate limit, the same limit as a publish and a
+keepalive.
+
+Response:
+
+```json
+{
+  "event_id": "<event_id>",
+  "accepted": true,
+  "seq": 1
+}
+```
+
+`seq` is the sequence number of the display stream. It is not the `seq` of
+the live value.
+
+Status codes:
+
+- `200` when the relay accepts the display state.
+- `400` with error code `invalid_display` when the body is not a display
+  state. This includes a URL with a scheme that is not `http` or `https`,
+  and a URL that is longer than 2,048 characters.
+- `401` with error code `missing_bearer_token`, `invalid_bearer_token` or
+  `invalid_authorization_header` when the bearer token is missing or
+  malformed. These are the codes of a publish.
+- `403` with error code `invalid_token` when the bearer token is wrong.
+- `404` with error code `event_not_found` when the item does not exist.
+- `409` with error code `event_not_reserved` when the item is ephemeral.
+- `413` when the body is larger than 8 KiB. The error code is
+  `payload_too_large`. A request with a `Content-Length` header over the
+  limit gets `413` with a plain text body.
+- `429` with error code `publish_rate_limited` when the per-event publish
+  rate limit is exceeded.
+
+The relay examines the credential before the body. A body error does not come
+before a `401`, `403`, `404` or `409` answer.
+
+#### Read The Display State
+
+```http
+GET /v1/liveitems/{event_id}/display
+```
+
+Returns the present display state. Returns `{"track": null}` when the item
+has no display state.
+
+Status codes:
+
+- `200` with the display state.
+- `404` with error code `event_not_found` when the item does not exist.
+- `409` with error code `event_not_reserved` when the item is ephemeral.
+
+#### Subscribe To The Display State
+
+```http
+GET /v1/liveitems/{event_id}/display/events
+Accept: text/event-stream
+```
+
+Each display state comes as one SSE event:
+
+```text
+event: display
+id: <display seq>
+data: {"track":{"artist":"Artist","title":"Title","artwork":null}}
+```
+
+The stream has its own sequence number and its own replay buffer of the last
+100 display states. When `Last-Event-ID` is present and valid, the relay
+replays the display states with a display `seq` greater than that value. The
+stream sends no image bytes. A delete of the item ends the stream.
+
+Status codes:
+
+- `200` with the stream.
+- `404` with error code `event_not_found` when the item does not exist.
+- `409` with error code `event_not_reserved` when the item is ephemeral.
+- `503` with error code `max_sse_connections_reached` when the relay has
+  `MAX_SSE_CONNECTIONS` streams open. The display streams and the `/events`
+  streams share this limit.
 
 ## RSS `podcast:liveValue`
 

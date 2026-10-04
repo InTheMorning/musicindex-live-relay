@@ -26,7 +26,7 @@ and a private client can read both. Podcast apps see no change.
 | `src/lib.rs` | The display state, its routes and its SSE stream | 001 |
 | `src/lib.rs` | The image store, its routes and its limits | 002 |
 | `tests/api.rs` | A test for each route and each status code | 001, 002 |
-| `README.md`, `docs/interoperability.md` | The routes | 002 |
+| `README.md`, `docs/interoperability.md` | The display routes, then the artwork routes | 001, 002 |
 
 ## Sequence
 

@@ -17,7 +17,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State as AxumState},
+    extract::{Path, State as AxumState, rejection::BytesRejection},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -60,6 +60,12 @@ const DEFAULT_MAX_RESERVED_ITEMS: usize = 100;
 const MIN_ADMIN_TOKEN_BYTES: usize = 16;
 const RESERVE_BODY_LIMIT_BYTES: usize = 4 * 1024;
 const MAX_LABEL_CHARS: usize = 200;
+/// The body limit of a display publish (ADR 0003).
+const DISPLAY_BODY_LIMIT_BYTES: usize = 8 * 1024;
+/// The maximum length of an `artwork.url`, in characters (ADR 0003).
+const MAX_ARTWORK_URL_CHARS: usize = 2_048;
+/// The image types that an `artwork.mime` can name (ADR 0003).
+const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 
 /// The operator credential for the reserved item routes (ADR 0001).
 ///
@@ -683,6 +689,137 @@ impl RelayState {
         })
     }
 
+    /// Returns the stored identity and the live state of a reserved event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found` when the event does not exist, and
+    /// `409 event_not_reserved` for an ephemeral event (ADR 0003).
+    async fn get_reserved_entry(
+        &self,
+        event_id: &str,
+    ) -> Result<(StoredEvent, Arc<LiveEventState>), ApiError> {
+        let (stored, event) = self.get_entry(event_id).await?;
+        if stored.class != EventClass::Reserved {
+            return Err(ApiError::new(StatusCode::CONFLICT, "event_not_reserved"));
+        }
+        Ok((stored, event))
+    }
+
+    /// Publishes the display state of a reserved event (ADR 0003).
+    ///
+    /// The order of checks is: the event exists, the token matches, the
+    /// event is reserved, the body was read in full, the body is a valid
+    /// display state, and the publish rate limit allows the request. The
+    /// handler gives `body` as the result of the body read, so a body error
+    /// never comes before a credential error. A display publish does not renew the
+    /// lease and does not change `renewed_at`.
+    ///
+    /// The display lock is the only lock held during the update. It is
+    /// released before the update goes to the subscribers. The live value
+    /// lock is never taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`, `403 invalid_token`,
+    /// `409 event_not_reserved`, the error of `body`, `400 invalid_display`,
+    /// or `429 publish_rate_limited`.
+    pub async fn publish_display(
+        &self,
+        event_id: &str,
+        token: &str,
+        body: Result<Bytes, ApiError>,
+    ) -> Result<PublishDisplayResponse, ApiError> {
+        let (stored, event) = self.get_entry(event_id).await?;
+        if !stored.token_hash_matches(&hash_token(token)) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
+        }
+        if stored.class != EventClass::Reserved {
+            return Err(ApiError::new(StatusCode::CONFLICT, "event_not_reserved"));
+        }
+        let display = validate_display(&body?)?;
+
+        let now = self.now();
+        if !event.try_acquire_publish_slot(now, self.inner.config.max_publishes_per_event_per_sec) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "publish_rate_limited",
+            ));
+        }
+        event.touch(now);
+
+        let mut inner = event.display.write().await;
+        let update = inner.apply(display);
+        drop(inner);
+        let seq = update.seq;
+        let _ = event.display_sender.send(update);
+
+        Ok(PublishDisplayResponse {
+            event_id: event_id.to_string(),
+            accepted: true,
+            seq,
+        })
+    }
+
+    /// Returns the present display state of a reserved event, or
+    /// `{"track": null}` when it has none (ADR 0003).
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found` or `409 event_not_reserved`.
+    pub async fn display_state(&self, event_id: &str) -> Result<Value, ApiError> {
+        let (_, event) = self.get_reserved_entry(event_id).await?;
+        let state = event.display.read().await.state.clone();
+        Ok(state)
+    }
+
+    async fn subscribe_display(
+        &self,
+        event_id: &str,
+        last_event_id: Option<u64>,
+    ) -> Result<DisplaySubscription, ApiError> {
+        let previous = self.inner.sse_connections.fetch_add(1, Ordering::AcqRel);
+        if previous >= self.inner.config.max_sse_connections {
+            self.inner.sse_connections.fetch_sub(1, Ordering::AcqRel);
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "max_sse_connections_reached",
+            ));
+        }
+
+        let event = match self.get_reserved_entry(event_id).await {
+            Ok((_, event)) => event,
+            Err(err) => {
+                self.inner.sse_connections.fetch_sub(1, Ordering::AcqRel);
+                return Err(err);
+            }
+        };
+
+        event.touch(self.now());
+        let replay = {
+            let inner = event.display.read().await;
+            match last_event_id {
+                Some(last_event_id) => inner
+                    .replay
+                    .iter()
+                    .filter(|update| update.seq > last_event_id)
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        let receiver = event.display_sender.subscribe();
+        let closed = event.closed.subscribe();
+
+        Ok(DisplaySubscription {
+            state: self.clone(),
+            event,
+            replay,
+            receiver,
+            closed,
+        })
+    }
+
     async fn subscribe(
         &self,
         event_id: &str,
@@ -770,6 +907,11 @@ impl RelayState {
     /// snapshot is left as is. Expiry never removes the event itself and
     /// never changes its idle-TTL activity time.
     ///
+    /// A cleared lease also sets a display state that is not
+    /// `{"track": null}` to `{"track": null}`, and sends it on
+    /// `/display/events` (ADR 0003). The display lock is taken after the
+    /// live value lock is released, and no lock is held during a send.
+    ///
     /// Returns the count of events cleared this way.
     pub async fn expire_leases(&self) -> usize {
         let now = self.now();
@@ -802,7 +944,16 @@ impl RelayState {
             // lease before it takes this lock, so a publish that arrived after
             // the first check is visible here, and its snapshot stays.
             let renewed_at = event.renewed_at.load(Ordering::Relaxed);
-            if inner.latest.is_none() || now.saturating_sub(renewed_at) < lease_secs {
+            if now.saturating_sub(renewed_at) < lease_secs {
+                continue;
+            }
+            if inner.latest.is_none() {
+                // No snapshot to clear. The lease still ended, so the display
+                // state clears (ADR 0003). This covers an event that published
+                // a display state and no payload, for example after a restart.
+                drop(inner);
+                self.clear_display_after_lease(&event, lease_secs, now)
+                    .await;
                 continue;
             }
             inner.latest = None;
@@ -821,10 +972,30 @@ impl RelayState {
 
             let _ = event.sender.send(snapshot);
             self.emit_socket_remote_value(&event_id, &json!({})).await;
+
+            self.clear_display_after_lease(&event, lease_secs, now)
+                .await;
             expired_count += 1;
         }
 
         expired_count
+    }
+
+    /// Sets the display state of `event` to `{"track": null}` and sends it,
+    /// when its lease ended and the state is not null already.
+    ///
+    /// The caller holds no lock. This takes only the `display` lock, checks the
+    /// lease again under it, and sends after it releases the lock.
+    async fn clear_display_after_lease(&self, event: &LiveEventState, lease_secs: u64, now: u64) {
+        let mut display = event.display.write().await;
+        let renewed_at = event.renewed_at.load(Ordering::Relaxed);
+        let cleared = (now.saturating_sub(renewed_at) >= lease_secs
+            && !display.state["track"].is_null())
+        .then(|| display.apply(null_display_state()));
+        drop(display);
+        if let Some(update) = cleared {
+            let _ = event.display_sender.send(update);
+        }
     }
 
     fn attach_socket_io(&self, io: SocketIo) {
@@ -910,12 +1081,68 @@ struct LiveEventState {
     /// of the event then stops. Only a delete sets it, and only a reserved
     /// item can be deleted.
     closed: watch::Sender<bool>,
+    /// The display state of ADR 0003. Only a reserved event uses it. It is
+    /// separate from `inner`, and no live value transport reads it.
+    display: RwLock<DisplayInner>,
+    /// The sender of the `/display/events` stream. It never carries a live
+    /// value update.
+    display_sender: broadcast::Sender<DisplayUpdate>,
 }
 
 struct LiveEventInner {
     seq: u64,
     latest: Option<MetadataSnapshot>,
     replay: VecDeque<MetadataSnapshot>,
+}
+
+/// The display half of an event (ADR 0003). It is in memory only, so a
+/// restart gives `{"track": null}`.
+struct DisplayInner {
+    /// The sequence number of the display stream. It is separate from the
+    /// `seq` of the live value.
+    seq: u64,
+    /// The present display state. It is always a validated display state.
+    state: Value,
+    replay: VecDeque<DisplayUpdate>,
+}
+
+impl DisplayInner {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            state: null_display_state(),
+            replay: VecDeque::with_capacity(REPLAY_CAPACITY),
+        }
+    }
+
+    /// Sets the present state, advances `seq`, and adds the update to the
+    /// replay buffer. The caller sends the returned update after it releases
+    /// the lock.
+    fn apply(&mut self, state: Value) -> DisplayUpdate {
+        self.seq += 1;
+        self.state = state;
+        let update = DisplayUpdate {
+            seq: self.seq,
+            state: self.state.clone(),
+        };
+        self.replay.push_back(update.clone());
+        while self.replay.len() > REPLAY_CAPACITY {
+            self.replay.pop_front();
+        }
+        update
+    }
+}
+
+/// One update of the display stream.
+#[derive(Debug, Clone)]
+struct DisplayUpdate {
+    seq: u64,
+    state: Value,
+}
+
+/// The display state when nothing plays.
+fn null_display_state() -> Value {
+    json!({ "track": null })
 }
 
 impl LiveEventState {
@@ -933,6 +1160,8 @@ impl LiveEventState {
             }),
             sender,
             closed: watch::channel(false).0,
+            display: RwLock::new(DisplayInner::new()),
+            display_sender: broadcast::channel(BROADCAST_CAPACITY).0,
         }
     }
 
@@ -984,6 +1213,105 @@ impl Drop for EventSubscription {
             .sse_connections
             .fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// A subscriber of `/display/events`. It counts against the same SSE
+/// connection limit as `/events`.
+struct DisplaySubscription {
+    state: RelayState,
+    event: Arc<LiveEventState>,
+    replay: Vec<DisplayUpdate>,
+    receiver: broadcast::Receiver<DisplayUpdate>,
+    closed: watch::Receiver<bool>,
+}
+
+impl Drop for DisplaySubscription {
+    fn drop(&mut self) {
+        self.state
+            .inner
+            .sse_connections
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Validates a display state body (ADR 0003 §The Display State).
+///
+/// The body is an object with the one key `track`. `track` is `null`, or an
+/// object with exactly the keys `artist`, `title` and `artwork`. `artist` and
+/// `title` are strings. `artwork` is `null`, `{"sha256", "mime"}` or
+/// `{"url"}`. Returns the body as the relay stores it.
+///
+/// # Errors
+///
+/// Returns `400 invalid_display` for each other shape.
+fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
+    let invalid = || ApiError::new(StatusCode::BAD_REQUEST, "invalid_display");
+    let state: Value = serde_json::from_slice(body).map_err(|_| invalid())?;
+
+    let root = state.as_object().ok_or_else(invalid)?;
+    if root.len() != 1 {
+        return Err(invalid());
+    }
+    let track = root.get("track").ok_or_else(invalid)?;
+    if track.is_null() {
+        return Ok(state);
+    }
+
+    let track = track.as_object().ok_or_else(invalid)?;
+    if track.len() != 3 || !track.get("artist").is_some_and(Value::is_string) {
+        return Err(invalid());
+    }
+    if !track.get("title").is_some_and(Value::is_string) {
+        return Err(invalid());
+    }
+    let artwork = track.get("artwork").ok_or_else(invalid)?;
+    if artwork.is_null() {
+        return Ok(state);
+    }
+
+    let artwork = artwork.as_object().ok_or_else(invalid)?;
+    let valid = match artwork.len() {
+        1 => artwork
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(is_valid_artwork_url),
+        2 => {
+            artwork
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(is_sha256_hex)
+                && artwork
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mime| ARTWORK_MIME_TYPES.contains(&mime))
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(invalid());
+    }
+    Ok(state)
+}
+
+/// Returns `true` for an `http` or `https` URL of at most
+/// `MAX_ARTWORK_URL_CHARS` characters with a part after the scheme.
+fn is_valid_artwork_url(url: &str) -> bool {
+    if url.chars().count() > MAX_ARTWORK_URL_CHARS {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !rest.is_empty()
+}
+
+/// Returns `true` for exactly 64 lowercase hexadecimal characters.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1112,6 +1440,16 @@ pub struct LatestMetadataResponse {
     pub metadata: Value,
 }
 
+/// The response of `POST /v1/liveitems/{event_id}/display`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublishDisplayResponse {
+    pub event_id: String,
+    pub accepted: bool,
+    /// The sequence number of the display stream. It is separate from the
+    /// `seq` of the live value.
+    pub seq: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeepaliveResponse {
     pub event_id: String,
@@ -1196,6 +1534,16 @@ pub fn app(state: RelayState) -> Router {
         .route("/v1/liveitems/{event_id}/remoteValue", get(remote_value))
         .route("/v1/liveitems/{event_id}/events", get(events))
         .route("/v1/liveitems/{event_id}/keepalive", post(keepalive_route))
+        .route(
+            "/v1/liveitems/{event_id}/display",
+            get(display_state)
+                .post(publish_display)
+                .route_layer(RequestBodyLimitLayer::new(DISPLAY_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/liveitems/{event_id}/display/events",
+            get(display_events),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
         .layer(socket_layer)
@@ -1306,6 +1654,90 @@ async fn keepalive_route(
 ) -> Result<Json<KeepaliveResponse>, ApiError> {
     let token = bearer_token(&headers)?;
     Ok(Json(state.keepalive(&event_id, token).await?))
+}
+
+/// Handles `POST /v1/liveitems/{event_id}/display` (ADR 0003).
+///
+/// The relay checks the credential, the event, and the class before the
+/// result of the body read. A body over the limit then gives
+/// `413 payload_too_large`. A request with a `Content-Length` over the limit
+/// gets `413` from `RequestBodyLimitLayer` before this handler runs.
+async fn publish_display(
+    AxumState(state): AxumState<RelayState>,
+    Path(event_id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<PublishDisplayResponse>, ApiError> {
+    let token = bearer_token(&headers)?;
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+        } else {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_display")
+        }
+    });
+    Ok(Json(state.publish_display(&event_id, token, body).await?))
+}
+
+/// Handles `GET /v1/liveitems/{event_id}/display` (ADR 0003).
+async fn display_state(
+    AxumState(state): AxumState<RelayState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.display_state(&event_id).await?))
+}
+
+/// Handles `GET /v1/liveitems/{event_id}/display/events` (ADR 0003).
+///
+/// It is an SSE stream of `display` events with its own sequence number and
+/// its own replay buffer. It never carries a `remoteValue` event, and
+/// `/events` never carries a `display` event.
+async fn display_events(
+    AxumState(state): AxumState<RelayState>,
+    Path(event_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let subscription = state.subscribe_display(&event_id, last_event_id).await?;
+
+    let stream = async_stream::stream! {
+        let mut subscription = subscription;
+
+        for update in subscription.replay.drain(..) {
+            yield Ok(display_update_to_sse(update));
+        }
+
+        loop {
+            // A delete closes the event, as for `/events`.
+            let received = tokio::select! {
+                biased;
+                _ = subscription.closed.wait_for(|closed| *closed) => break,
+                received = subscription.receiver.recv() => received,
+            };
+            match received {
+                Ok(update) => {
+                    subscription.event.touch(subscription.state.now());
+                    yield Ok(display_update_to_sse(update));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn display_update_to_sse(update: DisplayUpdate) -> Event {
+    Event::default()
+        .event("display")
+        .id(update.seq.to_string())
+        .json_data(update.state)
+        .expect("display states are serializable")
 }
 
 async fn remote_value(
@@ -2041,5 +2473,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ADR 0003 §Routes: a display publish checks the broadcaster token as a
+    // publish does. This guard proves that the check goes through
+    // `StoredEvent::token_hash_matches`, which calls `ct_eq`.
+    #[test]
+    fn the_display_token_check_uses_the_constant_time_comparison() {
+        let lib = production_source(include_str!("lib.rs"));
+        assert!(
+            function_body(lib, "pub async fn publish_display(")
+                .contains(".token_hash_matches(&hash_token(token))"),
+            "ADR 0003 §Routes and AGENTS.md §4: `publish_display` must check the token with \
+             `StoredEvent::token_hash_matches`, never with `==`."
+        );
     }
 }

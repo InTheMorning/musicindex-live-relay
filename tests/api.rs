@@ -2406,4 +2406,770 @@ mod reserved {
                 .await;
         }
     }
+
+    /// Tests for the display state of ADR 0003, task 001: the display
+    /// routes, the lease expiry rule, and the separation from the live
+    /// value transports.
+    mod display {
+        use musicindex_live_relay::PublishDisplayResponse;
+
+        use super::*;
+
+        const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        /// Builds a relay with an admin token, a lease of 10 seconds, and a
+        /// clock at 100. Keep the `TempDir` until the test ends.
+        fn display_app() -> (axum::Router, RelayState, Arc<AtomicU64>, TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(100));
+            let state = reserved_state_at(&state_file, &clock).expect("open state");
+            (app(state.clone()), state, clock, dir, state_file)
+        }
+
+        fn track(artwork: Value) -> Value {
+            json!({ "track": { "artist": "Artist", "title": "Title", "artwork": artwork } })
+        }
+
+        async fn post_display(
+            router: axum::Router,
+            event_id: &str,
+            authorization: Option<&str>,
+            body: impl Into<Body>,
+        ) -> axum::response::Response {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(format!("/v1/liveitems/{event_id}/display"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(authorization) = authorization {
+                builder = builder.header(header::AUTHORIZATION, authorization);
+            }
+            router
+                .oneshot(builder.body(body.into()).expect("display request"))
+                .await
+                .expect("display response")
+        }
+
+        /// Publishes `body` with the token and asserts `200`.
+        async fn publish_display_ok(
+            router: axum::Router,
+            reserved: &ReserveEventResponse,
+            body: &Value,
+        ) -> PublishDisplayResponse {
+            let response = post_display(
+                router,
+                &reserved.event_id,
+                Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                body.to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let published: PublishDisplayResponse = read_json(response).await;
+            assert!(published.accepted);
+            assert_eq!(published.event_id, reserved.event_id);
+            published
+        }
+
+        async fn read_display(router: axum::Router, event_id: &str) -> Value {
+            let response = get(router, format!("/v1/liveitems/{event_id}/display")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            read_json(response).await
+        }
+
+        async fn open_stream(
+            router: axum::Router,
+            uri: String,
+            last_event_id: Option<&str>,
+        ) -> axum::response::Response {
+            let mut builder = Request::builder().uri(uri);
+            if let Some(last_event_id) = last_event_id {
+                builder = builder.header("Last-Event-ID", last_event_id);
+            }
+            router
+                .oneshot(builder.body(Body::empty()).expect("stream request"))
+                .await
+                .expect("stream response")
+        }
+
+        async fn open_display_stream(
+            router: axum::Router,
+            event_id: &str,
+            last_event_id: Option<&str>,
+        ) -> Body {
+            let response = open_stream(
+                router,
+                format!("/v1/liveitems/{event_id}/display/events"),
+                last_event_id,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body()
+        }
+
+        /// Returns the `data` line of an SSE chunk as JSON.
+        fn chunk_data(chunk: &str) -> Value {
+            let data = chunk
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("no data line: {chunk}"));
+            serde_json::from_str(data).expect("data is json")
+        }
+
+        /// Asserts that `body` gives no frame in a short time.
+        async fn assert_no_frame(body: &mut Body) {
+            let frame = timeout(Duration::from_millis(200), body.frame()).await;
+            assert!(frame.is_err(), "unexpected frame: {frame:?}");
+        }
+
+        #[tokio::test]
+        async fn a_publish_and_a_read_give_the_same_state() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+
+            let states = [
+                track(json!({ "sha256": SHA256, "mime": "image/jpeg" })),
+                track(json!({ "sha256": SHA256, "mime": "image/png" })),
+                track(json!({ "url": "https://example.com/cover.jpg" })),
+                track(json!({ "url": "http://example.com/cover.png" })),
+                track(Value::Null),
+                json!({ "track": null }),
+            ];
+            for (index, state) in states.iter().enumerate() {
+                let published = publish_display_ok(router.clone(), &reserved, state).await;
+                assert_eq!(published.seq, index as u64 + 1);
+                assert_eq!(
+                    read_display(router.clone(), &reserved.event_id).await,
+                    *state
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_subscriber_receives_each_state_and_a_reconnect_receives_the_missed_states() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+
+            let states: Vec<Value> = (1..=3)
+                .map(|index| track(json!({ "url": format!("https://example.com/{index}.jpg") })))
+                .collect();
+            for (index, state) in states.iter().enumerate() {
+                publish_display_ok(router.clone(), &reserved, state).await;
+                let chunk = next_sse_chunk(&mut body).await;
+                assert!(chunk.contains("event: display"), "{chunk}");
+                assert!(chunk.contains(&format!("id: {}", index + 1)), "{chunk}");
+                assert_eq!(chunk_data(&chunk), *state);
+            }
+
+            let mut replay =
+                open_display_stream(router.clone(), &reserved.event_id, Some("1")).await;
+            for (index, state) in states.iter().enumerate().skip(1) {
+                let chunk = next_sse_chunk(&mut replay).await;
+                assert!(chunk.contains("event: display"), "{chunk}");
+                assert!(chunk.contains(&format!("id: {}", index + 1)), "{chunk}");
+                assert_eq!(chunk_data(&chunk), *state);
+            }
+            assert_no_frame(&mut replay).await;
+        }
+
+        #[tokio::test]
+        async fn an_ephemeral_event_gives_409_on_each_route() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let ephemeral = create_event(router.clone()).await;
+            let authorization = format!("Bearer {}", ephemeral.broadcaster_token);
+
+            let response = post_display(
+                router.clone(),
+                &ephemeral.event_id,
+                Some(&authorization),
+                json!({ "track": null }).to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(error_code(response).await, "event_not_reserved");
+
+            for path in ["display", "display/events"] {
+                let response = get(
+                    router.clone(),
+                    format!("/v1/liveitems/{}/{path}", ephemeral.event_id),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+                assert_eq!(error_code(response).await, "event_not_reserved", "{path}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_bad_credential_gives_401_or_403_and_an_unknown_event_gives_404() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), Some("first")).await;
+            let other = reserve_ok(router.clone(), Some("second")).await;
+            let body = json!({ "track": null }).to_string();
+
+            let cases = [
+                (None, StatusCode::UNAUTHORIZED, "missing_bearer_token"),
+                (
+                    Some("Token abc".to_string()),
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_bearer_token",
+                ),
+                (
+                    Some("Bearer".to_string()),
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_bearer_token",
+                ),
+                (
+                    Some("Bearer wrong".to_string()),
+                    StatusCode::FORBIDDEN,
+                    "invalid_token",
+                ),
+                (
+                    Some(format!("Bearer {}", other.broadcaster_token)),
+                    StatusCode::FORBIDDEN,
+                    "invalid_token",
+                ),
+                (
+                    Some(format!("Bearer {ADMIN_TOKEN}")),
+                    StatusCode::FORBIDDEN,
+                    "invalid_token",
+                ),
+            ];
+            for (authorization, status, code) in cases {
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    authorization.as_deref(),
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), status, "{authorization:?}");
+                assert_eq!(error_code(response).await, code, "{authorization:?}");
+            }
+            // No rejected request changed the state.
+            let published =
+                publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+            assert_eq!(published.seq, 1);
+
+            let response = post_display(
+                router.clone(),
+                "missing",
+                Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "event_not_found");
+            for path in ["display", "display/events"] {
+                let response = get(router.clone(), format!("/v1/liveitems/missing/{path}")).await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+                assert_eq!(error_code(response).await, "event_not_found", "{path}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_body_over_8_kib_gives_413() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+
+            // A valid display state of exactly `len` bytes.
+            let empty_len = json!({ "track": { "artist": "", "title": "", "artwork": null } })
+                .to_string()
+                .len();
+            let sized = |len: usize| {
+                let pad = len - empty_len;
+                let body = json!({
+                    "track": { "artist": "", "title": "a".repeat(pad), "artwork": null }
+                })
+                .to_string();
+                assert_eq!(body.len(), len);
+                body
+            };
+
+            let response = post_display(
+                router.clone(),
+                &reserved.event_id,
+                Some(&authorization),
+                sized(8 * 1024),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = post_display(
+                router.clone(),
+                &reserved.event_id,
+                Some(&authorization),
+                sized(8 * 1024 + 1),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(error_code(response).await, "payload_too_large");
+
+            // A request that states its length is refused before the
+            // handler runs.
+            let body = sized(8 * 1024 + 1);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/liveitems/{}/display", reserved.event_id))
+                        .header(header::AUTHORIZATION, &authorization)
+                        .header(header::CONTENT_LENGTH, body.len())
+                        .body(Body::from(body))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+            // The refused bodies did not change the state.
+            let state = read_display(router, &reserved.event_id).await;
+            assert_eq!(
+                state["track"]["title"].as_str().map(str::len),
+                Some(8 * 1024 - empty_len)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_wrong_shape_or_a_wrong_url_gives_400() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+            let long_url = format!("https://example.com/{}", "a".repeat(2_048 - 20));
+            assert_eq!(long_url.chars().count(), 2_048);
+
+            let wrong: Vec<String> = [
+                json!([]),
+                json!({}),
+                json!({ "track": null, "schema": "musicindex.display/1" }),
+                json!({ "track": "Title" }),
+                json!({ "track": { "artist": "Artist", "title": "Title" } }),
+                json!({ "track": { "title": "Title", "artwork": null } }),
+                json!({ "track": { "artist": 1, "title": "Title", "artwork": null } }),
+                json!({ "track": { "artist": "Artist", "title": null, "artwork": null } }),
+                json!({ "track": {
+                    "artist": "Artist", "title": "Title", "artwork": null, "album": "Album"
+                } }),
+                track(json!("https://example.com/cover.jpg")),
+                track(json!({})),
+                track(json!({ "url": "https://example.com/a.jpg", "sha256": SHA256 })),
+                track(json!({ "url": 1 })),
+                track(json!({ "sha256": SHA256 })),
+                track(json!({ "sha256": SHA256, "mime": "image/gif" })),
+                track(json!({ "sha256": SHA256, "mime": "IMAGE/JPEG" })),
+                track(json!({ "sha256": SHA256.to_uppercase(), "mime": "image/jpeg" })),
+                track(json!({ "sha256": &SHA256[1..], "mime": "image/jpeg" })),
+                track(json!({ "sha256": format!("{SHA256}0"), "mime": "image/jpeg" })),
+                track(json!({ "sha256": SHA256.replace('a', "g"), "mime": "image/jpeg" })),
+                track(json!({ "sha256": SHA256, "mime": "image/jpeg", "size": 1 })),
+                track(json!({ "url": "data:image/png;base64,iVBORw0KGgo=" })),
+                track(json!({ "url": "file:///home/citizen/cover.jpg" })),
+                track(json!({ "url": "ftp://example.com/cover.jpg" })),
+                track(json!({ "url": "javascript://example.com/%0Aalert(1)" })),
+                track(json!({ "url": "https:example.com/cover.jpg" })),
+                track(json!({ "url": "https://" })),
+                track(json!({ "url": format!("{long_url}a") })),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .chain([
+                "".to_string(),
+                "not json".to_string(),
+                "{\"track\":".to_string(),
+            ])
+            .collect();
+
+            for body in wrong {
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&authorization),
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(error_code(response).await, "invalid_display", "{body}");
+            }
+
+            // No refused body changed the state.
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+
+            // The limit and the scheme accept these.
+            for url in [long_url.as_str(), "HTTPS://example.com/cover.jpg"] {
+                let state = track(json!({ "url": url }));
+                publish_display_ok(router.clone(), &reserved, &state).await;
+                assert_eq!(
+                    read_display(router.clone(), &reserved.event_id).await,
+                    state
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_display_publish_does_not_move_the_lease() {
+            let (router, state, clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let metadata_uri = format!("/v1/liveitems/{}/metadata", reserved.event_id);
+            let before: LatestMetadataResponse =
+                read_json(get(router.clone(), metadata_uri.clone()).await).await;
+
+            clock.store(105, Ordering::SeqCst);
+            publish_display_ok(
+                router.clone(),
+                &reserved,
+                &track(json!({ "url": "https://example.com/cover.jpg" })),
+            )
+            .await;
+
+            let after: LatestMetadataResponse =
+                read_json(get(router.clone(), metadata_uri).await).await;
+            assert_eq!(after.renewed_at, before.renewed_at);
+            assert_eq!(after.lease_expires_at, before.lease_expires_at);
+
+            // The lease of 10 seconds runs from the publish at 100.
+            clock.store(110, Ordering::SeqCst);
+            assert_eq!(state.expire_leases().await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_lease_expiry_sets_the_state_to_null_and_sends_it() {
+            let (router, state, clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let playing = track(json!({ "sha256": SHA256, "mime": "image/jpeg" }));
+            publish_display_ok(router.clone(), &reserved, &playing).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+
+            clock.store(110, Ordering::SeqCst);
+            assert_eq!(state.expire_leases().await, 1);
+
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("event: display"), "{chunk}");
+            assert!(chunk.contains("id: 2"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), json!({ "track": null }));
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+
+            // A reconnect receives the null state from the replay buffer.
+            let mut replay =
+                open_display_stream(router.clone(), &reserved.event_id, Some("1")).await;
+            let chunk = next_sse_chunk(&mut replay).await;
+            assert!(chunk.contains("id: 2"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), json!({ "track": null }));
+
+            // A second expiry with a null state sends nothing more.
+            clock.store(111, Ordering::SeqCst);
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "back" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            clock.store(121, Ordering::SeqCst);
+            assert_eq!(state.expire_leases().await, 1);
+            assert_no_frame(&mut body).await;
+        }
+
+        #[tokio::test]
+        async fn a_lease_end_with_no_snapshot_still_sets_the_display_to_null() {
+            let (router, state, clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            // A display state and no payload, as after a relay restart.
+            let playing = track(json!({ "url": "https://example.com/cover.jpg" }));
+            publish_display_ok(router.clone(), &reserved, &playing).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+
+            clock.store(200, Ordering::SeqCst);
+            // No snapshot was cleared, so the count stays 0.
+            assert_eq!(state.expire_leases().await, 0);
+
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("event: display"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), json!({ "track": null }));
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+        }
+
+        #[tokio::test]
+        async fn no_display_event_appears_on_the_live_value_transports() {
+            let (router, state, clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let events_uri = format!("/v1/liveitems/{}/events", reserved.event_id);
+            let response = open_stream(router.clone(), events_uri.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut events = response.into_body();
+
+            let playing = track(json!({ "url": "https://example.com/cover.jpg" }));
+            publish_display_ok(router.clone(), &reserved, &playing).await;
+            assert_no_frame(&mut events).await;
+
+            // The live value is unchanged by the display publish.
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+            )
+            .await;
+            assert_eq!(read_json::<Value>(response).await, json!({}));
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/metadata", reserved.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "metadata_not_found");
+
+            // The next update on `/events` is the live value, with `seq` 1.
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let published: musicindex_live_relay::PublishMetadataResponse =
+                read_json(response).await;
+            assert_eq!(published.seq, 1);
+            let chunk = next_sse_chunk(&mut events).await;
+            assert!(chunk.contains("event: remoteValue"), "{chunk}");
+            assert!(chunk.contains("id: 1"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), json!({ "title": "on air" }));
+
+            // An expiry sends `{}` on `/events` and nothing of the display.
+            clock.store(110, Ordering::SeqCst);
+            assert_eq!(state.expire_leases().await, 1);
+            let chunk = next_sse_chunk(&mut events).await;
+            assert!(chunk.contains("event: remoteValue"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), json!({}));
+            assert_no_frame(&mut events).await;
+
+            // The replay buffer of `/events` holds no display state.
+            let response = open_stream(router.clone(), events_uri, Some("0")).await;
+            let mut replay = response.into_body();
+            for expected in [json!({ "title": "on air" }), json!({})] {
+                let chunk = next_sse_chunk(&mut replay).await;
+                assert!(chunk.contains("event: remoteValue"), "{chunk}");
+                assert!(!chunk.contains("display"), "{chunk}");
+                assert_eq!(chunk_data(&chunk), expected);
+            }
+            assert_no_frame(&mut replay).await;
+        }
+
+        #[tokio::test]
+        async fn the_display_publish_shares_the_publish_rate_limit() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let clock = Arc::new(AtomicU64::new(100));
+            let state = RelayState::try_with_clock(
+                AppConfig {
+                    admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+                    state_file: dir.path().join("reserved-items.sqlite3"),
+                    max_publishes_per_event_per_sec: 2,
+                    ..AppConfig::for_tests()
+                },
+                {
+                    let clock = clock.clone();
+                    Arc::new(move || clock.load(Ordering::SeqCst))
+                },
+            )
+            .expect("open state");
+            let router = app(state);
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+            let body = json!({ "track": null }).to_string();
+
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+
+            let response = post_display(
+                router.clone(),
+                &reserved.event_id,
+                Some(&authorization),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(error_code(response).await, "publish_rate_limited");
+
+            clock.store(101, Ordering::SeqCst);
+            let published =
+                publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+            assert_eq!(published.seq, 2);
+        }
+
+        #[tokio::test]
+        async fn the_display_stream_counts_against_the_sse_connection_limit() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = RelayState::try_new(AppConfig {
+                admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+                state_file: dir.path().join("reserved-items.sqlite3"),
+                max_sse_connections: 1,
+                ..AppConfig::for_tests()
+            })
+            .expect("open state");
+            let router = app(state);
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let first = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            let uri = format!("/v1/liveitems/{}/display/events", reserved.event_id);
+            let response = open_stream(router.clone(), uri.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_code(response).await, "max_sse_connections_reached");
+
+            drop(first);
+            let response = open_stream(router, uri, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_restart_gives_a_null_state() {
+            let (router, _state, clock, _dir, state_file) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            publish_display_ok(
+                router,
+                &reserved,
+                &track(json!({ "url": "https://example.com/cover.jpg" })),
+            )
+            .await;
+
+            let restarted = app(reserved_state_at(&state_file, &clock).expect("restart"));
+            assert_eq!(
+                read_display(restarted.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+            let published =
+                publish_display_ok(restarted, &reserved, &json!({ "track": null })).await;
+            assert_eq!(published.seq, 1);
+        }
+
+        #[tokio::test]
+        async fn a_delete_stops_the_display_stream() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v1/liveitems/reserved/{}", reserved.event_id))
+                        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+                        .body(Body::empty())
+                        .expect("delete request"),
+                )
+                .await
+                .expect("delete response");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+            let frame = timeout(Duration::from_secs(2), body.frame())
+                .await
+                .expect("the stream ends");
+            assert!(frame.is_none(), "the stream ended with a frame: {frame:?}");
+            let response = get(
+                router,
+                format!("/v1/liveitems/{}/display", reserved.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "event_not_found");
+        }
+
+        /// The reserved item routes hold the static segment `reserved`. An
+        /// event identifier equal to `reserved` gets the same answers as
+        /// before the display routes, on the display paths and on the
+        /// paths of the other per-event routes.
+        #[tokio::test]
+        async fn the_identifier_reserved_keeps_its_previous_answers() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let cases = [
+                (
+                    "GET",
+                    "/v1/liveitems/reserved/display",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                ),
+                (
+                    "POST",
+                    "/v1/liveitems/reserved/display",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                ),
+                (
+                    "GET",
+                    "/v1/liveitems/reserved/metadata",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                ),
+                (
+                    "GET",
+                    "/v1/liveitems/reserved/display/events",
+                    StatusCode::NOT_FOUND,
+                ),
+            ];
+            for (method, uri, status) in cases {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+                            .body(Body::from("{\"track\":null}"))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), status, "{method} {uri}");
+            }
+
+            // The delete route still reads `display` as an identifier.
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/v1/liveitems/reserved/display")
+                        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "event_not_found");
+        }
+    }
 }

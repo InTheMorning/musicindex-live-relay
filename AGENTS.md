@@ -33,8 +33,12 @@ packet.
   unit stops after five failed starts.
 - The reserved class is not deployed on a host. `v4vmm` has no packet yet to
   reserve an event from the app.
-- ADR 0003, display state and artwork, has the status `Accepted`. Its
-  implementation can start, because ADR 0001 is Implemented.
+- ADR 0003, display state and artwork, has the status `Accepted`. Task 001
+  is done, and task 002 is next. A reserved event has a display state,
+  with `POST` and `GET /v1/liveitems/{event_id}/display` and the SSE stream
+  `/display/events`. An ephemeral event gets `409 event_not_reserved`.
+  Task 002, the artwork store, has not started. Until then, the relay does
+  not examine if it holds the image of an `artwork.sha256`.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
@@ -127,6 +131,9 @@ This service carries payment routing to listener apps.
   or after the idle TTL. A reserved event survives both. After a restart it
   serves no snapshot until the next publish: `remoteValue` gives `{}` and the
   metadata route gives `404 metadata_not_found` (ADR 0001).
+- The display state of a reserved event (ADR 0003) lives in memory only. A
+  restart gives `{"track": null}`. A lease expiry sets it to
+  `{"track": null}`.
 - Consumers depend on those two death modes and work around them. A change to
   either one is an interoperability change. Record it in
   `docs/interoperability.md` in the same commit.

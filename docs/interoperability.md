@@ -162,6 +162,37 @@ ephemeral item, `Delete` in a control surface means "forget locally".
 This service discards its own record at the next restart or after the idle
 TTL.
 
+### The display state is in memory only
+
+ADR 0003 adds three display routes for a reserved item. Task 001 of the
+display state plan implements them:
+
+- `POST /v1/liveitems/{event_id}/display` publishes a display state. It needs
+  the broadcaster token.
+- `GET /v1/liveitems/{event_id}/display` gives the present display state.
+- `GET /v1/liveitems/{event_id}/display/events` is an SSE stream of `display`
+  events, with its own `seq` and its own replay buffer.
+
+`musicindex-live-publisher` ADR 0008 is the sender. A private app is the
+reader. `README.md` gives the body, the limits and each status code.
+
+A consumer must know these facts:
+
+- An ephemeral item gets `409` with the error code `event_not_reserved` on
+  each display route. An absent item gets `404 event_not_found`.
+- The display state is in memory only. After a restart, the read gives
+  `{"track": null}`. The display `seq` starts again at zero, and the display
+  replay buffer is empty.
+- A display publish does not renew the lease. When the lease expires, the
+  relay sets a display state that is not `{"track": null}` to
+  `{"track": null}`, and sends it on `/display/events`.
+- The display path does not change the live value. `remoteValue`, `/events`,
+  Socket.IO and the metadata route do not send a display state. The display
+  `seq` and the live value `seq` are different counters.
+- Task 002 adds the artwork store of ADR 0003. Until task 002, the
+  relay accepts an `artwork.sha256` that has the correct shape and does not
+  examine if it holds the image.
+
 ### The token is returned one time
 
 This service stores a SHA-256 hash of the broadcaster token and compares it in
