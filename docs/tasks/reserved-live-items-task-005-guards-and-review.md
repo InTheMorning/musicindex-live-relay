@@ -1,6 +1,7 @@
 # Reserved Live Items Task 005: Guards, Runbook, And Review
 
-Status: Ready - 2026-09-09. Gate task. Do last.
+Status: Implemented - 2026-10-04. The review is
+`docs/reviews/adr-0001-implementation-review.md`. Gate task. Do last.
 
 Every criterion in this packet is mechanical. This service has no user
 interface, so it has no visual criteria and needs no operator check.

@@ -2,6 +2,11 @@
 
 ## Status
 
+Implemented - 2026-10-04.
+
+Implemented 2026-10-04: tasks 001 to 005 are done. The review is
+`docs/reviews/adr-0001-implementation-review.md`.
+
 Accepted - 2026-09-06.
 
 ## Goal
@@ -118,14 +123,18 @@ Answered on 2026-09-06:
 - A reserved item count limit is configurable, separate from
   `max_active_events`.
 
-## Open Questions
+Answered on 2026-10-04 in task 005:
+
+- The admin token is the operator credential of the later identity model.
+  ADR 0001 §A Reserved Item Needs A Credential says this. The later identity
+  ADR can change it.
+
+## Follow-Up
 
 - How does a broadcaster get a credential on a public service? Deferred on
   2026-09-06. The options and the evidence are in
-  `docs/research/broadcaster-identity-options.md`. A future ADR 0002 decides
-  it.
-- Does the admin token from this ADR become the operator credential of that
-  model, or does it stay separate?
+  `docs/research/broadcaster-identity-options.md`. A later ADR decides it.
+  ADR 0002 is the live lease, not this decision.
 
 ## References
 

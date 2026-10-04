@@ -1896,4 +1896,514 @@ mod reserved {
             assert_eq!(listed_ids(&list_ok(router).await), vec![reserved.event_id]);
         }
     }
+
+    /// One guard for each invariant of ADR 0001 §Invariants (task 005).
+    ///
+    /// The constant-time invariant has its guard in the unit tests of
+    /// `src/lib.rs`, because the comparison functions are private.
+    mod adr_0001_invariants {
+        use sha2::{Digest, Sha256};
+
+        use super::*;
+
+        const WRONG_ADMIN_TOKEN: &str = "wrong-admin-token-0123456789";
+
+        /// Returns the name and the bytes of each file in `dir`, sorted by
+        /// name.
+        fn directory_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+                .expect("read state directory")
+                .map(|entry| {
+                    let path = entry.expect("entry").path();
+                    let name = path
+                        .file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned();
+                    (name, std::fs::read(&path).expect("read file"))
+                })
+                .collect();
+            files.sort();
+            files
+        }
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+
+        async fn send(
+            router: axum::Router,
+            method: &str,
+            uri: String,
+            token: Option<&str>,
+            body: Option<Value>,
+        ) -> axum::response::Response {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let body = match body {
+                Some(body) => {
+                    builder = builder.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(body.to_string())
+                }
+                None => Body::empty(),
+            };
+            router
+                .oneshot(builder.body(body).expect("request"))
+                .await
+                .expect("response")
+        }
+
+        /// Asserts that each route of `event_id` answers `404` with the
+        /// error code `event_not_found`.
+        async fn assert_event_does_not_exist(router: &axum::Router, event_id: &str, token: &str) {
+            let requests = [
+                ("GET", "metadata", None),
+                ("GET", "remoteValue", None),
+                ("GET", "events", None),
+                ("POST", "metadata", Some(json!({ "title": "x" }))),
+                ("POST", "keepalive", None),
+            ];
+            for (method, route, body) in requests {
+                let response = send(
+                    router.clone(),
+                    method,
+                    format!("/v1/liveitems/{event_id}/{route}"),
+                    Some(token),
+                    body,
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {route} of {event_id}"
+                );
+                assert_eq!(
+                    error_code(response).await,
+                    "event_not_found",
+                    "{method} {route} of {event_id}"
+                );
+            }
+        }
+
+        /// Asserts that `event_id` exists and has no snapshot. No route
+        /// answers `event_not_found`.
+        async fn assert_event_exists_with_no_snapshot(
+            router: &axum::Router,
+            event_id: &str,
+            token: &str,
+        ) {
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{event_id}/remoteValue"),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "remoteValue of {event_id}"
+            );
+            let value: Value = read_json(response).await;
+            assert_eq!(value, json!({}), "remoteValue of {event_id}");
+
+            // ADR 0002: an event with no snapshot gives `404` on the metadata
+            // read, with its own error code. The event exists.
+            let response = get(router.clone(), format!("/v1/liveitems/{event_id}/metadata")).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "metadata_not_found");
+
+            let response = get(router.clone(), format!("/v1/liveitems/{event_id}/events")).await;
+            assert_eq!(response.status(), StatusCode::OK, "events of {event_id}");
+
+            let response = keepalive(router.clone(), event_id, Some(token)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(error_code(response).await, "lease_expired");
+        }
+
+        // Invariant: ephemeral behavior does not change. Every test before
+        // `mod reserved` passes unchanged. This test runs the ephemeral life
+        // cycle on a relay that has a state file.
+        #[tokio::test]
+        async fn ephemeral_behavior_does_not_change_with_a_state_file() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(100));
+            let state = reserved_state_at(&state_file, &clock).expect("open state");
+            let router = app(state.clone());
+            let before = directory_files(dir.path());
+
+            let response = send(
+                router.clone(),
+                "POST",
+                "/v1/liveitems".to_string(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = read_json(response).await;
+            let mut keys: Vec<&str> = body
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "broadcaster_token",
+                    "event_id",
+                    "events_url",
+                    "metadata_url",
+                    "remote_value_url",
+                    "socket_io_url",
+                ]
+            );
+            let event_id = body["event_id"].as_str().expect("event_id").to_string();
+            let token = body["broadcaster_token"]
+                .as_str()
+                .expect("token")
+                .to_string();
+
+            let response = publish(
+                router.clone(),
+                &event_id,
+                Some(&token),
+                json!({ "title": "ephemeral show" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{event_id}/remoteValue"),
+            )
+            .await;
+            let value: Value = read_json(response).await;
+            assert_eq!(value, json!({ "title": "ephemeral show" }));
+
+            // An ephemeral item writes nothing to the state directory.
+            assert_eq!(directory_files(dir.path()), before);
+
+            // A restart loses the ephemeral item.
+            let restarted = app(reserved_state_at(&state_file, &clock).expect("restart"));
+            assert_event_does_not_exist(&restarted, &event_id, &token).await;
+
+            // The reaper removes the ephemeral item after the idle TTL.
+            clock.store(111, Ordering::SeqCst);
+            assert_eq!(state.cleanup_expired().await, 1);
+            assert_event_does_not_exist(&router, &event_id, &token).await;
+        }
+
+        // Invariant: no payload, snapshot, or replay buffer reaches disk.
+        // Packet step 2: the state file after a publish holds no payload.
+        #[tokio::test]
+        async fn no_payload_snapshot_or_replay_buffer_reaches_disk() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(100));
+            let state = reserved_state_at(&state_file, &clock).expect("open state");
+            let router = app(state.clone());
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            let ephemeral = create_event(router.clone()).await;
+            let after_reserve = directory_files(dir.path());
+
+            let markers = ["payload-marker-a81f", "payload-marker-b27e"];
+            let field = "payload_field_key_c93d";
+            for (step, marker) in markers.iter().enumerate() {
+                clock.store(101 + step as u64, Ordering::SeqCst);
+                for (event_id, token) in [
+                    (&reserved.event_id, &reserved.broadcaster_token),
+                    (&ephemeral.event_id, &ephemeral.broadcaster_token),
+                ] {
+                    let response = publish(
+                        router.clone(),
+                        event_id,
+                        Some(token),
+                        json!({
+                            "title": marker,
+                            field: marker,
+                            "value": { "destinations": [{ "name": marker, "split": "100" }] },
+                        }),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                }
+            }
+            let response = keepalive(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            // A lease expiry adds a `{}` update to the replay buffer.
+            clock.store(200, Ordering::SeqCst);
+            assert!(state.expire_leases().await >= 1);
+            drop(router);
+            drop(state);
+
+            // A publish, a keepalive, and a lease expiry change no byte in
+            // the state directory, and add no file to it.
+            let after_publish = directory_files(dir.path());
+            assert_eq!(after_publish, after_reserve);
+            for (name, bytes) in &after_publish {
+                for needle in markers.iter().chain([&field]) {
+                    assert!(
+                        !contains(bytes, needle.as_bytes()),
+                        "{name} holds the payload text {needle}"
+                    );
+                }
+            }
+
+            // The schema holds no place for a payload.
+            let connection = rusqlite::Connection::open(&state_file).expect("open state file");
+            let mut statement = connection
+                .prepare("SELECT type, name FROM sqlite_schema ORDER BY type, name")
+                .expect("prepare");
+            let objects: Vec<(String, String)> = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("objects");
+            let tables: Vec<&str> = objects
+                .iter()
+                .filter(|(kind, _)| kind != "index")
+                .map(|(_, name)| name.as_str())
+                .collect();
+            assert_eq!(tables, ["live_items", "schema_version"]);
+            assert!(
+                objects
+                    .iter()
+                    .filter(|(kind, _)| kind == "index")
+                    .all(|(_, name)| name.starts_with("sqlite_autoindex_live_items")),
+                "{objects:?}"
+            );
+            assert_eq!(
+                table_columns(&state_file, "live_items"),
+                ["event_id", "token_hash", "label", "created_at", "class"]
+            );
+            assert_eq!(table_columns(&state_file, "schema_version"), ["version"]);
+            assert_eq!(reserved_row_count(&state_file), 1);
+        }
+
+        // Invariant: the stored value for a token is a hash. The token itself
+        // is never stored.
+        #[tokio::test]
+        async fn the_state_file_holds_the_token_hash_and_never_the_token() {
+            let (router, dir, state_file) = reserved_app();
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            drop(router);
+
+            let stored: Vec<u8> = rusqlite::Connection::open(&state_file)
+                .expect("open state file")
+                .query_row(
+                    "SELECT token_hash FROM live_items WHERE event_id = ?1",
+                    [&reserved.event_id],
+                    |row| row.get(0),
+                )
+                .expect("token hash");
+            let expected: [u8; 32] = Sha256::digest(reserved.broadcaster_token.as_bytes()).into();
+            assert_eq!(stored, expected);
+            assert_ne!(stored, reserved.broadcaster_token.as_bytes());
+
+            // The admin token and its hash stay in memory only.
+            let admin_hash: [u8; 32] = Sha256::digest(ADMIN_TOKEN.as_bytes()).into();
+            for (name, bytes) in directory_files(dir.path()) {
+                assert!(
+                    !contains(&bytes, reserved.broadcaster_token.as_bytes()),
+                    "{name} holds the broadcaster token"
+                );
+                assert!(
+                    !contains(&bytes, ADMIN_TOKEN.as_bytes()),
+                    "{name} holds the admin token"
+                );
+                assert!(
+                    !contains(&bytes, &admin_hash),
+                    "{name} holds the admin token hash"
+                );
+            }
+        }
+
+        // Invariant: a route that writes to durable storage needs the admin
+        // credential. Only the reserve route and the delete route write to
+        // the state file.
+        #[tokio::test]
+        async fn each_durable_write_needs_the_admin_credential() {
+            let (router, dir, state_file) = reserved_app();
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            let ephemeral = create_event(router.clone()).await;
+            let before = directory_files(dir.path());
+
+            let credentials = [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some(WRONG_ADMIN_TOKEN), StatusCode::FORBIDDEN),
+                (
+                    Some(reserved.broadcaster_token.as_str()),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    Some(ephemeral.broadcaster_token.as_str()),
+                    StatusCode::FORBIDDEN,
+                ),
+            ];
+            for (credential, status) in credentials {
+                let response = send(
+                    router.clone(),
+                    "POST",
+                    "/v1/liveitems/reserved".to_string(),
+                    credential,
+                    Some(json!({ "label": "intruder" })),
+                )
+                .await;
+                assert_eq!(response.status(), status, "reserve with {credential:?}");
+                let response = send(
+                    router.clone(),
+                    "DELETE",
+                    format!("/v1/liveitems/reserved/{}", reserved.event_id),
+                    credential,
+                    None,
+                )
+                .await;
+                assert_eq!(response.status(), status, "delete with {credential:?}");
+            }
+
+            // The public routes write nothing to the state directory.
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            create_event(router.clone()).await;
+            assert_eq!(directory_files(dir.path()), before);
+            assert_eq!(reserved_row_count(&state_file), 1);
+
+            // With the admin credential, both routes write to the file.
+            reserve_ok(router.clone(), Some("second")).await;
+            assert_eq!(reserved_row_count(&state_file), 2);
+            let response = send(
+                router,
+                "DELETE",
+                format!("/v1/liveitems/reserved/{}", reserved.event_id),
+                Some(ADMIN_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(reserved_row_count(&state_file), 1);
+        }
+
+        // Invariant: the reaper never removes a reserved item, in each state
+        // that a reserved item can have.
+        #[tokio::test]
+        async fn the_reaper_never_removes_a_reserved_item() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let restored = reserve_publish_and_stop(&state_file, "before restart").await;
+
+            let clock = Arc::new(AtomicU64::new(5_000));
+            let state = reserved_state_at(&state_file, &clock).expect("restore");
+            let router = app(state.clone());
+            let never_published = reserve_ok(router.clone(), Some("never published")).await;
+            let on_air = reserve_ok(router.clone(), Some("on air")).await;
+            let response = publish(
+                router.clone(),
+                &on_air.event_id,
+                Some(&on_air.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let ephemeral = create_event(router.clone()).await;
+
+            // Ten years with no activity. The TTL is 10 seconds.
+            clock.store(5_000 + 10 * 365 * 24 * 60 * 60, Ordering::SeqCst);
+            state.expire_leases().await;
+            assert_eq!(state.cleanup_expired().await, 1);
+            assert_eq!(state.cleanup_expired().await, 0);
+
+            for reserved in [&restored, &never_published, &on_air] {
+                assert_event_exists_with_no_snapshot(
+                    &router,
+                    &reserved.event_id,
+                    &reserved.broadcaster_token,
+                )
+                .await;
+            }
+            assert_event_does_not_exist(&router, &ephemeral.event_id, &ephemeral.broadcaster_token)
+                .await;
+            assert_eq!(reserved_row_count(&state_file), 3);
+        }
+
+        // Invariant: a `404` with the error code `event_not_found` still means
+        // that the event does not exist, for both classes. An event that
+        // exists never gets that answer.
+        #[tokio::test]
+        async fn event_not_found_means_the_event_does_not_exist_for_both_classes() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(100));
+            let state = reserved_state_at(&state_file, &clock).expect("open state");
+            let router = app(state.clone());
+            let any_token = "any-token";
+
+            // An identifier that never existed.
+            assert_event_does_not_exist(&router, "no-such-event", any_token).await;
+
+            // Both classes exist before their first publish.
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            let deleted = reserve_ok(router.clone(), Some("deleted")).await;
+            let ephemeral = create_event(router.clone()).await;
+            for (event_id, token) in [
+                (&reserved.event_id, &reserved.broadcaster_token),
+                (&deleted.event_id, &deleted.broadcaster_token),
+                (&ephemeral.event_id, &ephemeral.broadcaster_token),
+            ] {
+                assert_event_exists_with_no_snapshot(&router, event_id, token).await;
+            }
+
+            // A deleted reserved item does not exist.
+            let response = send(
+                router.clone(),
+                "DELETE",
+                format!("/v1/liveitems/reserved/{}", deleted.event_id),
+                Some(ADMIN_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_event_does_not_exist(&router, &deleted.event_id, &deleted.broadcaster_token)
+                .await;
+
+            // A reaped ephemeral item does not exist. The reserved item does.
+            clock.store(111, Ordering::SeqCst);
+            assert_eq!(state.cleanup_expired().await, 1);
+            assert_event_does_not_exist(&router, &ephemeral.event_id, &ephemeral.broadcaster_token)
+                .await;
+            assert_event_exists_with_no_snapshot(
+                &router,
+                &reserved.event_id,
+                &reserved.broadcaster_token,
+            )
+            .await;
+
+            // After a restart, the reserved item exists with no snapshot, and
+            // the deleted item stays absent.
+            let restarted = app(reserved_state_at(&state_file, &clock).expect("restart"));
+            assert_event_exists_with_no_snapshot(
+                &restarted,
+                &reserved.event_id,
+                &reserved.broadcaster_token,
+            )
+            .await;
+            assert_event_does_not_exist(&restarted, &deleted.event_id, &deleted.broadcaster_token)
+                .await;
+        }
+    }
 }

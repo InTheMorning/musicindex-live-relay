@@ -2,7 +2,16 @@
 
 ## Status
 
+Implemented - 2026-10-04.
+
+Implemented 2026-10-04: reserved live items tasks 001 to 005 are done. The
+review is `docs/reviews/adr-0001-implementation-review.md`.
+
 Accepted - 2026-09-06.
+
+Amended 2026-10-04: "serves `{}`" now names each route. `remoteValue` gives
+`{}`, and the metadata route gives `404 metadata_not_found`. The decision did
+not change. The text now matches the shipped behavior.
 
 Amended 2026-09-06: the storage format is SQLite, the state file lives in the
 systemd `StateDirectory`, and a reserved item count limit is configurable.
@@ -74,7 +83,8 @@ needs a bound that is separate from the ephemeral traffic limit.
 ### A Reserved Item Stores No Payload
 
 **The latest snapshot and the replay buffer are never written to disk.** After a
-restart, a reserved item exists and serves `{}` until the next publish.
+restart, a reserved item exists and serves no snapshot until the next publish.
+`remoteValue` gives `{}`. The metadata route gives `404 metadata_not_found`.
 
 This is a payment rule, not an optimization. A restored snapshot would tell
 listener apps to pay the destinations of a track that stopped playing hours
@@ -169,7 +179,7 @@ Negative and risks:
   lived artifact than before.
 - Two classes of item mean two code paths in create, in the reaper, and in the
   tests.
-- A reserved item serves `{}` after a restart until the next publish. Document
+- A reserved item serves no snapshot after a restart until the next publish. Document
   that in the runbook so it does not read as a defect.
 
 ## Follow-Up Work

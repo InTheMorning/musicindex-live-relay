@@ -100,7 +100,9 @@ after a restart it serves `{}` until the next publish:
   An SSE client that keeps a `Last-Event-ID` sees the reset.
 
 The lease applies to a reserved item. A lease expiry removes the snapshot,
-and the item stays. A corrupt state file stops the relay at startup.
+and the item stays. A corrupt state file stops the relay at startup. The
+included systemd unit stops the restart loop after five failed starts, and
+the unit becomes `failed`.
 
 The reserve response holds the fields of the create response, and `label`.
 `v4vmm` parses `event_id`, `broadcaster_token`, `metadata_url`, and
@@ -176,11 +178,11 @@ a log.
 A weekly show and a permanent station both need an event that survives a
 restart of this process and the idle TTL. An ephemeral event does not.
 
-ADR 0001 in this repository records the decision, and
-`docs/plans/adr-0001-reserved-live-items-phase-plan.md` holds the work. Tasks
-001 to 004 are done: a reserved item survives a restart and the idle TTL, and
-the operator can list and delete reserved items. Task 005, the guards and the
-review, is open.
+ADR 0001 in this repository records the decision, and it is Implemented on
+2026-10-04. A reserved item survives a restart and the idle TTL, and the
+operator can list and delete reserved items. The review is
+`docs/reviews/adr-0001-implementation-review.md`. The operator procedures are
+in `docs/runbooks/reserved-live-items.md`.
 
 The requirement, from the 2026-09-06 chain review:
 

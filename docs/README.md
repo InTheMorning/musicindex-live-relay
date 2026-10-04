@@ -17,8 +17,8 @@ station runs continuously.
 
 ## ADRs
 
-- [ADR 0001: Reserved live items](adr/0001-reserved-live-items.md) — a durable
-  event class for stations and repeating shows
+- [ADR 0001: Reserved live items](adr/0001-reserved-live-items.md) —
+  Implemented. A durable event class for stations and repeating shows
 - [ADR 0002: A live event is a lease](adr/0002-live-lease.md) — Implemented. An
   event goes off air when its broadcaster stops the keepalive
 - [ADR 0003: Display state and artwork](adr/0003-display-state-and-artwork.md)
@@ -26,7 +26,7 @@ station runs continuously.
 
 ## Plans
 
-- [Reserved live items phase plan](plans/adr-0001-reserved-live-items-phase-plan.md)
+- [Reserved live items phase plan](plans/adr-0001-reserved-live-items-phase-plan.md) — Implemented
 - [Live lease proposal](plans/live-lease-heartbeat-proposal.md) — the proposal
   that ADR 0002 answers
 - [Live lease phase plan](plans/adr-0002-live-lease-phase-plan.md)
@@ -34,7 +34,8 @@ station runs continuously.
 
 ## Tasks
 
-Packets for the reserved live items plan. Strictly sequential.
+Packets for the reserved live items plan. Strictly sequential. All five are
+done, and ADR 0001 is Implemented.
 
 - [001 — Event store boundary](tasks/reserved-live-items-task-001-event-store-boundary.md)
 - [002 — Reserved class and admin credential](tasks/reserved-live-items-task-002-reserved-class-and-admin-credential.md)
@@ -54,8 +55,15 @@ after the reserved live items packets.
 - [001 — Lease state and expiry](tasks/live-lease-task-001-lease-state-and-expiry.md)
 - [002 — Keepalive route and documents](tasks/live-lease-task-002-keepalive-route-and-docs.md)
 
+## Runbooks
+
+- [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
+  rotate the admin token, restart, delete, and recover a corrupt state file
+
 ## Reviews
 
+- [ADR 0001 implementation review](reviews/adr-0001-implementation-review.md)
+  — the named artifact for the `Implemented` status of ADR 0001
 - [Live lease review checklist](reviews/live-lease-review-checklist.md)
 
 ## Research

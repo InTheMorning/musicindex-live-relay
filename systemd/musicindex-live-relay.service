@@ -1,6 +1,10 @@
 [Unit]
 Description=MusicIndex live metadata relay
 After=network.target
+# A corrupt state file fails each start. Five failed starts in 300 seconds
+# stop the restart loop, and systemd marks the unit failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple

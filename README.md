@@ -169,8 +169,9 @@ The idle TTL does not remove a reserved item. The lease applies to it. A
 lease expiry removes the snapshot, and the item and its identifier stay.
 
 If the state file is corrupt or the relay cannot read it, the relay stops at
-startup. The error names the path. The relay does not delete the file or make
-it again.
+startup with a non-zero exit code. The log line `relay stopped with an error`
+names the path and the cause. The relay does not delete the file or make it
+again.
 
 ### List Reserved Items
 
@@ -671,7 +672,7 @@ A systemd unit template is included at:
 systemd/musicindex-live-relay.service
 ```
 
-The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, gives the relay the state directory `/var/lib/musicindex-live-relay/`, and restarts on failure.
+The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, gives the relay the state directory `/var/lib/musicindex-live-relay/`, and restarts on failure. Five failed starts in 300 seconds stop the restart loop, and systemd marks the unit `failed`. A corrupt state file causes this. `docs/runbooks/reserved-live-items.md` gives the recovery.
 
 The relay can be exposed directly or behind any reverse proxy that preserves the service routes. MusicIndex currently deploys it behind nginx at `api.musicindex.org`; that deployment uses:
 

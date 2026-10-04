@@ -16,18 +16,25 @@ packet.
 - An ephemeral event lives in memory only. A restart or the idle TTL removes
   it.
 - A reserved event survives a restart and the idle TTL. A restart restores
-  its identity and its token hash, but never its snapshot (ADR 0001).
+  its identity and its token hash, but never its snapshot (ADR 0001). Until
+  the next publish, `remoteValue` gives `{}` and the metadata read gives
+  `404 metadata_not_found`.
 - The lease operates and has tests (ADR 0002).
-- ADR 0001, reserved live items, has the status `Accepted`. Tasks 001 to 003
-  are done. Task 004 is implemented and waits for review.
-  `POST /v1/liveitems/reserved` writes the identity of a reserved event to a
-  SQLite file, and the relay reads that file at startup.
+- ADR 0001, reserved live items, has the status `Implemented`. The review is
+  `docs/reviews/adr-0001-implementation-review.md`, and each ADR 0001
+  invariant has a test. `POST /v1/liveitems/reserved` writes the identity of
+  a reserved event to a SQLite file, and the relay reads that file at startup.
   `GET /v1/liveitems/reserved` lists the reserved events, and
   `DELETE /v1/liveitems/reserved/{event_id}` deletes one permanently. Until a
   later identity decision, only the operator makes a reserved event, with the
   admin token (ADR 0001).
+- `docs/runbooks/reserved-live-items.md` holds the operator procedures for
+  reserved events. A corrupt state file stops the relay at startup, and the
+  unit stops after five failed starts.
+- The reserved class is not deployed on a host. `v4vmm` has no packet yet to
+  reserve an event from the app.
 - ADR 0003, display state and artwork, has the status `Accepted`. Its
-  implementation needs ADR 0001 first.
+  implementation can start, because ADR 0001 is Implemented.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
@@ -117,8 +124,9 @@ This service carries payment routing to listener apps.
 ### 6. State Model Honesty
 
 - An ephemeral event lives in memory only, and it dies on a process restart
-  or after the idle TTL. A reserved event survives both, and it serves `{}`
-  after a restart until the next publish (ADR 0001).
+  or after the idle TTL. A reserved event survives both. After a restart it
+  serves no snapshot until the next publish: `remoteValue` gives `{}` and the
+  metadata route gives `404 metadata_not_found` (ADR 0001).
 - Consumers depend on those two death modes and work around them. A change to
   either one is an interoperability change. Record it in
   `docs/interoperability.md` in the same commit.

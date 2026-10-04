@@ -1958,4 +1958,88 @@ mod tests {
         let err = result.expect_err("a lease below the minimum is rejected");
         assert!(err.to_string().contains("LEASE_SECS"));
     }
+
+    #[test]
+    fn admin_token_matches_only_the_same_token() {
+        let admin_token = AdminToken::new("test-admin-token-0123456789");
+
+        assert!(admin_token.matches("test-admin-token-0123456789"));
+        assert!(!admin_token.matches("test-admin-token-0123456788"));
+        assert!(!admin_token.matches("test-admin-token-012345678"));
+        assert!(!admin_token.matches(""));
+    }
+
+    /// Returns the production part of a source file: the text before its
+    /// test module.
+    fn production_source(source: &'static str) -> &'static str {
+        source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production)
+    }
+
+    /// Returns the text of the function that starts at `signature`, up to
+    /// the first line that closes a block at the indent of the signature.
+    fn function_body(source: &'static str, signature: &str) -> &'static str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("the source has no `{signature}`"));
+        let indent = source[..start]
+            .rsplit_once('\n')
+            .map_or(start, |(_, line)| line.len());
+        let close = format!("\n{}}}\n", " ".repeat(indent));
+        let end = source[start..]
+            .find(&close)
+            .unwrap_or_else(|| panic!("`{signature}` has no end"));
+        &source[start..start + end]
+    }
+
+    // ADR 0001 §Invariants: token comparison stays constant time, for the
+    // admin token and for the broadcaster token. A test cannot measure the
+    // time of a comparison reliably. This guard proves that both checks go
+    // through `subtle::ConstantTimeEq` and that no hash is compared with
+    // `==` or `!=`.
+    #[test]
+    fn both_token_checks_use_the_constant_time_comparison() {
+        const FIX: &str = "ADR 0001 §Invariants and AGENTS.md §4: compare a token hash with \
+                           `subtle::ConstantTimeEq::ct_eq`, never with `==`. Route each token \
+                           check through `AdminToken::matches` or \
+                           `StoredEvent::token_hash_matches`.";
+        let lib = production_source(include_str!("lib.rs"));
+        let store = production_source(include_str!("store.rs"));
+
+        assert!(
+            function_body(lib, "fn matches(&self, candidate: &str)").contains(".ct_eq("),
+            "{FIX} `AdminToken::matches` does not call `ct_eq`."
+        );
+        assert!(
+            function_body(store, "pub fn token_hash_matches(").contains(".ct_eq("),
+            "{FIX} `StoredEvent::token_hash_matches` does not call `ct_eq`."
+        );
+
+        // The admin check, the publish check, and the keepalive check each
+        // call one of the two functions.
+        assert!(
+            function_body(lib, "fn authorize_admin(").contains("admin_token.matches("),
+            "{FIX} The admin check does not call `AdminToken::matches`."
+        );
+        for signature in ["pub async fn publish_metadata(", "pub async fn keepalive("] {
+            assert!(
+                function_body(lib, signature).contains(".token_hash_matches(&hash_token(token))"),
+                "{FIX} `{signature}` does not call `StoredEvent::token_hash_matches`."
+            );
+        }
+
+        for (file, source) in [("src/lib.rs", lib), ("src/store.rs", store)] {
+            for (index, line) in source.lines().enumerate() {
+                let code = line.split_once("//").map_or(line, |(code, _)| code);
+                let compares = code.contains("==") || code.contains("!=");
+                let names_a_secret = code.contains("hash") || code.contains("token");
+                assert!(
+                    !(compares && names_a_secret),
+                    "{FIX} {file}:{} compares a token or a hash with `==` or `!=`: {line}",
+                    index + 1
+                );
+            }
+        }
+    }
 }

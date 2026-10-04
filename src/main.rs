@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, process::ExitCode};
 
 use musicindex_live_relay::{AppConfig, RelayState, app, spawn_cleanup_task, spawn_lease_task};
 use tokio::net::TcpListener;
@@ -6,12 +6,25 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Log a startup error with `Display`, not `Debug`. A state file error then
+    // names the path and the cause in one line. The exit code stays non-zero,
+    // so systemd sees a failure.
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(error = %err, "relay stopped with an error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let bind: SocketAddr = config.bind;
     // With an admin token, `try_new` restores the reserved items and logs the
