@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -23,7 +23,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ use socketioxide::{
 };
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 use crate::store::{
@@ -442,6 +442,98 @@ impl RelayState {
         })
     }
 
+    /// Returns the reserved items, oldest first (ADR 0001).
+    ///
+    /// The list holds no ephemeral item, no token, and no token hash. The
+    /// table lock is released before the publish time of an item is read.
+    pub async fn list_reserved(&self) -> ReservedItemsResponse {
+        let mut entries: Vec<(StoredEvent, Option<Arc<LiveEventState>>)> = {
+            let events = self.inner.events.read().await;
+            events
+                .store
+                .list_ids()
+                .into_iter()
+                .filter_map(|event_id| {
+                    let stored = events.store.get(&event_id)?;
+                    (stored.class == EventClass::Reserved).then(|| {
+                        let live = events.live.get(&event_id).cloned();
+                        (stored, live)
+                    })
+                })
+                .collect()
+        };
+        entries.sort_by(|(a, _), (b, _)| {
+            (a.created_at, &a.event_id).cmp(&(b.created_at, &b.event_id))
+        });
+
+        ReservedItemsResponse {
+            reserved: entries
+                .into_iter()
+                .map(|(stored, live)| ReservedItem {
+                    created_at: format_timestamp(stored.created_at),
+                    last_publish_at: live
+                        .and_then(|live| live.last_publish_at())
+                        .map(format_timestamp),
+                    event_id: stored.event_id,
+                    label: stored.label,
+                })
+                .collect(),
+        }
+    }
+
+    /// Deletes a reserved item permanently (ADR 0001).
+    ///
+    /// The steps are in this order:
+    ///
+    /// 1. The store deletes the row from the state file. The SQLite call
+    ///    blocks, so it runs on the blocking thread pool with the table write
+    ///    lock held, as a reserve does.
+    /// 2. The live state leaves memory. The table write lock is then
+    ///    released.
+    /// 3. Each SSE stream of the item stops.
+    /// 4. Each Socket.IO client of the item gets `{}` and is disconnected.
+    ///
+    /// If step 1 fails, nothing changes. No lock is held during step 3 or
+    /// step 4.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found` when no reserved item holds `event_id`.
+    /// An ephemeral item gives the same answer and stays unchanged. Returns
+    /// `500 store_unavailable` when the state file write fails.
+    pub async fn delete_reserved(&self, event_id: &str) -> Result<(), ApiError> {
+        let events = Arc::clone(&self.inner.events).write_owned().await;
+        let is_reserved = events
+            .store
+            .get(event_id)
+            .is_some_and(|stored| stored.class == EventClass::Reserved);
+        if !is_reserved {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "event_not_found"));
+        }
+
+        let owned_event_id = event_id.to_string();
+        let (mut events, result) = tokio::task::spawn_blocking(move || {
+            let mut events = events;
+            let result = events.store.remove(&owned_event_id);
+            (events, result)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "delete task failed");
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "store_unavailable")
+        })?;
+        result?;
+        let live = events.live.remove(event_id);
+        drop(events);
+
+        if let Some(live) = live {
+            live.close();
+        }
+        self.disconnect_socket_clients(event_id).await;
+        tracing::info!(%event_id, "deleted reserved live item");
+        Ok(())
+    }
+
     /// Returns the stored identity and the live state of an event.
     ///
     /// The store decides if the event exists. The table lock is released
@@ -496,6 +588,7 @@ impl RelayState {
         };
 
         inner.latest = Some(snapshot.clone());
+        event.record_publish(now);
         inner.replay.push_back(snapshot.clone());
         while inner.replay.len() > REPLAY_CAPACITY {
             inner.replay.pop_front();
@@ -626,12 +719,14 @@ impl RelayState {
             }
         };
         let receiver = event.sender.subscribe();
+        let closed = event.closed.subscribe();
 
         Ok(EventSubscription {
             state: self.clone(),
             event,
             replay,
             receiver,
+            closed,
         })
     }
 
@@ -739,6 +834,19 @@ impl RelayState {
             .expect("socket_io already attached; app(state) called twice on same RelayState");
     }
 
+    /// Sends `{}` to each Socket.IO client of a deleted event, then
+    /// disconnects it. A new client of an unknown event gets the same
+    /// treatment from the namespace handler.
+    async fn disconnect_socket_clients(&self, event_id: &str) {
+        self.emit_socket_remote_value(event_id, &json!({})).await;
+        if let Some(io) = self.inner.socket_io.get()
+            && let Some(event_ns) = io.of("/event")
+            && let Err(err) = event_ns.to(event_id.to_string()).disconnect().await
+        {
+            tracing::warn!(%event_id, ?err, "failed to disconnect Socket.IO clients");
+        }
+    }
+
     async fn emit_socket_remote_value(&self, event_id: &str, metadata: &Value) {
         if let Some(io) = self.inner.socket_io.get()
             && let Some(event_ns) = io.of("/event")
@@ -792,8 +900,16 @@ struct LiveEventState {
     last_activity: AtomicU64,
     renewed_at: AtomicU64,
     publish_window: AtomicU64,
+    /// The time of the last accepted metadata publish. Only a publish sets
+    /// it. A keepalive does not. It is in memory only, so a restart clears
+    /// it (ADR 0001).
+    last_publish_at: Mutex<Option<u64>>,
     inner: RwLock<LiveEventInner>,
     sender: broadcast::Sender<MetadataSnapshot>,
+    /// Changes to `true` when an operator deletes the event. Each SSE stream
+    /// of the event then stops. Only a delete sets it, and only a reserved
+    /// item can be deleted.
+    closed: watch::Sender<bool>,
 }
 
 struct LiveEventInner {
@@ -809,12 +925,14 @@ impl LiveEventState {
             last_activity: AtomicU64::new(now),
             renewed_at: AtomicU64::new(now),
             publish_window: AtomicU64::new(0),
+            last_publish_at: Mutex::new(None),
             inner: RwLock::new(LiveEventInner {
                 seq: 0,
                 latest: None,
                 replay: VecDeque::with_capacity(REPLAY_CAPACITY),
             }),
             sender,
+            closed: watch::channel(false).0,
         }
     }
 
@@ -829,6 +947,26 @@ impl LiveEventState {
     fn renew_lease(&self, now: u64) {
         self.renewed_at.store(now, Ordering::Relaxed);
     }
+
+    fn record_publish(&self, now: u64) {
+        *self
+            .last_publish_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(now);
+    }
+
+    fn last_publish_at(&self) -> Option<u64> {
+        *self
+            .last_publish_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stops each SSE stream of the event. A stream that starts later stops
+    /// at once.
+    fn close(&self) {
+        self.closed.send_replace(true);
+    }
 }
 
 struct EventSubscription {
@@ -836,6 +974,7 @@ struct EventSubscription {
     event: Arc<LiveEventState>,
     replay: Vec<MetadataSnapshot>,
     receiver: broadcast::Receiver<MetadataSnapshot>,
+    closed: watch::Receiver<bool>,
 }
 
 impl Drop for EventSubscription {
@@ -901,6 +1040,32 @@ pub struct ReserveEventResponse {
     /// The operator name. It is absent when the request holds no label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// The response of `GET /v1/liveitems/reserved`.
+///
+/// It is an object, not a bare array, so a later field does not change the
+/// shape that `v4vmm` parses. An empty list keeps the `reserved` key.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReservedItemsResponse {
+    /// The reserved items, oldest first.
+    pub reserved: Vec<ReservedItem>,
+}
+
+/// One reserved item in the list. It holds no token and no token hash.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReservedItem {
+    /// The event identifier.
+    pub event_id: String,
+    /// The operator name. It is absent when the item has no label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The creation time, in RFC 3339.
+    pub created_at: String,
+    /// The time of the last accepted publish, in RFC 3339. It is absent
+    /// when the item has not published since the relay started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_publish_at: Option<String>,
 }
 
 /// The body of `POST /v1/liveitems/reserved`. Each field is optional.
@@ -1017,8 +1182,11 @@ pub fn app(state: RelayState) -> Router {
         .route("/v1/liveitems/", post(create_event))
         .route(
             "/v1/liveitems/reserved",
-            post(reserve_event).route_layer(RequestBodyLimitLayer::new(RESERVE_BODY_LIMIT_BYTES)),
+            post(reserve_event)
+                .get(list_reserved)
+                .route_layer(RequestBodyLimitLayer::new(RESERVE_BODY_LIMIT_BYTES)),
         )
+        .route("/v1/liveitems/reserved/{event_id}", delete(delete_reserved))
         .route(
             "/v1/liveitems/{event_id}/metadata",
             get(latest_metadata)
@@ -1092,6 +1260,28 @@ async fn reserve_event(
     Ok((StatusCode::CREATED, Json(reserved)))
 }
 
+/// Handles `GET /v1/liveitems/reserved`.
+async fn list_reserved(
+    AxumState(state): AxumState<RelayState>,
+    headers: HeaderMap,
+) -> Result<Json<ReservedItemsResponse>, ApiError> {
+    state.authorize_admin(&headers)?;
+    Ok(Json(state.list_reserved().await))
+}
+
+/// Handles `DELETE /v1/liveitems/reserved/{event_id}`.
+///
+/// The handler checks the admin credential before it looks for the item.
+async fn delete_reserved(
+    AxumState(state): AxumState<RelayState>,
+    Path(event_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    state.authorize_admin(&headers)?;
+    state.delete_reserved(&event_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn publish_metadata(
     AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
@@ -1154,7 +1344,15 @@ async fn events(
         }
 
         loop {
-            match subscription.receiver.recv().await {
+            // A delete closes the event. The stream then ends, and a
+            // reconnect gets `404`. The flag never changes for an ephemeral
+            // event, because an ephemeral event cannot be deleted.
+            let received = tokio::select! {
+                biased;
+                _ = subscription.closed.wait_for(|closed| *closed) => break,
+                received = subscription.receiver.recv() => received,
+            };
+            match received {
                 Ok(snapshot) => {
                     subscription.event.touch(subscription.state.now());
                     yield Ok(snapshot_to_sse_remote_value(snapshot));

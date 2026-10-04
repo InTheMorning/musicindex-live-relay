@@ -1,6 +1,6 @@
 # Reserved Live Items Task 004: List And Delete Reserved Items
 
-Status: Ready - 2026-09-09. Do after 003.
+Status: Implemented - 2026-10-04. See §Review Result.
 
 Every criterion in this packet is mechanical. This service has no user
 interface, so it has no visual criteria and needs no operator check.
@@ -171,3 +171,30 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-04. The review changed no code. No test expectation changed,
+and 11 new tests cover the routes. Each rule was broken on purpose, and a test
+failed each time.
+
+The review accepts these deviations:
+
+- A per-event close signal stops the SSE stream of a deleted item, because the
+  broadcast channel cannot close while a subscriber holds the event. Only a
+  delete sets the signal, so ephemeral events do not change.
+- `last_publish_at` follows the contract, not the word "last activity" in
+  §Constraints. Only an accepted publish sets it, and it is kept in memory
+  only.
+- A delete sends `{}` to the Socket.IO room before it disconnects the clients.
+- The static path `reserved` now takes the requests for an event with the
+  identifier `reserved`. The relay never makes that identifier, because its
+  identifiers have 22 characters.
+
+Points that stay open:
+
+- A publish that started before a delete can send one payload to the Socket.IO
+  room before the disconnect. A lock across an emit is not allowed, so this
+  window stays. A delete is an operator action.
+- No automatic test covers the Socket.IO disconnect, because the tests have
+  no Socket.IO client.

@@ -22,6 +22,8 @@ By default the relay binds to `127.0.0.1:8018`. It serves these routes at whatev
 ```text
 POST /v1/liveitems
 POST /v1/liveitems/reserved
+GET  /v1/liveitems/reserved
+DELETE /v1/liveitems/reserved/{event_id}
 GET  /v1/liveitems/{event_id}/metadata
 POST /v1/liveitems/{event_id}/keepalive
 GET  /v1/liveitems/{event_id}/remoteValue
@@ -169,6 +171,88 @@ lease expiry removes the snapshot, and the item and its identifier stay.
 If the state file is corrupt or the relay cannot read it, the relay stops at
 startup. The error names the path. The relay does not delete the file or make
 it again.
+
+### List Reserved Items
+
+```http
+GET /v1/liveitems/reserved
+Authorization: Bearer <admin_token>
+```
+
+Returns the reserved items, oldest first (ADR 0001). The request needs the
+admin token. The list never holds an ephemeral item. A client that needs a
+list of its ephemeral items must keep its own registry.
+
+Response, with status `200 OK`:
+
+```json
+{
+  "reserved": [
+    {
+      "event_id": "<random opaque id>",
+      "label": "weekly show",
+      "created_at": "2026-09-09T18:00:00Z",
+      "last_publish_at": "2026-09-09T19:30:00Z"
+    }
+  ]
+}
+```
+
+The body is an object that holds the `reserved` array. It is not a bare
+array. With no reserved item, the body is `{"reserved": []}`.
+
+- `label` is absent when the item has no label.
+- `created_at` is the reserve time. A restart keeps it.
+- `last_publish_at` is the time of the last accepted publish. A keepalive
+  does not change it. It is absent when the item has not published since the
+  relay started, because the relay keeps it in memory only.
+
+The list never holds a broadcaster token or a token hash.
+
+Status codes:
+
+- `200` with the list.
+- `401` when the admin token is missing or malformed.
+- `403` with error code `invalid_admin_token` when the admin token is wrong.
+- `404` with error code `reserved_items_disabled` when no admin token is configured. The feature is off.
+
+### Delete Reserved Item
+
+```http
+DELETE /v1/liveitems/reserved/{event_id}
+Authorization: Bearer <admin_token>
+```
+
+Deletes one reserved item (ADR 0001). The request needs the admin token.
+
+**A delete is permanent.** The relay removes the row from
+the state file first, then removes the item from memory. A restart does not
+restore the item. The broadcaster token of the item becomes invalid.
+
+After a delete:
+
+- Each route of that identifier answers `404` with error code
+  `event_not_found`. This includes `metadata`, `remoteValue`, `events`, a
+  publish and a keepalive.
+- Each SSE stream of the item ends. A reconnect gets `404`.
+- Each Socket.IO client of the item gets `{}` and is disconnected. A
+  reconnect gets `{}` and is disconnected, as for each unknown event.
+
+The route never deletes an ephemeral item. An ephemeral identifier gets the
+same `404` as an identifier that does not exist, and the item stays.
+
+Status codes:
+
+- `204` when the relay deleted the item. The body is empty.
+- `401` when the admin token is missing or malformed.
+- `403` with error code `invalid_admin_token` when the admin token is wrong.
+- `404` with error code `reserved_items_disabled` when no admin token is configured. The feature is off.
+- `404` with error code `event_not_found` when no reserved item has the identifier. An ephemeral identifier gets this answer.
+- `500` with error code `store_unavailable` when the state file write failed. The item stays. The body holds no other detail.
+
+The two `404` answers differ in the error code. A client can also tell them
+apart from the credential: `reserved_items_disabled` comes before the relay
+examines the credential.
 
 ### Publish Metadata
 
@@ -542,7 +626,7 @@ Configuration is read from environment variables.
 | `MAX_CREATES_PER_SEC` | `50` | Global cap on `POST /v1/liveitems` per second. Returns 429 when exceeded. |
 | `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Returns 429 when exceeded. |
 | `LEASE_SECS` | `90` | Lease duration for an event. Must be 10 or more. See "The Lease" above. |
-| `ADMIN_TOKEN` | not set | The operator credential for `POST /v1/liveitems/reserved`. It must have 16 bytes or more. When it is not set, the route answers `404` and the relay opens no state file. |
+| `ADMIN_TOKEN` | not set | The operator credential for the reserve, list and delete routes of reserved items. It must have 16 bytes or more. When it is not set, these routes answer `404` and the relay opens no state file. |
 | `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay opens it and restores the reserved items only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
 | `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
 

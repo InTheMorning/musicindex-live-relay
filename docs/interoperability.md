@@ -134,13 +134,31 @@ the event is dead. The event identifier and the stored token do not become
 invalid. A broadcaster that resumes publishing brings the same event back
 on air with no new identifier.
 
-### No list route and no delete route
+### List and delete apply to reserved items only
 
-This service cannot tell a client which events it owns. A client that needs a
-list must keep its own.
+ADR 0001 adds two admin routes. `GET /v1/liveitems/reserved` lists the
+reserved items. `DELETE /v1/liveitems/reserved/{event_id}` deletes one
+reserved item permanently. Both routes need the admin token. With no admin
+token configured, both answer `404` with the error code
+`reserved_items_disabled`.
 
-`Delete` in a control surface therefore means "forget locally". This service
-discards its own record at the next restart.
+A control surface can list and delete reserved items:
+
+- The list is an object that holds a `reserved` array. Each item holds
+  `event_id`, `created_at`, and `label` and `last_publish_at` when they have a
+  value. The list never holds a token or a token hash.
+- `last_publish_at` is in memory only. It is absent after a restart until the
+  next publish.
+- A delete answers `204`. After it, each route of that identifier answers
+  `404` with the error code `event_not_found`. SSE streams of the item end,
+  and Socket.IO clients get `{}` and are disconnected.
+
+Neither route reports an ephemeral item. An ephemeral identifier gets the same
+`404` as an absent identifier, and the delete removes nothing. A client that
+needs a list of its ephemeral items must keep its own registry. For an
+ephemeral item, `Delete` in a control surface means "forget locally".
+This service discards its own record at the next restart or after the idle
+TTL.
 
 ### The token is returned one time
 
@@ -160,8 +178,9 @@ restart of this process and the idle TTL. An ephemeral event does not.
 
 ADR 0001 in this repository records the decision, and
 `docs/plans/adr-0001-reserved-live-items-phase-plan.md` holds the work. Tasks
-001 to 003 are done: a reserved item survives a restart and the idle TTL. The
-list route and the delete route of task 004 are open.
+001 to 004 are done: a reserved item survives a restart and the idle TTL, and
+the operator can list and delete reserved items. Task 005, the guards and the
+review, is open.
 
 The requirement, from the 2026-09-06 chain review:
 

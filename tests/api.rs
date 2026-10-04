@@ -1417,4 +1417,483 @@ mod reserved {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(std::fs::read(&state_file).expect("read"), before);
     }
+
+    /// Tests for the list and delete routes of ADR 0001 task 004.
+    mod list_and_delete {
+        use super::*;
+
+        async fn list(router: axum::Router, credential: Option<&str>) -> axum::response::Response {
+            let mut builder = Request::builder().uri("/v1/liveitems/reserved");
+            if let Some(credential) = credential {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {credential}"));
+            }
+            router
+                .oneshot(builder.body(Body::empty()).expect("list request"))
+                .await
+                .expect("list response")
+        }
+
+        async fn list_ok(router: axum::Router) -> Value {
+            let response = list(router, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            read_json(response).await
+        }
+
+        async fn delete(
+            router: axum::Router,
+            event_id: &str,
+            credential: Option<&str>,
+        ) -> axum::response::Response {
+            let mut builder = Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/liveitems/reserved/{event_id}"));
+            if let Some(credential) = credential {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {credential}"));
+            }
+            router
+                .oneshot(builder.body(Body::empty()).expect("delete request"))
+                .await
+                .expect("delete response")
+        }
+
+        fn listed_ids(body: &Value) -> Vec<String> {
+            body["reserved"]
+                .as_array()
+                .expect("reserved array")
+                .iter()
+                .map(|item| item["event_id"].as_str().expect("event_id").to_string())
+                .collect()
+        }
+
+        fn stored_hash(path: &Path, event_id: &str) -> Vec<u8> {
+            rusqlite::Connection::open(path)
+                .expect("open state file")
+                .query_row(
+                    "SELECT token_hash FROM live_items WHERE event_id = ?1",
+                    [event_id],
+                    |row| row.get(0),
+                )
+                .expect("token hash")
+        }
+
+        fn timestamp(seconds: i64) -> String {
+            time::OffsetDateTime::from_unix_timestamp(seconds)
+                .expect("timestamp")
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format")
+        }
+
+        #[tokio::test]
+        async fn list_with_correct_credential_returns_only_reserved_items() {
+            let (router, _dir, _state_file) = reserved_app();
+            let first = reserve_ok(router.clone(), Some("weekly show")).await;
+            let second = reserve_ok(router.clone(), None).await;
+            let ephemeral = create_event(router.clone()).await;
+
+            let body = list_ok(router).await;
+
+            let mut ids = listed_ids(&body);
+            ids.sort();
+            let mut expected = vec![first.event_id.clone(), second.event_id.clone()];
+            expected.sort();
+            assert_eq!(ids, expected);
+            assert!(!ids.contains(&ephemeral.event_id));
+            let items = body["reserved"].as_array().expect("array");
+            let labelled = items
+                .iter()
+                .find(|item| item["event_id"] == first.event_id.as_str())
+                .expect("first item");
+            assert_eq!(labelled["label"], "weekly show");
+            let unlabelled = items
+                .iter()
+                .find(|item| item["event_id"] == second.event_id.as_str())
+                .expect("second item");
+            assert!(unlabelled.get("label").is_none());
+        }
+
+        #[tokio::test]
+        async fn list_with_no_reserved_item_keeps_the_key() {
+            let (router, _dir, _state_file) = reserved_app();
+            create_event(router.clone()).await;
+
+            let body = list_ok(router).await;
+
+            assert_eq!(body, json!({ "reserved": [] }));
+        }
+
+        #[tokio::test]
+        async fn list_holds_no_token_and_no_hash() {
+            let (router, _dir, state_file) = reserved_app();
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = list(router, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+            let body: Value = serde_json::from_str(&text).expect("json");
+
+            assert_eq!(body.as_object().expect("object").len(), 1);
+            let item = body["reserved"][0].as_object().expect("item");
+            let mut keys: Vec<&str> = item.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["created_at", "event_id", "label", "last_publish_at"]
+            );
+
+            let hash = stored_hash(&state_file, &reserved.event_id);
+            let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+            let byte_list = serde_json::to_string(&hash).expect("bytes");
+            assert!(!text.contains(&reserved.broadcaster_token), "token in list");
+            assert!(!text.contains(ADMIN_TOKEN), "admin token in list");
+            assert!(!text.to_lowercase().contains(&hex), "hex hash in list");
+            assert!(
+                !text.contains(&byte_list[1..byte_list.len() - 1]),
+                "hash bytes in list"
+            );
+            assert!(!text.contains("token"), "a token field in list");
+            assert!(!text.contains("hash"), "a hash field in list");
+        }
+
+        #[tokio::test]
+        async fn list_reports_the_last_publish_and_not_a_keepalive() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(1_000));
+            let router = app(reserved_state_at(&state_file, &clock).expect("open state"));
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let body = list_ok(router.clone()).await;
+            let item = &body["reserved"][0];
+            assert_eq!(item["created_at"], timestamp(1_000));
+            assert!(
+                item.get("last_publish_at").is_none(),
+                "absent before the first publish: {item}"
+            );
+
+            clock.store(1_005, Ordering::SeqCst);
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            clock.store(1_008, Ordering::SeqCst);
+            let response = keepalive(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            // A rejected publish does not move the time.
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some("wrong"),
+                json!({ "title": "x" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+            let body = list_ok(router).await;
+            let item = &body["reserved"][0];
+            assert_eq!(item["created_at"], timestamp(1_000));
+            assert_eq!(item["last_publish_at"], timestamp(1_005));
+        }
+
+        #[tokio::test]
+        async fn list_after_a_restart_has_no_last_publish() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let reserved = reserve_publish_and_stop(&state_file, "before restart").await;
+
+            let clock = Arc::new(AtomicU64::new(5_000));
+            let router = app(reserved_state_at(&state_file, &clock).expect("restore"));
+            let body = list_ok(router).await;
+
+            assert_eq!(listed_ids(&body), vec![reserved.event_id]);
+            let item = &body["reserved"][0];
+            assert_eq!(item["label"], "station");
+            assert_eq!(item["created_at"], timestamp(1_000));
+            assert!(item.get("last_publish_at").is_none(), "{item}");
+        }
+
+        #[tokio::test]
+        async fn delete_removes_the_item_and_a_later_read_answers_404() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(1_000));
+            let router = app(reserved_state_at(&state_file, &clock).expect("open state"));
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            let kept = reserve_ok(router.clone(), Some("other")).await;
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "on air" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = delete(router.clone(), &reserved.event_id, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert!(bytes.is_empty());
+
+            for route in ["metadata", "remoteValue", "events"] {
+                let response = get(
+                    router.clone(),
+                    format!("/v1/liveitems/{}/{route}", reserved.event_id),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+                assert_eq!(error_code(response).await, "event_not_found", "{route}");
+            }
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "x" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let response = keepalive(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let response = delete(router.clone(), &reserved.event_id, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+            assert_eq!(
+                listed_ids(&list_ok(router).await),
+                vec![kept.event_id.clone()]
+            );
+            assert_eq!(reserved_row_count(&state_file), 1);
+
+            // The delete is permanent. A restart does not bring the item back.
+            let router = app(reserved_state_at(&state_file, &clock).expect("restore"));
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(listed_ids(&list_ok(router).await), vec![kept.event_id]);
+        }
+
+        #[tokio::test]
+        async fn delete_of_an_ephemeral_identifier_answers_404_and_removes_nothing() {
+            let (router, _dir, state_file) = reserved_app();
+            reserve_ok(router.clone(), None).await;
+            let ephemeral = create_event(router.clone()).await;
+            let response = publish(
+                router.clone(),
+                &ephemeral.event_id,
+                Some(&ephemeral.broadcaster_token),
+                json!({ "title": "ephemeral show" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = delete(router.clone(), &ephemeral.event_id, Some(ADMIN_TOKEN)).await;
+            let ephemeral_status = response.status();
+            let ephemeral_body: Value = read_json(response).await;
+            let response = delete(router.clone(), "no-such-item", Some(ADMIN_TOKEN)).await;
+            let absent_status = response.status();
+            let absent_body: Value = read_json(response).await;
+
+            // An ephemeral identifier gives the same answer as an absent one.
+            assert_eq!(ephemeral_status, StatusCode::NOT_FOUND);
+            assert_eq!(ephemeral_status, absent_status);
+            assert_eq!(ephemeral_body, absent_body);
+
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/remoteValue", ephemeral.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: Value = read_json(response).await;
+            assert_eq!(value, json!({ "title": "ephemeral show" }));
+            let response = publish(
+                router,
+                &ephemeral.event_id,
+                Some(&ephemeral.broadcaster_token),
+                json!({ "title": "still here" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(reserved_row_count(&state_file), 1);
+        }
+
+        #[tokio::test]
+        async fn both_routes_answer_401_and_403_for_a_bad_credential() {
+            let (router, _dir, state_file) = reserved_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let ephemeral = create_event(router.clone()).await;
+
+            let response = list(router.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = delete(router.clone(), &reserved.event_id, None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+            for credential in [
+                "wrong-admin-token-0123456789",
+                reserved.broadcaster_token.as_str(),
+                ephemeral.broadcaster_token.as_str(),
+            ] {
+                let response = list(router.clone(), Some(credential)).await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_eq!(error_code(response).await, "invalid_admin_token");
+                let response = delete(router.clone(), &reserved.event_id, Some(credential)).await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_eq!(error_code(response).await, "invalid_admin_token");
+            }
+
+            // A rejected credential gets the same answer for an absent item,
+            // so it cannot probe for an identifier.
+            let response = delete(
+                router.clone(),
+                "no-such-item",
+                Some("wrong-admin-token-0123456789"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+            assert_eq!(reserved_row_count(&state_file), 1);
+            let response = get(
+                router,
+                format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn both_routes_answer_404_with_no_admin_token_configured() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let router = app(RelayState::new(AppConfig {
+                state_file: state_file.clone(),
+                ..AppConfig::for_tests()
+            }));
+            let ephemeral = create_event(router.clone()).await;
+
+            let response = list(router.clone(), Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "reserved_items_disabled");
+            let response = delete(router.clone(), &ephemeral.event_id, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(response).await, "reserved_items_disabled");
+
+            let response = get(
+                router,
+                format!("/v1/liveitems/{}/remoteValue", ephemeral.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!state_file.exists(), "a disabled feature opens no file");
+        }
+
+        #[tokio::test]
+        async fn a_subscriber_to_a_deleted_item_stops() {
+            let (router, _dir, _state_file) = reserved_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let ephemeral = create_event(router.clone()).await;
+
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/events", reserved.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/events", ephemeral.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut ephemeral_body = response.into_body();
+
+            let response = delete(router.clone(), &reserved.event_id, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+            // The stream ends. A keep-alive comment can come first.
+            let ended = timeout(Duration::from_secs(2), async {
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.expect("frame");
+                    if let Some(data) = frame.data_ref() {
+                        assert!(
+                            !String::from_utf8_lossy(data).contains("remoteValue"),
+                            "a deleted item sent an update"
+                        );
+                    }
+                }
+            })
+            .await;
+            assert!(
+                ended.is_ok(),
+                "the SSE stream of a deleted item did not stop"
+            );
+
+            // The stream of another event stays open and gets its updates.
+            let response = publish(
+                router,
+                &ephemeral.event_id,
+                Some(&ephemeral.broadcaster_token),
+                json!({ "title": "still live" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let chunk = next_sse_chunk(&mut ephemeral_body).await;
+            assert!(chunk.contains("still live"), "{chunk}");
+        }
+
+        #[tokio::test]
+        async fn delete_store_failure_returns_500_and_changes_nothing() {
+            let (router, _dir, state_file) = reserved_app();
+            let reserved = reserve_ok(router.clone(), Some("station")).await;
+            rusqlite::Connection::open(&state_file)
+                .expect("open state file")
+                .execute("DROP TABLE live_items", [])
+                .expect("drop table");
+
+            let response = delete(router.clone(), &reserved.event_id, Some(ADMIN_TOKEN)).await;
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body: Value = read_json(response).await;
+            assert_eq!(body, json!({ "error": "store_unavailable" }));
+            // The file write comes first. It failed, so the item stays live.
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": "still here" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(listed_ids(&list_ok(router).await), vec![reserved.event_id]);
+        }
+    }
 }

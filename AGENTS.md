@@ -19,11 +19,13 @@ packet.
   its identity and its token hash, but never its snapshot (ADR 0001).
 - The lease operates and has tests (ADR 0002).
 - ADR 0001, reserved live items, has the status `Accepted`. Tasks 001 to 003
-  are done. `POST /v1/liveitems/reserved` writes the identity of a reserved
-  event to a SQLite file, and the relay reads that file at startup. The list
-  and delete routes of task 004 do not exist yet. Until a later identity
-  decision, only the operator makes a reserved event, with the admin token
-  (ADR 0001).
+  are done. Task 004 is implemented and waits for review.
+  `POST /v1/liveitems/reserved` writes the identity of a reserved event to a
+  SQLite file, and the relay reads that file at startup.
+  `GET /v1/liveitems/reserved` lists the reserved events, and
+  `DELETE /v1/liveitems/reserved/{event_id}` deletes one permanently. Until a
+  later identity decision, only the operator makes a reserved event, with the
+  admin token (ADR 0001).
 - ADR 0003, display state and artwork, has the status `Accepted`. Its
   implementation needs ADR 0001 first.
 - The broadcaster identity model is open. The options are in
