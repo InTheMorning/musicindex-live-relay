@@ -6,6 +6,26 @@ live metadata to listener apps over Socket.IO, server-sent events, and HTTP.
 Read `docs/interoperability.md` before a change to a route, a body form, or the
 state model. Three other repositories depend on those choices.
 
+## Current State
+
+`docs/README.md` lists each ADR with its status, each plan and each task
+packet.
+
+- No one runs the relay in production. A change needs no transition period
+  for an older client.
+- Every event is ephemeral and lives in memory only. A restart or the idle
+  TTL removes it.
+- The lease operates and has tests (ADR 0002).
+- ADR 0001, reserved live items, has the status `Accepted`. Its five task
+  packets are ready. Its implementation has not started. Until a later
+  identity decision, only the operator makes a reserved event, with the admin
+  token (ADR 0001).
+- ADR 0003, display state and artwork, has the status `Accepted`. Its
+  implementation needs ADR 0001 first.
+- The broadcaster identity model is open. The options are in
+  `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
+  relay accepts other broadcasters.
+
 ## Build / Lint / Test Commands
 
 ```bash

@@ -49,6 +49,14 @@ Skip reserved items in the reaper.
   items.
 - Startup logs the state file path and the count of restored items. It logs no
   identifier and no hash.
+- **The lease of ADR 0002 also applies to a reserved item.** Added
+  2026-10-04, because ADR 0002 came after this packet.
+  - A restored item has no snapshot, so it is not on air.
+  - When the lease of a reserved item ends, `expire_leases` removes its
+    snapshot as for any item. The reaper skips the item, so the item and its
+    identifier stay.
+  - A keepalive on a restored item with no snapshot gives
+    `409 lease_expired`, as ADR 0002 says.
 
 ## Implementation Steps
 
@@ -78,6 +86,8 @@ Skip reserved items in the reaper.
 - A stored broadcaster token still validates after a restart.
 - A restored item serves `{}`, never the previous payload.
 - The reaper keeps reserved items and still removes ephemeral ones.
+- A keepalive on a restored item gives `409 lease_expired`. A lease expiry on a
+  reserved item removes its snapshot and keeps the item.
 - A corrupt file fails startup with the path in the message.
 - `README.md` and `docs/interoperability.md` describe the new behavior.
 

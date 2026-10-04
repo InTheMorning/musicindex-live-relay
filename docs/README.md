@@ -30,6 +30,7 @@ station runs continuously.
 - [Live lease proposal](plans/live-lease-heartbeat-proposal.md) — the proposal
   that ADR 0002 answers
 - [Live lease phase plan](plans/adr-0002-live-lease-phase-plan.md)
+- [Display state phase plan](plans/adr-0003-display-state-phase-plan.md)
 
 ## Tasks
 
@@ -40,6 +41,12 @@ Packets for the reserved live items plan. Strictly sequential.
 - [003 — Restore on startup and TTL exemption](tasks/reserved-live-items-task-003-restore-and-ttl-exemption.md)
 - [004 — List and delete reserved items](tasks/reserved-live-items-task-004-list-and-delete.md)
 - [005 — Guards, runbook, and review](tasks/reserved-live-items-task-005-guards-and-review.md)
+
+Packets for the display state plan. ADR 0003 governs them. They need the
+reserved live items packets first. Task 002 needs task 001.
+
+- [001 — The display state and its routes](tasks/display-state-task-001-state-and-routes.md)
+- [002 — The artwork store](tasks/display-state-task-002-artwork-store.md)
 
 Packets for the live lease plan. Strictly sequential. They can go before or
 after the reserved live items packets.
