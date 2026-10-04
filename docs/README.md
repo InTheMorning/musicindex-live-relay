@@ -21,6 +21,8 @@ station runs continuously.
   event class for stations and repeating shows
 - [ADR 0002: A live event is a lease](adr/0002-live-lease.md) — Implemented. An
   event goes off air when its broadcaster stops the keepalive
+- [ADR 0003: Display state and artwork](adr/0003-display-state-and-artwork.md)
+  — Proposed. Optional display routes and an image store for reserved events
 
 ## Plans
 
