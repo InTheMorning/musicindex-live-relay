@@ -2,10 +2,12 @@
 
 ## Status
 
-Proposed - 2026-10-04.
+Accepted - 2026-10-04.
 
-This ADR becomes Accepted when the operator accepts it. It needs ADR 0001,
+Accepted 2026-10-04 by the operator. The implementation needs ADR 0001,
 because only a reserved event can use these routes.
+
+Proposed 2026-10-04.
 
 `musicindex-live-publisher` ADR 0008 is the broadcaster side. It decides what
 the producer and the publisher send. This ADR decides the routes, the limits
