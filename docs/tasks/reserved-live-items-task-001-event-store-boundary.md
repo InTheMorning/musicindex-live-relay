@@ -1,7 +1,6 @@
 # Reserved Live Items Task 001: Event Store Boundary
 
-Status: Ready - 2026-09-09. Do first. Every later packet writes through the
-boundary this one adds.
+Status: Implemented - 2026-10-04. See §Review Result.
 
 Every criterion in this packet is mechanical. This service has no user
 interface, so it has no visual criteria and needs no operator check.
@@ -122,3 +121,19 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-04. The review changed no code. No test expectation changed,
+and `tests/api.rs`, `README.md`, `Cargo.toml` and `Cargo.lock` have no diff.
+
+- The keepalive and `expire_leases` also go through the store. ADR 0002 came
+  after this packet.
+- The lock order of the lease review stays. The table lock is released before
+  the first event lock. `expire_leases` checks the lease again under the event
+  write lock, and the keepalive renews under the event read lock. No lock is
+  held across an emit.
+- The module `store` is public, because clippy rejects the unused `remove`
+  in a private module. ADR 0001 task 004 uses it.
+- The trait methods return no `Result`. Task 002 adds the SQLite store, so it
+  must change the trait to return `Result`, or wrap the store.

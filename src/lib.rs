@@ -1,3 +1,5 @@
+pub mod store;
+
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
@@ -29,10 +31,11 @@ use socketioxide::{
     SocketIo,
     extract::{SocketRef, State as SocketState},
 };
-use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{RwLock, broadcast};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
+
+use crate::store::{EventClass, EventStore, MemoryEventStore, StoredEvent};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8018";
 const DEFAULT_MAX_ACTIVE_EVENTS: usize = 10_000;
@@ -146,11 +149,21 @@ pub struct RelayState {
 
 struct RelayStateInner {
     config: AppConfig,
-    events: RwLock<HashMap<String, Arc<LiveEventState>>>,
+    events: RwLock<EventTable>,
     sse_connections: AtomicUsize,
     create_window: AtomicU64,
     socket_io: OnceLock<SocketIo>,
     clock: Clock,
+}
+
+/// The identity half and the live half of each event.
+///
+/// One lock protects both halves, so they always hold the same identifiers.
+/// The store holds the identity. `live` holds the snapshot, the replay
+/// buffer, the broadcast sender, and the lease time.
+struct EventTable {
+    store: Box<dyn EventStore>,
+    live: HashMap<String, Arc<LiveEventState>>,
 }
 
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -164,7 +177,10 @@ impl RelayState {
         Self {
             inner: Arc::new(RelayStateInner {
                 config,
-                events: RwLock::new(HashMap::new()),
+                events: RwLock::new(EventTable {
+                    store: Box::new(MemoryEventStore::new()),
+                    live: HashMap::new(),
+                }),
                 sse_connections: AtomicUsize::new(0),
                 create_window: AtomicU64::new(0),
                 socket_io: OnceLock::new(),
@@ -190,18 +206,26 @@ impl RelayState {
         }
 
         let mut events = self.inner.events.write().await;
-        if events.len() >= self.inner.config.max_active_events {
+        if events.live.len() >= self.inner.config.max_active_events {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "max_active_events_reached",
             ));
         }
 
-        let event_id = unique_event_id(&events);
+        let event_id = unique_event_id(events.store.as_ref());
         let token = random_urlsafe(TOKEN_BYTES);
-        let event = Arc::new(LiveEventState::new(hash_token(&token), self.now()));
+        let now = self.now();
 
-        events.insert(event_id.clone(), event);
+        events.store.insert(StoredEvent {
+            event_id: event_id.clone(),
+            token_hash: hash_token(&token),
+            created_at: now,
+            class: EventClass::Ephemeral,
+        });
+        events
+            .live
+            .insert(event_id.clone(), Arc::new(LiveEventState::new(now)));
 
         Ok(CreateEventResponse {
             event_id: event_id.clone(),
@@ -213,14 +237,24 @@ impl RelayState {
         })
     }
 
-    async fn get_event(&self, event_id: &str) -> Result<Arc<LiveEventState>, ApiError> {
-        self.inner
-            .events
-            .read()
-            .await
+    /// Returns the stored identity and the live state of an event.
+    ///
+    /// The store decides if the event exists. The table lock is released
+    /// before this function returns.
+    async fn get_entry(
+        &self,
+        event_id: &str,
+    ) -> Result<(StoredEvent, Arc<LiveEventState>), ApiError> {
+        let events = self.inner.events.read().await;
+        events
+            .store
             .get(event_id)
-            .cloned()
+            .zip(events.live.get(event_id).cloned())
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "event_not_found"))
+    }
+
+    async fn get_event(&self, event_id: &str) -> Result<Arc<LiveEventState>, ApiError> {
+        self.get_entry(event_id).await.map(|(_, event)| event)
     }
 
     pub async fn publish_metadata(
@@ -229,8 +263,8 @@ impl RelayState {
         token: &str,
         body: PublishMetadataRequest,
     ) -> Result<PublishMetadataResponse, ApiError> {
-        let event = self.get_event(event_id).await?;
-        if !event.token_matches(token) {
+        let (stored, event) = self.get_entry(event_id).await?;
+        if !stored.token_hash_matches(&hash_token(token)) {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
         }
         let metadata = body.into_metadata(event_id)?;
@@ -320,8 +354,8 @@ impl RelayState {
         event_id: &str,
         token: &str,
     ) -> Result<KeepaliveResponse, ApiError> {
-        let event = self.get_event(event_id).await?;
-        if !event.token_matches(token) {
+        let (stored, event) = self.get_entry(event_id).await?;
+        if !stored.token_hash_matches(&hash_token(token)) {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
         }
 
@@ -399,9 +433,15 @@ impl RelayState {
     pub async fn cleanup_expired(&self) -> usize {
         let cutoff = self.now().saturating_sub(self.inner.config.ttl.as_secs());
         let mut events = self.inner.events.write().await;
-        let before = events.len();
-        events.retain(|_, event| event.last_activity.load(Ordering::Relaxed) >= cutoff);
-        before - events.len()
+        let EventTable { store, live } = &mut *events;
+        let removed = store.retain(&mut |stored| {
+            live.get(&stored.event_id)
+                .is_some_and(|event| event.last_activity.load(Ordering::Relaxed) >= cutoff)
+        });
+        for event_id in &removed {
+            live.remove(event_id);
+        }
+        removed.len()
     }
 
     /// Clears the snapshot of each event whose lease has expired.
@@ -418,14 +458,20 @@ impl RelayState {
         let now = self.now();
         let lease_secs = self.inner.config.lease.as_secs();
 
-        let candidates: Vec<(String, Arc<LiveEventState>)> = self
-            .inner
-            .events
-            .read()
-            .await
-            .iter()
-            .map(|(event_id, event)| (event_id.clone(), Arc::clone(event)))
-            .collect();
+        // Copy the candidates, then release the table lock before the first
+        // event lock.
+        let candidates: Vec<(String, Arc<LiveEventState>)> = {
+            let events = self.inner.events.read().await;
+            events
+                .store
+                .list_ids()
+                .into_iter()
+                .filter_map(|event_id| {
+                    let event = Arc::clone(events.live.get(&event_id)?);
+                    Some((event_id, event))
+                })
+                .collect()
+        };
 
         let mut expired_count = 0;
         for (event_id, event) in candidates {
@@ -510,17 +556,17 @@ fn try_acquire_window_slot(window: &AtomicU64, now: u64, limit: u32) -> bool {
     }
 }
 
-fn unique_event_id(events: &HashMap<String, Arc<LiveEventState>>) -> String {
+fn unique_event_id(store: &dyn EventStore) -> String {
     loop {
         let event_id = random_urlsafe(EVENT_ID_BYTES);
-        if !events.contains_key(&event_id) {
+        if store.get(&event_id).is_none() {
             return event_id;
         }
     }
 }
 
+/// The live half of an event. It is never stored.
 struct LiveEventState {
-    token_hash: [u8; 32],
     last_activity: AtomicU64,
     renewed_at: AtomicU64,
     publish_window: AtomicU64,
@@ -535,10 +581,9 @@ struct LiveEventInner {
 }
 
 impl LiveEventState {
-    fn new(token_hash: [u8; 32], now: u64) -> Self {
+    fn new(now: u64) -> Self {
         let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
-            token_hash,
             last_activity: AtomicU64::new(now),
             renewed_at: AtomicU64::new(now),
             publish_window: AtomicU64::new(0),
@@ -553,14 +598,6 @@ impl LiveEventState {
 
     fn try_acquire_publish_slot(&self, now: u64, limit: u32) -> bool {
         try_acquire_window_slot(&self.publish_window, now, limit)
-    }
-
-    fn token_matches(&self, token: &str) -> bool {
-        let candidate = hash_token(token);
-        self.token_hash
-            .as_slice()
-            .ct_eq(candidate.as_slice())
-            .into()
     }
 
     fn touch(&self, now: u64) {
