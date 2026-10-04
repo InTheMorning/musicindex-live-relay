@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -15,6 +16,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State as AxumState},
     http::{HeaderMap, StatusCode, header},
     response::{
@@ -31,11 +33,14 @@ use socketioxide::{
     SocketIo,
     extract::{SocketRef, State as SocketState},
 };
+use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{RwLock, broadcast};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
-use crate::store::{EventClass, EventStore, MemoryEventStore, StoredEvent};
+use crate::store::{
+    EventClass, EventStore, MemoryEventStore, SqliteEventStore, StoreError, StoredEvent,
+};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8018";
 const DEFAULT_MAX_ACTIVE_EVENTS: usize = 10_000;
@@ -50,6 +55,43 @@ const REPLAY_CAPACITY: usize = 100;
 const BROADCAST_CAPACITY: usize = 128;
 const TOKEN_BYTES: usize = 32;
 const EVENT_ID_BYTES: usize = 16;
+const DEFAULT_STATE_FILE: &str = "/var/lib/musicindex-live-relay/reserved-items.sqlite3";
+const DEFAULT_MAX_RESERVED_ITEMS: usize = 100;
+const MIN_ADMIN_TOKEN_BYTES: usize = 16;
+const RESERVE_BODY_LIMIT_BYTES: usize = 4 * 1024;
+const MAX_LABEL_CHARS: usize = 200;
+
+/// The operator credential for the reserved item routes (ADR 0001).
+///
+/// It holds the SHA-256 hash of the token, not the token. Its `Debug` output
+/// shows no part of the hash.
+#[derive(Clone)]
+pub struct AdminToken {
+    hash: [u8; 32],
+}
+
+impl AdminToken {
+    /// Makes an admin credential from the configured token.
+    pub fn new(token: &str) -> Self {
+        Self {
+            hash: hash_token(token),
+        }
+    }
+
+    /// Compares `candidate` with the admin token in constant time.
+    fn matches(&self, candidate: &str) -> bool {
+        self.hash
+            .as_slice()
+            .ct_eq(hash_token(candidate).as_slice())
+            .into()
+    }
+}
+
+impl std::fmt::Debug for AdminToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdminToken(<redacted>)")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -60,6 +102,13 @@ pub struct AppConfig {
     pub max_publishes_per_event_per_sec: u32,
     pub max_creates_per_sec: u32,
     pub lease: Duration,
+    /// The admin credential. With no value, the reserved item routes answer
+    /// `404`, and the relay opens no state file.
+    pub admin_token: Option<AdminToken>,
+    /// The SQLite file that holds the reserved items.
+    pub state_file: PathBuf,
+    /// The maximum count of reserved items in the state file.
+    pub max_reserved_items: usize,
 }
 
 impl AppConfig {
@@ -75,6 +124,9 @@ impl AppConfig {
             )?,
             max_creates_per_sec: env_parse("MAX_CREATES_PER_SEC", DEFAULT_MAX_CREATES_PER_SEC)?,
             lease: Duration::from_secs(parse_lease_secs()?),
+            admin_token: parse_admin_token()?,
+            state_file: env_parse("STATE_FILE", PathBuf::from(DEFAULT_STATE_FILE))?,
+            max_reserved_items: env_parse("MAX_RESERVED_ITEMS", DEFAULT_MAX_RESERVED_ITEMS)?,
         })
     }
 
@@ -87,7 +139,27 @@ impl AppConfig {
             max_publishes_per_event_per_sec: DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
             max_creates_per_sec: DEFAULT_MAX_CREATES_PER_SEC,
             lease: Duration::from_secs(DEFAULT_LEASE_SECS),
+            admin_token: None,
+            state_file: PathBuf::from(DEFAULT_STATE_FILE),
+            max_reserved_items: DEFAULT_MAX_RESERVED_ITEMS,
         }
+    }
+}
+
+/// Reads `ADMIN_TOKEN`. An error never holds the value.
+fn parse_admin_token() -> Result<Option<AdminToken>, ConfigError> {
+    let redacted = |message: String| ConfigError {
+        key: "ADMIN_TOKEN",
+        value: "<redacted>".to_string(),
+        message,
+    };
+    match std::env::var("ADMIN_TOKEN") {
+        Ok(token) if token.len() < MIN_ADMIN_TOKEN_BYTES => Err(redacted(format!(
+            "must be {MIN_ADMIN_TOKEN_BYTES} bytes or more"
+        ))),
+        Ok(token) => Ok(Some(AdminToken::new(&token))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(redacted("not valid unicode".to_string())),
     }
 }
 
@@ -149,7 +221,8 @@ pub struct RelayState {
 
 struct RelayStateInner {
     config: AppConfig,
-    events: RwLock<EventTable>,
+    // The `Arc` lets a reserve move an owned write guard into a blocking task.
+    events: Arc<RwLock<EventTable>>,
     sse_connections: AtomicUsize,
     create_window: AtomicU64,
     socket_io: OnceLock<SocketIo>,
@@ -169,24 +242,68 @@ struct EventTable {
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl RelayState {
+    /// Makes the relay state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an admin token is configured and the state file cannot be
+    /// opened. Use [`RelayState::try_new`] to get the error.
     pub fn new(config: AppConfig) -> Self {
         Self::with_clock(config, Arc::new(epoch_seconds))
     }
 
+    /// Makes the relay state with an injected time source.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an admin token is configured and the state file cannot be
+    /// opened. Use [`RelayState::try_with_clock`] to get the error.
     pub fn with_clock(config: AppConfig, clock: Clock) -> Self {
-        Self {
+        Self::try_with_clock(config, clock).expect("open the state file")
+    }
+
+    /// Makes the relay state.
+    ///
+    /// With an admin token configured, the relay opens the state file and
+    /// writes each reserved item to it. With no admin token, the relay opens
+    /// no file and keeps each item in memory only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` when the state file cannot be opened. The error
+    /// names the path.
+    pub fn try_new(config: AppConfig) -> Result<Self, StoreError> {
+        Self::try_with_clock(config, Arc::new(epoch_seconds))
+    }
+
+    /// Makes the relay state with an injected time source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` when the state file cannot be opened. The error
+    /// names the path.
+    pub fn try_with_clock(config: AppConfig, clock: Clock) -> Result<Self, StoreError> {
+        let store: Box<dyn EventStore> = if config.admin_token.is_some() {
+            Box::new(SqliteEventStore::open(
+                &config.state_file,
+                config.max_reserved_items,
+            )?)
+        } else {
+            Box::new(MemoryEventStore::new())
+        };
+        Ok(Self {
             inner: Arc::new(RelayStateInner {
                 config,
-                events: RwLock::new(EventTable {
-                    store: Box::new(MemoryEventStore::new()),
+                events: Arc::new(RwLock::new(EventTable {
+                    store,
                     live: HashMap::new(),
-                }),
+                })),
                 sse_connections: AtomicUsize::new(0),
                 create_window: AtomicU64::new(0),
                 socket_io: OnceLock::new(),
                 clock,
             }),
-        }
+        })
     }
 
     fn now(&self) -> u64 {
@@ -220,9 +337,10 @@ impl RelayState {
         events.store.insert(StoredEvent {
             event_id: event_id.clone(),
             token_hash: hash_token(&token),
+            label: None,
             created_at: now,
             class: EventClass::Ephemeral,
-        });
+        })?;
         events
             .live
             .insert(event_id.clone(), Arc::new(LiveEventState::new(now)));
@@ -234,6 +352,81 @@ impl RelayState {
             remote_value_url: format!("/v1/liveitems/{event_id}/remoteValue"),
             events_url: format!("/v1/liveitems/{event_id}/events"),
             socket_io_url: format!("/event?event_id={event_id}"),
+        })
+    }
+
+    /// Checks the admin credential of a request to a reserved item route.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 reserved_items_disabled` when no admin token is
+    /// configured, `401` when the credential is missing or malformed, and
+    /// `403 invalid_admin_token` when the credential is wrong.
+    fn authorize_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let Some(admin_token) = &self.inner.config.admin_token else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "reserved_items_disabled",
+            ));
+        };
+        let candidate = bearer_token(headers)?;
+        if !admin_token.matches(candidate) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_admin_token"));
+        }
+        Ok(())
+    }
+
+    /// Reserves a live item with a durable identity (ADR 0001).
+    ///
+    /// The store writes the identity and the token hash to the state file in
+    /// one transaction. The SQLite call blocks, so it runs on the blocking
+    /// thread pool. The table write lock stays held for that call, so the
+    /// label check, the count check, and the insert are one step. No event
+    /// lock is held, and no subscriber is waited on.
+    ///
+    /// # Errors
+    ///
+    /// Returns `409 label_already_reserved`,
+    /// `503 max_reserved_items_reached`, or `500 store_unavailable`.
+    pub async fn reserve_event(
+        &self,
+        label: Option<String>,
+    ) -> Result<ReserveEventResponse, ApiError> {
+        let token = random_urlsafe(TOKEN_BYTES);
+        let now = self.now();
+
+        let mut events = Arc::clone(&self.inner.events).write_owned().await;
+        let event_id = unique_event_id(events.store.as_ref());
+        let stored = StoredEvent {
+            event_id: event_id.clone(),
+            token_hash: hash_token(&token),
+            label: label.clone(),
+            created_at: now,
+            class: EventClass::Reserved,
+        };
+        let (mut events, result) = tokio::task::spawn_blocking(move || {
+            let result = events.store.insert(stored);
+            (events, result)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "reserve task failed");
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "store_unavailable")
+        })?;
+        result?;
+        events
+            .live
+            .insert(event_id.clone(), Arc::new(LiveEventState::new(now)));
+        drop(events);
+
+        Ok(ReserveEventResponse {
+            event_id: event_id.clone(),
+            broadcaster_token: token,
+            metadata_url: format!("/v1/liveitems/{event_id}/metadata"),
+            remote_value_url: format!("/v1/liveitems/{event_id}/remoteValue"),
+            events_url: format!("/v1/liveitems/{event_id}/events"),
+            socket_io_url: format!("/event?event_id={event_id}"),
+            label,
         })
     }
 
@@ -434,10 +627,16 @@ impl RelayState {
         let cutoff = self.now().saturating_sub(self.inner.config.ttl.as_secs());
         let mut events = self.inner.events.write().await;
         let EventTable { store, live } = &mut *events;
-        let removed = store.retain(&mut |stored| {
+        let removed = match store.retain(&mut |stored| {
             live.get(&stored.event_id)
                 .is_some_and(|event| event.last_activity.load(Ordering::Relaxed) >= cutoff)
-        });
+        }) {
+            Ok(removed) => removed,
+            Err(err) => {
+                tracing::error!(error = %err, "cannot remove expired live items");
+                return 0;
+            }
+        };
         for event_id in &removed {
             live.remove(event_id);
         }
@@ -664,6 +863,48 @@ pub struct CreateEventResponse {
     pub socket_io_url: String,
 }
 
+/// The response of `POST /v1/liveitems/reserved`.
+///
+/// It holds the fields of [`CreateEventResponse`] and the label. `v4vmm`
+/// parses these names. Do not rename them.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReserveEventResponse {
+    pub event_id: String,
+    pub broadcaster_token: String,
+    pub metadata_url: String,
+    pub remote_value_url: String,
+    pub events_url: String,
+    pub socket_io_url: String,
+    /// The operator name. It is absent when the request holds no label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The body of `POST /v1/liveitems/reserved`. Each field is optional.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReserveEventRequest {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+impl ReserveEventRequest {
+    /// Parses the body. An empty body is a request with no label.
+    fn parse(body: &[u8]) -> Result<Self, ApiError> {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
+        let request: Self = serde_json::from_slice(body)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_body"))?;
+        if let Some(label) = &request.label
+            && (label.trim().is_empty() || label.chars().count() > MAX_LABEL_CHARS)
+        {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_label"));
+        }
+        Ok(request)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublishMetadataResponse {
     pub event_id: String,
@@ -710,6 +951,24 @@ impl ApiError {
     }
 }
 
+impl From<StoreError> for ApiError {
+    /// Maps a store error to a stable error code. The body holds no internal
+    /// detail, so the cause goes to the log only.
+    fn from(err: StoreError) -> Self {
+        match err {
+            StoreError::LabelTaken => Self::new(StatusCode::CONFLICT, "label_already_reserved"),
+            StoreError::ReservedLimitReached => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "max_reserved_items_reached",
+            ),
+            err => {
+                tracing::error!(error = %err, "event store failed");
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "store_unavailable")
+            }
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
@@ -733,6 +992,10 @@ pub fn app(state: RelayState) -> Router {
         .route("/v1/liveitems/health", get(health))
         .route("/v1/liveitems", post(create_event))
         .route("/v1/liveitems/", post(create_event))
+        .route(
+            "/v1/liveitems/reserved",
+            post(reserve_event).route_layer(RequestBodyLimitLayer::new(RESERVE_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/v1/liveitems/{event_id}/metadata",
             get(latest_metadata)
@@ -789,6 +1052,21 @@ async fn create_event(
     AxumState(state): AxumState<RelayState>,
 ) -> Result<Json<CreateEventResponse>, ApiError> {
     Ok(Json(state.create_event().await?))
+}
+
+/// Handles `POST /v1/liveitems/reserved`.
+///
+/// The handler checks the admin credential before it reads the body, so a
+/// request with no credential never gets a body error.
+async fn reserve_event(
+    AxumState(state): AxumState<RelayState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ReserveEventResponse>), ApiError> {
+    state.authorize_admin(&headers)?;
+    let request = ReserveEventRequest::parse(&body)?;
+    let reserved = state.reserve_event(request.label).await?;
+    Ok((StatusCode::CREATED, Json(reserved)))
 }
 
 async fn publish_metadata(
@@ -984,6 +1262,7 @@ mod tests {
                 max_publishes_per_event_per_sec: DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC,
                 max_creates_per_sec: DEFAULT_MAX_CREATES_PER_SEC,
                 lease: Duration::from_secs(lease_secs),
+                ..AppConfig::for_tests()
             },
             {
                 let clock = clock.clone();

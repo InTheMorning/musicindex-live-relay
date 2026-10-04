@@ -21,6 +21,7 @@ By default the relay binds to `127.0.0.1:8018`. It serves these routes at whatev
 
 ```text
 POST /v1/liveitems
+POST /v1/liveitems/reserved
 GET  /v1/liveitems/{event_id}/metadata
 POST /v1/liveitems/{event_id}/keepalive
 GET  /v1/liveitems/{event_id}/remoteValue
@@ -30,7 +31,9 @@ GET  /socket.io/*
 
 The public URLs advertised in RSS should be based on the deployment's external origin. The `api.musicindex.org` examples below show the MusicIndex deployment, not a hosting requirement.
 
-All state is process-local. Restarting the process drops live items, broadcaster tokens, latest snapshots, and replay buffers.
+All live state is process-local. Restarting the process drops ephemeral live items, broadcaster tokens, latest snapshots, and replay buffers.
+
+A reserved live item also writes its identity to a SQLite state file. See "Reserve Live Item" below.
 
 ## The Lease
 
@@ -77,6 +80,74 @@ Response:
 ```
 
 The broadcaster token is returned only once. The service stores only a SHA-256 hash of the token and validates it with constant-time comparison.
+
+### Reserve Live Item
+
+```http
+POST /v1/liveitems/reserved
+Authorization: Bearer <admin_token>
+Content-Type: application/json
+```
+
+Reserves a live item with a durable identity (ADR 0001). Only the operator
+can reserve an item. The request needs the admin token that `ADMIN_TOKEN`
+sets. The relay compares the admin token in constant time.
+
+Request body, optional:
+
+```json
+{
+  "label": "weekly show"
+}
+```
+
+`label` is an operator name. It is optional. It must not be empty, and it can
+hold at most 200 characters. Two reserved items cannot have the same label.
+An empty body reserves an item with no label. The body limit is 4 KiB.
+
+Response, with status `201 Created`:
+
+```json
+{
+  "event_id": "<random opaque id>",
+  "broadcaster_token": "<random secret token>",
+  "metadata_url": "/v1/liveitems/<event_id>/metadata",
+  "remote_value_url": "/v1/liveitems/<event_id>/remoteValue",
+  "events_url": "/v1/liveitems/<event_id>/events",
+  "socket_io_url": "/event?event_id=<event_id>",
+  "label": "weekly show"
+}
+```
+
+The response has the same fields as `POST /v1/liveitems`, and `label`. When
+the request has no label, the response has no `label` field.
+
+The relay returns the broadcaster token one time only. The state file holds
+the event identifier, the SHA-256 hash of the token, the label, the creation
+time, and the item class. It never holds the token, a payload, a snapshot, a
+sequence number, or a replay buffer.
+
+A reserved item uses the same publish, keepalive, read, SSE, and Socket.IO
+routes as an ephemeral item. The lease applies to it in the same way.
+
+Status codes:
+
+- `201` when the relay reserved the item. The body holds the token.
+- `400` with error code `invalid_body` or `invalid_label` when the body is not valid.
+- `401` when the admin token is missing or malformed.
+- `403` with error code `invalid_admin_token` when the admin token is wrong.
+- `404` with error code `reserved_items_disabled` when no admin token is configured. The feature is off.
+- `409` with error code `label_already_reserved` when a reserved item has the label.
+- `413` when the request body is larger than 4 KiB.
+- `500` with error code `store_unavailable` when the state file write failed. The body holds no other detail.
+- `503` with error code `max_reserved_items_reached` when the state file holds `MAX_RESERVED_ITEMS` items.
+
+At startup, the relay does not read reserved items from the state file.
+Until ADR 0001 task 003 adds that step, a restart removes a reserved item
+from memory, and the idle TTL removes a reserved item as it removes an
+ephemeral item. A TTL removal also deletes the row from the state file. The
+row of an item that a restart removed stays in the file, and its label and
+its count stay reserved.
 
 ### Publish Metadata
 
@@ -447,8 +518,17 @@ Configuration is read from environment variables.
 | `MAX_CREATES_PER_SEC` | `50` | Global cap on `POST /v1/liveitems` per second. Returns 429 when exceeded. |
 | `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Returns 429 when exceeded. |
 | `LEASE_SECS` | `90` | Lease duration for an event. Must be 10 or more. See "The Lease" above. |
+| `ADMIN_TOKEN` | not set | The operator credential for `POST /v1/liveitems/reserved`. It must have 16 bytes or more. When it is not set, the route answers `404` and the relay opens no state file. |
+| `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay reads it only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
+| `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
 
-Metadata request bodies are limited to 64 KiB. The body limit applies only to `POST /v1/liveitems/{event_id}/metadata`; other routes are unconstrained.
+The included systemd unit sets `ProtectSystem=strict` and does not set
+`StateDirectory`. Before you set `ADMIN_TOKEN` for that unit, add
+`StateDirectory=musicindex-live-relay` to it. Then systemd makes
+`/var/lib/musicindex-live-relay/` with the correct owner. If the relay cannot
+open the state file, it stops at startup and the error names the path.
+
+Metadata request bodies are limited to 64 KiB. Reserve request bodies are limited to 4 KiB. Other routes are unconstrained.
 
 Per-IP rate limiting is the responsibility of the front-end proxy (e.g. nginx). The relay's `MAX_CREATES_PER_SEC` is a global safety bound, not a per-client limit.
 

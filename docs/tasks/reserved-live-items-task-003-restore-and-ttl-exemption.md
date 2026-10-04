@@ -27,6 +27,7 @@ Skip reserved items in the reaper.
 - `tests/api.rs`
 - `README.md`
 - `docs/interoperability.md`
+- `systemd/musicindex-live-relay.service`
 
 ## Do Not Touch
 
@@ -49,6 +50,10 @@ Skip reserved items in the reaper.
   items.
 - Startup logs the state file path and the count of restored items. It logs no
   identifier and no hash.
+- `systemd/musicindex-live-relay.service` gets
+  `StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. Added
+  2026-10-04 in the review of task 002: the unit sets `ProtectSystem=strict`,
+  so the relay cannot open its state file without this line.
 - **The lease of ADR 0002 also applies to a reserved item.** Added
   2026-10-04, because ADR 0002 came after this packet.
   - A restored item has no snapshot, so it is not on air.

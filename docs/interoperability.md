@@ -74,6 +74,28 @@ invalid, and listeners must tune to a new event identifier.
 `v4vmm` therefore keeps its own registry of the events that it created, and
 reports a dead event to the operator instead of a silent replacement.
 
+### Two classes of live item
+
+ADR 0001 adds a reserved live item. `POST /v1/liveitems/reserved` makes one,
+and it needs the admin token. With no admin token configured, that route
+answers `404` and the relay has ephemeral items only.
+
+- An ephemeral item does not change. A restart or the idle TTL removes it.
+  `POST /v1/liveitems` never writes to disk.
+- A reserved item writes its identity and its token hash to a SQLite state
+  file. The file never holds a payload, a snapshot, or a replay buffer.
+
+At startup, the relay does not read the state file. Until ADR 0001 task 003
+adds that step, a reserved item dies on a restart and after the idle TTL,
+as an ephemeral item does. After task 003, a reserved item survives a restart
+and serves `{}` until the next publish. Before that change, a client must not
+expect a reserved item to survive a restart.
+
+The reserve response holds the fields of the create response, and `label`.
+`v4vmm` parses `event_id`, `broadcaster_token`, `metadata_url`, and
+`events_url` from it. Do not rename them. The status codes `201`, `401`,
+`403`, `404`, and `409` each have one meaning. See `README.md`.
+
 ### An idle event expires
 
 The reaper removes an event when its last activity is older than the TTL. The

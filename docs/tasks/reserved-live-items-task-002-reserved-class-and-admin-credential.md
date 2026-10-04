@@ -1,6 +1,6 @@
 # Reserved Live Items Task 002: Reserved Class And Admin Credential
 
-Status: Ready - 2026-09-09. Do after 001.
+Status: Implemented - 2026-10-04. See §Review Result.
 
 Every criterion in this packet is mechanical. This service has no user
 interface, so it has no visual criteria and needs no operator check.
@@ -191,3 +191,32 @@ At the end, report:
 4. schema created
 5. deviations from task
 6. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-04. The review changed no code. The 22 present tests in
+`tests/api.rs` have no change, and 14 new tests cover the route.
+
+The review accepts these deviations:
+
+- Only the write methods of the store return `Result`. Both stores answer the
+  reads from memory.
+- The SQLite file decides the label check and the count check, because no
+  restore exists before task 003.
+- The admin token has its own parser, so a configuration error never shows its
+  value. The relay keeps only its hash.
+- The route also gives `400`, `413`, `500` and `503`. The five codes of the
+  contract keep their meaning.
+- `AGENTS.md` §Current State changed with this task, because it must describe
+  the present.
+
+Points for the next tasks:
+
+- A reserve holds the table write lock during one SQLite commit, in
+  `spawn_blocking`. No runtime thread blocks, and no event lock is held.
+- The reaper still deletes a reserved row synchronously. Task 003 removes this
+  path, because the reaper then skips reserved items.
+- Between task 002 and task 003, a restart drops a reserved item from memory,
+  but its row stays.
+- `systemd/musicindex-live-relay.service` has no `StateDirectory`. Task 003
+  adds it.

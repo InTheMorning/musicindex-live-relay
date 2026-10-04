@@ -717,3 +717,363 @@ async fn latest_metadata_includes_renewed_at_and_lease_expires_at() {
     assert!(!body.renewed_at.is_empty());
     assert!(!body.lease_expires_at.is_empty());
 }
+
+/// Tests for `POST /v1/liveitems/reserved` (ADR 0001, task 002).
+mod reserved {
+    use std::path::{Path, PathBuf};
+
+    use musicindex_live_relay::{AdminToken, ReserveEventResponse};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const ADMIN_TOKEN: &str = "test-admin-token-0123456789";
+
+    /// Builds a router with an admin token and a state file in a temporary
+    /// directory. Keep the `TempDir` until the test ends.
+    fn reserved_app_with(max_reserved_items: usize) -> (axum::Router, TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let state = RelayState::try_new(AppConfig {
+            admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+            state_file: state_file.clone(),
+            max_reserved_items,
+            ..AppConfig::for_tests()
+        })
+        .expect("open state");
+        (app(state), dir, state_file)
+    }
+
+    fn reserved_app() -> (axum::Router, TempDir, PathBuf) {
+        reserved_app_with(100)
+    }
+
+    async fn reserve(
+        router: axum::Router,
+        credential: Option<&str>,
+        body: Option<Value>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/liveitems/reserved");
+        if let Some(credential) = credential {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {credential}"));
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        router
+            .oneshot(builder.body(body).expect("reserve request"))
+            .await
+            .expect("reserve response")
+    }
+
+    async fn reserve_ok(router: axum::Router, label: Option<&str>) -> ReserveEventResponse {
+        let body = label.map(|label| json!({ "label": label }));
+        let response = reserve(router, Some(ADMIN_TOKEN), body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        read_json(response).await
+    }
+
+    async fn error_code(response: axum::response::Response) -> String {
+        let body: Value = read_json(response).await;
+        body["error"].as_str().expect("error code").to_string()
+    }
+
+    fn table_columns(path: &Path, table: &str) -> Vec<String> {
+        let connection = rusqlite::Connection::open(path).expect("open state file");
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("columns")
+    }
+
+    fn reserved_row_count(path: &Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .expect("open state file")
+            .query_row("SELECT COUNT(*) FROM live_items", [], |row| row.get(0))
+            .expect("count")
+    }
+
+    #[tokio::test]
+    async fn reserve_with_correct_credential_returns_201_and_the_contract_fields() {
+        let (router, _dir, state_file) = reserved_app();
+
+        let response = reserve(
+            router,
+            Some(ADMIN_TOKEN),
+            Some(json!({ "label": "weekly show" })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = read_json(response).await;
+        let object = body.as_object().expect("object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "broadcaster_token",
+                "event_id",
+                "events_url",
+                "label",
+                "metadata_url",
+                "remote_value_url",
+                "socket_io_url",
+            ]
+        );
+        let event_id = body["event_id"].as_str().expect("event_id");
+        assert!(!event_id.is_empty());
+        assert!(
+            !body["broadcaster_token"]
+                .as_str()
+                .expect("token")
+                .is_empty()
+        );
+        assert_eq!(
+            body["metadata_url"],
+            format!("/v1/liveitems/{event_id}/metadata")
+        );
+        assert_eq!(
+            body["events_url"],
+            format!("/v1/liveitems/{event_id}/events")
+        );
+        assert_eq!(body["label"], "weekly show");
+        assert_eq!(reserved_row_count(&state_file), 1);
+    }
+
+    #[tokio::test]
+    async fn reserve_with_no_body_omits_the_label() {
+        let (router, _dir, _state_file) = reserved_app();
+
+        let response = reserve(router, Some(ADMIN_TOKEN), None).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = read_json(response).await;
+        assert!(body.get("label").is_none());
+        assert!(body.get("event_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn reserve_with_wrong_credential_returns_403() {
+        let (router, _dir, state_file) = reserved_app();
+
+        let response = reserve(
+            router,
+            Some("wrong-admin-token-0123456789"),
+            Some(json!({ "label": "show" })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(response).await, "invalid_admin_token");
+        assert_eq!(reserved_row_count(&state_file), 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_with_missing_credential_returns_401() {
+        let (router, _dir, state_file) = reserved_app();
+
+        let response = reserve(router, None, Some(json!({ "label": "show" }))).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(reserved_row_count(&state_file), 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_with_a_broadcaster_token_returns_403() {
+        let (router, _dir, _state_file) = reserved_app();
+        let created = create_event(router.clone()).await;
+
+        let response = reserve(router, Some(&created.broadcaster_token), None).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reserve_with_no_admin_token_configured_returns_404() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let router = app(RelayState::new(AppConfig {
+            state_file: state_file.clone(),
+            ..AppConfig::for_tests()
+        }));
+
+        let response = reserve(router, Some(ADMIN_TOKEN), Some(json!({ "label": "show" }))).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(response).await, "reserved_items_disabled");
+        assert!(!state_file.exists(), "a disabled feature opens no file");
+    }
+
+    #[tokio::test]
+    async fn reserve_with_a_duplicate_label_returns_409() {
+        let (router, _dir, state_file) = reserved_app();
+        reserve_ok(router.clone(), Some("weekly show")).await;
+
+        let response = reserve(
+            router,
+            Some(ADMIN_TOKEN),
+            Some(json!({ "label": "weekly show" })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(response).await, "label_already_reserved");
+        assert_eq!(reserved_row_count(&state_file), 1);
+    }
+
+    #[tokio::test]
+    async fn reserve_with_an_invalid_label_returns_400() {
+        let (router, _dir, state_file) = reserved_app();
+
+        for body in [
+            json!({ "label": "" }),
+            json!({ "label": "x".repeat(201) }),
+            json!({ "label": 7 }),
+            json!({ "name": "show" }),
+        ] {
+            let response = reserve(router.clone(), Some(ADMIN_TOKEN), Some(body)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(reserved_row_count(&state_file), 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_over_the_limit_returns_503() {
+        let (router, _dir, _state_file) = reserved_app_with(1);
+        reserve_ok(router.clone(), None).await;
+
+        let response = reserve(router, Some(ADMIN_TOKEN), None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(response).await, "max_reserved_items_reached");
+    }
+
+    #[tokio::test]
+    async fn reserve_store_failure_returns_500_with_no_detail() {
+        let (router, _dir, state_file) = reserved_app();
+        rusqlite::Connection::open(&state_file)
+            .expect("open state file")
+            .execute("DROP TABLE live_items", [])
+            .expect("drop table");
+
+        let response = reserve(router.clone(), Some(ADMIN_TOKEN), None).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value = read_json(response).await;
+        assert_eq!(body, json!({ "error": "store_unavailable" }));
+
+        // A failed reserve leaves the ephemeral route working.
+        create_event(router).await;
+    }
+
+    #[tokio::test]
+    async fn publish_to_a_reserved_item_with_its_broadcaster_token() {
+        let (router, _dir, _state_file) = reserved_app();
+        let reserved = reserve_ok(router.clone(), Some("station")).await;
+
+        let response = publish(
+            router.clone(),
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+            json!({ "title": "on air", "value": { "destinations": [] } }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let published: PublishMetadataResponse = read_json(response).await;
+        assert_eq!(published.seq, 1);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{}/remoteValue", reserved.event_id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = read_json(response).await;
+        assert_eq!(value["title"], "on air");
+
+        let response = publish(
+            router,
+            &reserved.event_id,
+            Some("wrong"),
+            json!({ "title": "x" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_create_writes_nothing_to_the_state_file() {
+        let (router, _dir, state_file) = reserved_app();
+
+        let created = create_event(router).await;
+
+        assert!(!created.event_id.is_empty());
+        assert_eq!(reserved_row_count(&state_file), 0);
+    }
+
+    #[tokio::test]
+    async fn state_file_holds_identity_and_hash_only() {
+        let (router, dir, state_file) = reserved_app();
+        let reserved = reserve_ok(router.clone(), Some("weekly show")).await;
+        let marker = "payload-marker-7f3a9c";
+        let response = publish(
+            router,
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+            json!({ "title": marker, "value": { "destinations": [] } }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(table_columns(&state_file, "schema_version"), ["version"]);
+        assert_eq!(
+            table_columns(&state_file, "live_items"),
+            ["event_id", "token_hash", "label", "created_at", "class"]
+        );
+
+        // No file in the state directory holds the payload, the token, or
+        // the admin token.
+        for entry in std::fs::read_dir(dir.path()).expect("read state directory") {
+            let bytes = std::fs::read(entry.expect("entry").path()).expect("read file");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(marker), "the payload reached the disk");
+            assert!(
+                !text.contains(&reserved.broadcaster_token),
+                "the broadcaster token reached the disk"
+            );
+            assert!(
+                !text.contains(ADMIN_TOKEN),
+                "the admin token reached the disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_token_debug_output_is_redacted() {
+        let config = AppConfig {
+            admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+            ..AppConfig::for_tests()
+        };
+
+        let output = format!("{config:?}");
+
+        assert!(!output.contains(ADMIN_TOKEN));
+        assert!(output.contains("<redacted>"));
+    }
+}
