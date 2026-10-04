@@ -57,8 +57,13 @@ The display state of an event is one JSON object:
 
 - `track` is `null` when nothing plays. A broadcaster sends `null`
   explicitly.
-- `artwork` is `null` when the track has no image.
-- `mime` is `image/jpeg` or `image/png`.
+- `artwork` has one of three forms:
+  - `{"sha256": "…", "mime": "…"}` for an image in the store of the relay.
+    `mime` is `image/jpeg` or `image/png`.
+  - `{"url": "…"}` for an image on a different host. The URL uses `http` or
+    `https`, and it has at most 2,048 characters. The relay does not fetch,
+    check or store that image. A client loads it.
+  - `null` when the track has no image.
 
 ### Routes
 
@@ -77,6 +82,8 @@ The display state of an event is one JSON object:
 - The body is the display state. Its limit is 8 KiB.
 - An `artwork.sha256` that the relay does not hold gives `409` with
   `artwork_missing`. So the broadcaster uploads the image first.
+- An `artwork.url` with a different scheme, or longer than 2,048 characters,
+  gives `400` with `invalid_display`.
 
 `GET /v1/liveitems/{event_id}/display`
 
@@ -138,6 +145,7 @@ difference.
   images of `ARTWORK_MAX_BYTES`.
 - Every write route has a body limit.
 - An image is served only with the hash that its bytes have.
+- The relay never fetches an image from a URL.
 - No display data goes into the live value transports.
 
 ## Verification After Implementation
@@ -148,6 +156,8 @@ Mechanical, each with a test:
 - An upload with a wrong hash, with bytes that are not JPEG or PNG, and over
   the limit each give the correct error.
 - A display publish with an unknown image gives `409 artwork_missing`.
+- A display state with an `http` or `https` URL is accepted with no upload. A
+  `data:` or `file:` URL gives `400 invalid_display`.
 - A third image removes the first one.
 - A lease expiry sets the state to `{"track": null}`, sends it on SSE, and
   removes the images.
