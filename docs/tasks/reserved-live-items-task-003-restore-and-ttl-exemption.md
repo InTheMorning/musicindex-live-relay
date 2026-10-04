@@ -1,6 +1,6 @@
 # Reserved Live Items Task 003: Restore On Startup And TTL Exemption
 
-Status: Ready - 2026-09-09. Do after 002. This packet is the reason ADR 0001
+Status: Implemented - 2026-10-04. See §Review Result.
 exists: without it a reserved item still dies with the process or the reaper.
 
 Every criterion in this packet is mechanical. This service has no user
@@ -156,3 +156,23 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-04. The review changed no code. No test expectation changed.
+Each new rule was broken on purpose, and a test failed each time.
+
+- A restored item has the stored token hash, no snapshot, an empty replay
+  buffer and `seq` 0. `remoteValue` gives `{}`. `/metadata` gives `404
+  metadata_not_found`, the same as after a lease expiry. The packet text said
+  `{}` for the metadata read. That would change the wire format, so the review
+  accepts the `404`.
+- The reaper skips reserved items, so it no longer writes to SQLite.
+- With no `ADMIN_TOKEN`, the relay opens and restores nothing.
+- `load()` runs `PRAGMA quick_check`. A damaged file stops startup with its
+  path, and the file stays unchanged.
+- The unit has `StateDirectory=musicindex-live-relay` and
+  `StateDirectoryMode=0700`.
+
+Two points moved to task 005: the restart loop on a corrupt file, and the
+format of the startup error.

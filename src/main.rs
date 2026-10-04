@@ -14,9 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AppConfig::from_env()?;
     let bind: SocketAddr = config.bind;
-    if config.admin_token.is_some() {
-        tracing::info!(state_file = %config.state_file.display(), "reserved items enabled");
-    }
+    // With an admin token, `try_new` restores the reserved items and logs the
+    // state file path and the restored count. A corrupt or unreadable state
+    // file stops the startup, and the error names the path.
     let state = RelayState::try_new(config)?;
 
     spawn_cleanup_task(state.clone());

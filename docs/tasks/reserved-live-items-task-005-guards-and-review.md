@@ -43,6 +43,14 @@ review, and reconcile the statuses.
 - The runbook is for an operator under pressure. Short sentences, numbered
   steps, one instruction for each step.
 
+- Added 2026-10-04 in the review of task 003:
+  - The unit has `Restart=on-failure` and `RestartSec=5s` with no start
+    limit. A corrupt state file then gives a restart loop for ever. Add
+    `StartLimitIntervalSec` and `StartLimitBurst` to the `[Unit]` section, so
+    systemd stops the loop and marks the unit `failed`.
+  - `main` returns the startup error, so Rust prints its `Debug` form. Print
+    a startup error with `Display`, with the state file path and the cause.
+
 ## Implementation Steps
 
 1. Write one test for each ADR 0001 invariant:

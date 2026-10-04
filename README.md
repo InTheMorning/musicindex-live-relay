@@ -33,7 +33,7 @@ The public URLs advertised in RSS should be based on the deployment's external o
 
 All live state is process-local. Restarting the process drops ephemeral live items, broadcaster tokens, latest snapshots, and replay buffers.
 
-A reserved live item also writes its identity to a SQLite state file. See "Reserve Live Item" below.
+A reserved live item also writes its identity to a SQLite state file. A restart restores the identity, but not the snapshot. See "Reserve Live Item" below.
 
 ## The Lease
 
@@ -142,12 +142,33 @@ Status codes:
 - `500` with error code `store_unavailable` when the state file write failed. The body holds no other detail.
 - `503` with error code `max_reserved_items_reached` when the state file holds `MAX_RESERVED_ITEMS` items.
 
-At startup, the relay does not read reserved items from the state file.
-Until ADR 0001 task 003 adds that step, a restart removes a reserved item
-from memory, and the idle TTL removes a reserved item as it removes an
-ephemeral item. A TTL removal also deletes the row from the state file. The
-row of an item that a restart removed stays in the file, and its label and
-its count stay reserved.
+#### Restart And Idle TTL
+
+At startup, the relay reads each reserved item from the state file. The
+stored broadcaster token stays valid after a restart. The relay logs the
+state file path and the count of restored items. It logs no identifier and no
+hash.
+
+A restored item has no snapshot, because the state file holds no payload. It
+is not on air until the next publish:
+
+- `GET /v1/liveitems/{event_id}/remoteValue` gives `200` with `{}`.
+- `GET /v1/liveitems/{event_id}/metadata` gives `404` with error code
+  `metadata_not_found`, as after a lease expiry.
+- A keepalive gives `409` with error code `lease_expired`.
+- Socket.IO sends `{}` at connect.
+
+The sequence number of a restored item starts again at zero. The first
+publish after a restart gives `seq` 1. The replay buffer is empty. An SSE
+client that keeps a `Last-Event-ID` from before the restart gets no replay,
+and the next `id` can be lower than its `Last-Event-ID`.
+
+The idle TTL does not remove a reserved item. The lease applies to it. A
+lease expiry removes the snapshot, and the item and its identifier stay.
+
+If the state file is corrupt or the relay cannot read it, the relay stops at
+startup. The error names the path. The relay does not delete the file or make
+it again.
 
 ### Publish Metadata
 
@@ -280,7 +301,8 @@ Response:
 `renewed_at` is the time of the last publish or keepalive. `lease_expires_at` is `renewed_at` plus `LEASE_SECS`.
 
 Returns `404` when the event does not exist, no metadata has been
-published yet, or the event lease has expired. See "The Lease" above.
+published yet, or the event lease has expired. See "The Lease" above. A
+reserved item that a restart restored has no metadata until its next publish.
 
 The Socket.IO-compatible raw payload is also available at:
 
@@ -344,6 +366,8 @@ data: {"title":"...","image":"...","line":["..."],"value":{...},"type":"person"}
 ```
 
 When `Last-Event-ID` is present and valid, the relay replays buffered events with `seq > Last-Event-ID` before streaming live updates. The replay buffer keeps the last 100 metadata updates per live item.
+
+The replay buffer is in memory only. After a restart, a reserved item has an empty replay buffer, and its `seq` starts again at zero. See "Restart And Idle TTL" above.
 
 The stream also sends periodic keepalive comments.
 
@@ -514,19 +538,19 @@ Configuration is read from environment variables.
 | `BIND` | `127.0.0.1:8018` | Socket address to listen on. |
 | `MAX_ACTIVE_EVENTS` | `10000` | Maximum number of live items kept in memory. |
 | `MAX_SSE_CONNECTIONS` | `1000` | Maximum concurrent SSE streams. |
-| `EVENT_TTL_SECS` | `86400` | Time before inactive events expire. |
+| `EVENT_TTL_SECS` | `86400` | Time before inactive events expire. A reserved item does not expire. |
 | `MAX_CREATES_PER_SEC` | `50` | Global cap on `POST /v1/liveitems` per second. Returns 429 when exceeded. |
 | `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Returns 429 when exceeded. |
 | `LEASE_SECS` | `90` | Lease duration for an event. Must be 10 or more. See "The Lease" above. |
 | `ADMIN_TOKEN` | not set | The operator credential for `POST /v1/liveitems/reserved`. It must have 16 bytes or more. When it is not set, the route answers `404` and the relay opens no state file. |
-| `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay reads it only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
+| `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay opens it and restores the reserved items only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
 | `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
 
-The included systemd unit sets `ProtectSystem=strict` and does not set
-`StateDirectory`. Before you set `ADMIN_TOKEN` for that unit, add
-`StateDirectory=musicindex-live-relay` to it. Then systemd makes
-`/var/lib/musicindex-live-relay/` with the correct owner. If the relay cannot
-open the state file, it stops at startup and the error names the path.
+The included systemd unit sets `ProtectSystem=strict`,
+`StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. systemd
+makes `/var/lib/musicindex-live-relay/` with the correct owner and mode 0700,
+and the relay can write the state file there. If the relay cannot open or read
+the state file, it stops at startup and the error names the path.
 
 Metadata request bodies are limited to 64 KiB. Reserve request bodies are limited to 4 KiB. Other routes are unconstrained.
 
@@ -563,7 +587,7 @@ A systemd unit template is included at:
 systemd/musicindex-live-relay.service
 ```
 
-The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, and restarts on failure.
+The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, gives the relay the state directory `/var/lib/musicindex-live-relay/`, and restarts on failure.
 
 The relay can be exposed directly or behind any reverse proxy that preserves the service routes. MusicIndex currently deploys it behind nginx at `api.musicindex.org`; that deployment uses:
 

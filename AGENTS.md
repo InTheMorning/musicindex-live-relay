@@ -15,12 +15,15 @@ packet.
   for an older client.
 - An ephemeral event lives in memory only. A restart or the idle TTL removes
   it.
+- A reserved event survives a restart and the idle TTL. A restart restores
+  its identity and its token hash, but never its snapshot (ADR 0001).
 - The lease operates and has tests (ADR 0002).
-- ADR 0001, reserved live items, has the status `Accepted`. Tasks 001 and 002
+- ADR 0001, reserved live items, has the status `Accepted`. Tasks 001 to 003
   are done. `POST /v1/liveitems/reserved` writes the identity of a reserved
-  event to a SQLite file. The relay does not read that file at startup until
-  task 003. Until a later identity decision, only the operator makes a
-  reserved event, with the admin token (ADR 0001).
+  event to a SQLite file, and the relay reads that file at startup. The list
+  and delete routes of task 004 do not exist yet. Until a later identity
+  decision, only the operator makes a reserved event, with the admin token
+  (ADR 0001).
 - ADR 0003, display state and artwork, has the status `Accepted`. Its
   implementation needs ADR 0001 first.
 - The broadcaster identity model is open. The options are in
@@ -111,8 +114,9 @@ This service carries payment routing to listener apps.
 
 ### 6. State Model Honesty
 
-- Today the service keeps state in memory only, and an event dies on a process
-  restart or after the idle TTL.
+- An ephemeral event lives in memory only, and it dies on a process restart
+  or after the idle TTL. A reserved event survives both, and it serves `{}`
+  after a restart until the next publish (ADR 0001).
 - Consumers depend on those two death modes and work around them. A change to
   either one is an interoperability change. Record it in
   `docs/interoperability.md` in the same commit.

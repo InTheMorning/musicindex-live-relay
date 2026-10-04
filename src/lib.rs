@@ -247,7 +247,7 @@ impl RelayState {
     /// # Panics
     ///
     /// Panics when an admin token is configured and the state file cannot be
-    /// opened. Use [`RelayState::try_new`] to get the error.
+    /// opened or restored. Use [`RelayState::try_new`] to get the error.
     pub fn new(config: AppConfig) -> Self {
         Self::with_clock(config, Arc::new(epoch_seconds))
     }
@@ -257,47 +257,59 @@ impl RelayState {
     /// # Panics
     ///
     /// Panics when an admin token is configured and the state file cannot be
-    /// opened. Use [`RelayState::try_with_clock`] to get the error.
+    /// opened or restored. Use [`RelayState::try_with_clock`] to get the error.
     pub fn with_clock(config: AppConfig, clock: Clock) -> Self {
         Self::try_with_clock(config, clock).expect("open the state file")
     }
 
     /// Makes the relay state.
     ///
-    /// With an admin token configured, the relay opens the state file and
-    /// writes each reserved item to it. With no admin token, the relay opens
-    /// no file and keeps each item in memory only.
+    /// With an admin token configured, the relay opens the state file,
+    /// restores each reserved item from it, and writes each new reserved item
+    /// to it. With no admin token, the relay opens no file and keeps each item
+    /// in memory only.
     ///
     /// # Errors
     ///
-    /// Returns a `StoreError` when the state file cannot be opened. The error
-    /// names the path.
+    /// Returns a `StoreError` when the state file cannot be opened or read,
+    /// or when it is corrupt. The error names the path.
     pub fn try_new(config: AppConfig) -> Result<Self, StoreError> {
         Self::try_with_clock(config, Arc::new(epoch_seconds))
     }
 
     /// Makes the relay state with an injected time source.
     ///
+    /// A restored item gets new live state at the current time: the stored
+    /// token hash, no snapshot, an empty replay buffer, and `seq` at zero
+    /// (ADR 0001). It is not on air until the next publish.
+    ///
     /// # Errors
     ///
-    /// Returns a `StoreError` when the state file cannot be opened. The error
-    /// names the path.
+    /// Returns a `StoreError` when the state file cannot be opened or read,
+    /// or when it is corrupt. The error names the path.
     pub fn try_with_clock(config: AppConfig, clock: Clock) -> Result<Self, StoreError> {
+        let mut live = HashMap::new();
         let store: Box<dyn EventStore> = if config.admin_token.is_some() {
-            Box::new(SqliteEventStore::open(
-                &config.state_file,
-                config.max_reserved_items,
-            )?)
+            let mut store = SqliteEventStore::open(&config.state_file, config.max_reserved_items)?;
+            let restored = store.load()?;
+            let now = clock();
+            for event in &restored {
+                live.insert(event.event_id.clone(), Arc::new(LiveEventState::new(now)));
+            }
+            // Log the path and the count only. No identifier and no hash.
+            tracing::info!(
+                state_file = %config.state_file.display(),
+                restored = restored.len(),
+                "restored reserved live items"
+            );
+            Box::new(store)
         } else {
             Box::new(MemoryEventStore::new())
         };
         Ok(Self {
             inner: Arc::new(RelayStateInner {
                 config,
-                events: Arc::new(RwLock::new(EventTable {
-                    store,
-                    live: HashMap::new(),
-                })),
+                events: Arc::new(RwLock::new(EventTable { store, live })),
                 sse_connections: AtomicUsize::new(0),
                 create_window: AtomicU64::new(0),
                 socket_io: OnceLock::new(),
@@ -623,13 +635,24 @@ impl RelayState {
         })
     }
 
+    /// Removes each ephemeral event whose last activity is older than the
+    /// idle TTL.
+    ///
+    /// The reaper never removes a reserved item (ADR 0001). It reads the
+    /// class from the store under the table lock, and it takes no event lock.
+    /// Because it keeps each reserved item, it never deletes a row of the
+    /// state file.
+    ///
+    /// Returns the count of removed events.
     pub async fn cleanup_expired(&self) -> usize {
         let cutoff = self.now().saturating_sub(self.inner.config.ttl.as_secs());
         let mut events = self.inner.events.write().await;
         let EventTable { store, live } = &mut *events;
         let removed = match store.retain(&mut |stored| {
-            live.get(&stored.event_id)
-                .is_some_and(|event| event.last_activity.load(Ordering::Relaxed) >= cutoff)
+            stored.class == EventClass::Reserved
+                || live
+                    .get(&stored.event_id)
+                    .is_some_and(|event| event.last_activity.load(Ordering::Relaxed) >= cutoff)
         }) {
             Ok(removed) => removed,
             Err(err) => {

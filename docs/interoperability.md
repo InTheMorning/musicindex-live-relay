@@ -67,9 +67,11 @@ See "A lease expires" below.
 
 ### State is in memory
 
-A restart of this process discards live items, broadcaster tokens, latest
-snapshots, and replay buffers. Every event dies, every stored token becomes
-invalid, and listeners must tune to a new event identifier.
+A restart of this process discards ephemeral live items, their broadcaster
+tokens, every latest snapshot, and every replay buffer. Every ephemeral event
+dies, its stored token becomes invalid, and listeners must tune to a new event
+identifier. A reserved item survives a restart. See "Two classes of live item"
+below.
 
 `v4vmm` therefore keeps its own registry of the events that it created, and
 reports a dead event to the operator instead of a silent replacement.
@@ -85,11 +87,20 @@ answers `404` and the relay has ephemeral items only.
 - A reserved item writes its identity and its token hash to a SQLite state
   file. The file never holds a payload, a snapshot, or a replay buffer.
 
-At startup, the relay does not read the state file. Until ADR 0001 task 003
-adds that step, a reserved item dies on a restart and after the idle TTL,
-as an ephemeral item does. After task 003, a reserved item survives a restart
-and serves `{}` until the next publish. Before that change, a client must not
-expect a reserved item to survive a restart.
+A reserved item survives a restart and the idle TTL. Its stored broadcaster
+token stays valid. The relay restores its identity, but not its snapshot, so
+after a restart it serves `{}` until the next publish:
+
+- `remoteValue` and Socket.IO give `{}`.
+- `GET /v1/liveitems/{event_id}/metadata` gives `404` with the error code
+  `metadata_not_found`, as after a lease expiry. The event exists.
+- A keepalive gives `409` with the error code `lease_expired`. The
+  broadcaster must publish to go back on air.
+- The sequence number starts again at zero, and the replay buffer is empty.
+  An SSE client that keeps a `Last-Event-ID` sees the reset.
+
+The lease applies to a reserved item. A lease expiry removes the snapshot,
+and the item stays. A corrupt state file stops the relay at startup.
 
 The reserve response holds the fields of the create response, and `label`.
 `v4vmm` parses `event_id`, `broadcaster_token`, `metadata_url`, and
@@ -98,12 +109,13 @@ The reserve response holds the fields of the create response, and `label`.
 
 ### An idle event expires
 
-The reaper removes an event when its last activity is older than the TTL. The
-default is 24 hours.
+The reaper removes an ephemeral event when its last activity is older than the
+TTL. The default is 24 hours.
 
-An event therefore dies with no restart. A weekly show that reserves an
-identifier on Monday finds it gone on Saturday. Consumers see the same `404`
-for both death modes, so no consumer needs to separate them.
+An ephemeral event therefore dies with no restart. Consumers see the same
+`404` for both death modes, so no consumer needs to separate them. The reaper
+never removes a reserved item, so a weekly show or a station uses a reserved
+item.
 
 ### A lease expires
 
@@ -144,11 +156,12 @@ a log.
 ### Long-lived live items
 
 A weekly show and a permanent station both need an event that survives a
-restart of this process and the idle TTL. Today a restart forces new
-identifiers and a new round of listener tuning, and a quiet day does the same.
+restart of this process and the idle TTL. An ephemeral event does not.
 
-ADR 0001 in this repository proposes the decision, and
-`docs/plans/adr-0001-reserved-live-items-phase-plan.md` holds the work.
+ADR 0001 in this repository records the decision, and
+`docs/plans/adr-0001-reserved-live-items-phase-plan.md` holds the work. Tasks
+001 to 003 are done: a reserved item survives a restart and the idle TTL. The
+list route and the delete route of task 004 are open.
 
 The requirement, from the 2026-09-06 chain review:
 

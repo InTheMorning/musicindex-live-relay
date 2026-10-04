@@ -37,6 +37,11 @@ CREATE TABLE live_items (
 ) STRICT;
 ";
 
+/// One row of `live_items` as SQLite returns it, before validation: the
+/// event identifier, the token hash, the label, the creation time, and the
+/// class.
+type RawRow = (String, Vec<u8>, Option<String>, i64, String);
+
 /// The class of a live item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventClass {
@@ -54,6 +59,12 @@ impl EventClass {
             Self::Ephemeral => "ephemeral",
             Self::Reserved => "reserved",
         }
+    }
+
+    /// The class for a value of the class column. The file holds reserved
+    /// items only, so each other value is not valid.
+    fn from_column(value: &str) -> Option<Self> {
+        (value == Self::Reserved.as_column()).then_some(Self::Reserved)
     }
 }
 
@@ -119,6 +130,16 @@ pub enum StoreError {
         /// The version in the file, if the file holds one.
         found: Option<i64>,
     },
+    /// The state file at `path` is corrupt, or a stored row is not valid.
+    ///
+    /// The relay does not start with this error. It does not change, delete
+    /// or make again the file.
+    Corrupt {
+        /// The path of the state file.
+        path: PathBuf,
+        /// The cause, with no token hash.
+        reason: String,
+    },
     /// A read or a write of the state file failed.
     Database(rusqlite::Error),
     /// The lock on the database connection is poisoned.
@@ -140,6 +161,9 @@ impl std::fmt::Display for StoreError {
                 "state file {} has schema version {found:?}, expected {SCHEMA_VERSION}",
                 path.display()
             ),
+            Self::Corrupt { path, reason } => {
+                write!(f, "state file {} is corrupt: {reason}", path.display())
+            }
             Self::Database(source) => write!(f, "state file error: {source}"),
             Self::Poisoned => f.write_str("state file connection lock is poisoned"),
             Self::LabelTaken => f.write_str("label is already reserved"),
@@ -266,6 +290,7 @@ impl EventStore for MemoryEventStore {
 /// an async worker thread for a long time.
 #[derive(Debug)]
 pub struct SqliteEventStore {
+    path: PathBuf,
     events: HashMap<String, StoredEvent>,
     // The trait needs `Sync`, and a `Connection` is not `Sync`. Each write
     // has `&mut self` and uses `Mutex::get_mut`, so the mutex never blocks.
@@ -278,7 +303,7 @@ impl SqliteEventStore {
     ///
     /// A new file gets the schema and the schema version in one transaction.
     /// The parent directory must exist. The store does not load the reserved
-    /// rows of the file into memory.
+    /// rows of the file into memory. Call [`SqliteEventStore::load`] for that.
     ///
     /// # Errors
     ///
@@ -326,10 +351,91 @@ impl SqliteEventStore {
         transaction.commit().map_err(open_error)?;
 
         Ok(Self {
+            path: path.to_path_buf(),
             events: HashMap::new(),
             connection: Mutex::new(connection),
             max_reserved,
         })
+    }
+
+    /// Reads each reserved row of the state file into memory, and returns
+    /// the restored items (ADR 0001).
+    ///
+    /// A row holds identity and the token hash only. The restored items
+    /// replace the items in memory. A new file gives an empty set.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Corrupt` when the integrity check of SQLite fails or a row is
+    /// not valid, and `Open` when SQLite cannot read the file. The error names
+    /// the path. A failed load does not change the file or the memory.
+    pub fn load(&mut self) -> Result<Vec<StoredEvent>, StoreError> {
+        let path = self.path.clone();
+        let read_error = |source| StoreError::Open {
+            path: path.clone(),
+            source,
+        };
+        let corrupt = |reason: String| StoreError::Corrupt {
+            path: path.clone(),
+            reason,
+        };
+
+        let connection = self.connection()?;
+        let check: Vec<String> = connection
+            .prepare("PRAGMA quick_check")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(read_error)?;
+        if check != ["ok"] {
+            return Err(corrupt(format!(
+                "integrity check failed: {}",
+                check.join("; ")
+            )));
+        }
+
+        let rows: Vec<RawRow> = connection
+            .prepare("SELECT event_id, token_hash, label, created_at, class FROM live_items")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(read_error)?;
+
+        let mut restored = Vec::with_capacity(rows.len());
+        for (event_id, token_hash, label, created_at, class) in rows {
+            let token_hash: [u8; 32] = token_hash
+                .try_into()
+                .map_err(|_| corrupt("a token hash does not have 32 bytes".to_string()))?;
+            let created_at = u64::try_from(created_at)
+                .map_err(|_| corrupt("a creation time is negative".to_string()))?;
+            let class = EventClass::from_column(&class)
+                .ok_or_else(|| corrupt("a row has an unknown item class".to_string()))?;
+            restored.push(StoredEvent {
+                event_id,
+                token_hash,
+                label,
+                created_at,
+                class,
+            });
+        }
+
+        self.events = restored
+            .iter()
+            .map(|event| (event.event_id.clone(), event.clone()))
+            .collect();
+        Ok(restored)
     }
 
     fn connection(&mut self) -> Result<&mut Connection, StoreError> {
@@ -735,5 +841,72 @@ mod tests {
         let rows = file_rows(&path);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "r2");
+    }
+
+    #[test]
+    fn sqlite_load_of_a_new_file_gives_an_empty_set() {
+        let (_dir, _path, mut store) = open_store(10);
+
+        assert!(store.load().expect("load").is_empty());
+        assert!(store.list_ids().is_empty());
+    }
+
+    #[test]
+    fn sqlite_load_restores_the_rows_of_an_earlier_process() {
+        let (_dir, path, mut store) = open_store(10);
+        store.insert(stored("e", 1)).expect("insert ephemeral");
+        store
+            .insert(reserved("r", Some("weekly show")))
+            .expect("insert reserved");
+        drop(store);
+
+        let mut store = SqliteEventStore::open(&path, 10).expect("open again");
+        let restored = store.load().expect("load");
+
+        assert_eq!(restored, vec![reserved("r", Some("weekly show"))]);
+        assert_eq!(store.get("r"), Some(reserved("r", Some("weekly show"))));
+        // An ephemeral item never reached the file, so it is not restored.
+        assert_eq!(store.get("e"), None);
+        assert!(store.get("r").expect("r").token_hash_matches(&[9; 32]));
+    }
+
+    #[test]
+    fn sqlite_load_rejects_a_row_that_is_not_valid() {
+        let (_dir, path, store) = open_store(10);
+        drop(store);
+        let connection = Connection::open(&path).expect("open state file");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("pragma");
+        connection
+            .execute(
+                "INSERT INTO live_items (event_id, token_hash, label, created_at, class) \
+                 VALUES ('x', ?1, NULL, 1, 'ephemeral')",
+                params![[9_u8; 32].as_slice()],
+            )
+            .expect("insert");
+        drop(connection);
+
+        let mut store = SqliteEventStore::open(&path, 10).expect("open");
+        let err = store.load().expect_err("row with an unknown class");
+
+        assert!(matches!(err, StoreError::Corrupt { .. }));
+        assert!(err.to_string().contains(&path.display().to_string()));
+        assert!(store.list_ids().is_empty());
+    }
+
+    #[test]
+    fn sqlite_open_of_a_file_that_is_not_a_database_fails_and_keeps_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite3");
+        let garbage = b"this is not a SQLite database, it is garbage text \x00\x01".repeat(64);
+        std::fs::write(&path, &garbage).expect("write garbage");
+
+        let err = SqliteEventStore::open(&path, 10)
+            .and_then(|mut store| store.load().map(|_| store))
+            .expect_err("garbage file");
+
+        assert!(err.to_string().contains(&path.display().to_string()));
+        assert_eq!(std::fs::read(&path).expect("read"), garbage);
     }
 }

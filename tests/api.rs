@@ -718,7 +718,8 @@ async fn latest_metadata_includes_renewed_at_and_lease_expires_at() {
     assert!(!body.lease_expires_at.is_empty());
 }
 
-/// Tests for `POST /v1/liveitems/reserved` (ADR 0001, task 002).
+/// Tests for the reserved live items of ADR 0001: the reserve route
+/// (task 002), and the restore and the TTL exemption (task 003).
 mod reserved {
     use std::path::{Path, PathBuf};
 
@@ -1075,5 +1076,345 @@ mod reserved {
 
         assert!(!output.contains(ADMIN_TOKEN));
         assert!(output.contains("<redacted>"));
+    }
+
+    /// Builds a relay state with an admin token, the state file `state_file`,
+    /// a TTL of 10 seconds, a lease of 10 seconds, and an injected clock.
+    fn reserved_state_at(
+        state_file: &Path,
+        clock: &Arc<AtomicU64>,
+    ) -> Result<RelayState, musicindex_live_relay::store::StoreError> {
+        RelayState::try_with_clock(
+            AppConfig {
+                admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+                state_file: state_file.to_path_buf(),
+                ttl: Duration::from_secs(10),
+                lease: Duration::from_secs(10),
+                ..AppConfig::for_tests()
+            },
+            {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+        )
+    }
+
+    async fn get(router: axum::Router, uri: String) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    /// Reserves an item, publishes `marker` to it, and stops the relay.
+    /// Returns the reserve response.
+    async fn reserve_publish_and_stop(state_file: &Path, marker: &str) -> ReserveEventResponse {
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let state = reserved_state_at(state_file, &clock).expect("open state");
+        let router = app(state);
+        let reserved = reserve_ok(router.clone(), Some("station")).await;
+        for _ in 0..3 {
+            let response = publish(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                json!({ "title": marker, "value": { "destinations": [] } }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        reserved
+    }
+
+    #[tokio::test]
+    async fn reserved_token_validates_after_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let reserved = reserve_publish_and_stop(&state_file, "before restart").await;
+
+        let clock = Arc::new(AtomicU64::new(5_000));
+        let router = app(reserved_state_at(&state_file, &clock).expect("restore"));
+
+        let response = publish(
+            router.clone(),
+            &reserved.event_id,
+            Some("wrong"),
+            json!({ "title": "x" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = publish(
+            router,
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+            json!({ "title": "after restart" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let published: PublishMetadataResponse = read_json(response).await;
+        // The sequence number restarts at zero, so the first publish gives 1.
+        assert_eq!(published.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn restored_item_serves_no_previous_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let marker = "payload-before-restart-41c2";
+        let reserved = reserve_publish_and_stop(&state_file, marker).await;
+
+        let clock = Arc::new(AtomicU64::new(5_000));
+        let router = app(reserved_state_at(&state_file, &clock).expect("restore"));
+
+        // The metadata read gives the answer of an item with no snapshot.
+        let response = get(
+            router.clone(),
+            format!("/v1/liveitems/{}/metadata", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = read_json(response).await;
+        assert_eq!(body, json!({ "error": "metadata_not_found" }));
+
+        let response = get(
+            router.clone(),
+            format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = read_json(response).await;
+        assert_eq!(value, json!({}));
+
+        // An SSE client that keeps an old `Last-Event-ID` gets no replay.
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{}/events", reserved.event_id))
+                    .header("last-event-id", "0")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let chunk = timeout(Duration::from_millis(200), body.frame()).await;
+        if let Ok(Some(Ok(frame))) = chunk
+            && let Some(data) = frame.data_ref()
+        {
+            let text = String::from_utf8_lossy(data);
+            assert!(
+                !text.contains(marker),
+                "the SSE replay held the old payload"
+            );
+            assert!(!text.contains("remoteValue"), "the SSE replay is not empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_on_a_restored_item_returns_409_until_a_publish() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let reserved = reserve_publish_and_stop(&state_file, "before restart").await;
+
+        let clock = Arc::new(AtomicU64::new(5_000));
+        let router = app(reserved_state_at(&state_file, &clock).expect("restore"));
+
+        let response = keepalive(
+            router.clone(),
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(response).await, "lease_expired");
+
+        let response = publish(
+            router.clone(),
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+            json!({ "title": "back on air" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = keepalive(
+            router,
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reaper_removes_an_ephemeral_item_and_keeps_a_reserved_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let clock = Arc::new(AtomicU64::new(100));
+        let state = reserved_state_at(&state_file, &clock).expect("open state");
+        let router = app(state.clone());
+        let reserved = reserve_ok(router.clone(), Some("station")).await;
+        let ephemeral = create_event(router.clone()).await;
+
+        // The TTL is 10 seconds. Both items are idle for 11 seconds.
+        clock.store(111, Ordering::SeqCst);
+        assert_eq!(state.cleanup_expired().await, 1);
+
+        let response = get(
+            router.clone(),
+            format!("/v1/liveitems/{}/remoteValue", ephemeral.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = get(
+            router.clone(),
+            format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reserved_row_count(&state_file), 1);
+
+        let response = publish(
+            router,
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+            json!({ "title": "still here" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reaper_keeps_a_restored_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let reserved = reserve_publish_and_stop(&state_file, "before restart").await;
+
+        let clock = Arc::new(AtomicU64::new(5_000));
+        let state = reserved_state_at(&state_file, &clock).expect("restore");
+        clock.store(5_000 + 1_000_000, Ordering::SeqCst);
+
+        assert_eq!(state.cleanup_expired().await, 0);
+        let response = get(
+            app(state),
+            format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reserved_row_count(&state_file), 1);
+    }
+
+    #[tokio::test]
+    async fn lease_expiry_on_a_reserved_item_removes_the_snapshot_and_keeps_the_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let clock = Arc::new(AtomicU64::new(100));
+        let state = reserved_state_at(&state_file, &clock).expect("open state");
+        let router = app(state.clone());
+        let reserved = reserve_ok(router.clone(), None).await;
+        let response = publish(
+            router.clone(),
+            &reserved.event_id,
+            Some(&reserved.broadcaster_token),
+            json!({ "title": "on air" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The lease is 10 seconds. The TTL is also 10 seconds.
+        clock.store(111, Ordering::SeqCst);
+        assert_eq!(state.expire_leases().await, 1);
+        assert_eq!(state.cleanup_expired().await, 0);
+
+        let response = get(
+            router.clone(),
+            format!("/v1/liveitems/{}/metadata", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(response).await, "metadata_not_found");
+
+        let response = get(
+            router,
+            format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = read_json(response).await;
+        assert_eq!(value, json!({}));
+        assert_eq!(reserved_row_count(&state_file), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_file_fails_startup_and_stays_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let garbage = b"not a SQLite database \x00\x01\x02".repeat(128);
+        std::fs::write(&state_file, &garbage).expect("write garbage");
+
+        let clock = Arc::new(AtomicU64::new(1));
+        let Err(err) = reserved_state_at(&state_file, &clock) else {
+            panic!("a corrupt state file must fail startup");
+        };
+
+        assert!(
+            err.to_string().contains(&state_file.display().to_string()),
+            "the error names the path: {err}"
+        );
+        assert_eq!(std::fs::read(&state_file).expect("read"), garbage);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![state_file.file_name().expect("name").to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn state_file_with_no_item_table_fails_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        drop(reserved_state_at(&state_file, &Arc::new(AtomicU64::new(1))).expect("open"));
+        rusqlite::Connection::open(&state_file)
+            .expect("open state file")
+            .execute("DROP TABLE live_items", [])
+            .expect("drop table");
+
+        let Err(err) = reserved_state_at(&state_file, &Arc::new(AtomicU64::new(1))) else {
+            panic!("a state file with no item table must fail startup");
+        };
+        assert!(err.to_string().contains(&state_file.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn no_admin_token_restores_nothing_and_leaves_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = dir.path().join("reserved-items.sqlite3");
+        let reserved = reserve_publish_and_stop(&state_file, "before restart").await;
+        let before = std::fs::read(&state_file).expect("read");
+
+        let router = app(RelayState::try_new(AppConfig {
+            state_file: state_file.clone(),
+            ..AppConfig::for_tests()
+        })
+        .expect("start with no admin token"));
+
+        let response = get(
+            router,
+            format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(std::fs::read(&state_file).expect("read"), before);
     }
 }

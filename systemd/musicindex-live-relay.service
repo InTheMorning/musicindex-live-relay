@@ -12,6 +12,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+StateDirectory=musicindex-live-relay
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
