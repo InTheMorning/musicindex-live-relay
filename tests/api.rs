@@ -2411,7 +2411,7 @@ mod reserved {
     /// routes, the lease expiry rule, and the separation from the live
     /// value transports.
     mod display {
-        use musicindex_live_relay::PublishDisplayResponse;
+        use musicindex_live_relay::{PublishDisplayResponse, UploadArtworkResponse};
 
         use super::*;
 
@@ -2531,15 +2531,24 @@ mod reserved {
                 json!({ "track": null })
             );
 
+            // Task 002: a display publish names only a held image, and a
+            // publish removes an upload that no state names. So each image
+            // is uploaded just before the state that names it.
+            let images = [jpeg_bytes(1), png_bytes(1)];
+            let jpeg = sha256_of(&images[0]);
+            let png = sha256_of(&images[1]);
             let states = [
-                track(json!({ "sha256": SHA256, "mime": "image/jpeg" })),
-                track(json!({ "sha256": SHA256, "mime": "image/png" })),
+                track(json!({ "sha256": jpeg, "mime": "image/jpeg" })),
+                track(json!({ "sha256": png, "mime": "image/png" })),
                 track(json!({ "url": "https://example.com/cover.jpg" })),
                 track(json!({ "url": "http://example.com/cover.png" })),
                 track(Value::Null),
                 json!({ "track": null }),
             ];
             for (index, state) in states.iter().enumerate() {
+                if let Some(bytes) = images.get(index) {
+                    upload_ok(router.clone(), &reserved, bytes).await;
+                }
                 let published = publish_display_ok(router.clone(), &reserved, state).await;
                 assert_eq!(published.seq, index as u64 + 1);
                 assert_eq!(
@@ -2860,7 +2869,9 @@ mod reserved {
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
-            let playing = track(json!({ "sha256": SHA256, "mime": "image/jpeg" }));
+            // Task 002: a display publish names only a held image.
+            let jpeg = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+            let playing = track(json!({ "sha256": jpeg, "mime": "image/jpeg" }));
             publish_display_ok(router.clone(), &reserved, &playing).await;
             let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
 
@@ -3170,6 +3181,703 @@ mod reserved {
                 .expect("response");
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             assert_eq!(error_code(response).await, "event_not_found");
+        }
+
+        /// A small byte array that starts with the JPEG bytes.
+        fn jpeg_bytes(seed: u8) -> Vec<u8> {
+            let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+            bytes.extend([seed; 16]);
+            bytes
+        }
+
+        /// A small byte array that starts with the PNG bytes.
+        fn png_bytes(seed: u8) -> Vec<u8> {
+            let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+            bytes.extend([seed; 16]);
+            bytes
+        }
+
+        fn sha256_of(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        async fn put_artwork(
+            router: axum::Router,
+            event_id: &str,
+            sha256: &str,
+            authorization: Option<&str>,
+            body: impl Into<Body>,
+        ) -> axum::response::Response {
+            let mut builder = Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/liveitems/{event_id}/artwork/{sha256}"));
+            if let Some(authorization) = authorization {
+                builder = builder.header(header::AUTHORIZATION, authorization);
+            }
+            router
+                .oneshot(builder.body(body.into()).expect("artwork request"))
+                .await
+                .expect("artwork response")
+        }
+
+        /// Uploads `bytes` with the token, asserts `200` and a new image, and
+        /// returns the hash.
+        async fn upload_ok(
+            router: axum::Router,
+            reserved: &ReserveEventResponse,
+            bytes: &[u8],
+        ) -> String {
+            let sha256 = sha256_of(bytes);
+            let response = put_artwork(
+                router,
+                &reserved.event_id,
+                &sha256,
+                Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                bytes.to_vec(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let uploaded: UploadArtworkResponse = read_json(response).await;
+            assert_eq!(uploaded.event_id, reserved.event_id);
+            assert_eq!(uploaded.sha256, sha256);
+            assert!(uploaded.stored, "the image was held already");
+            sha256
+        }
+
+        async fn get_artwork(
+            router: axum::Router,
+            event_id: &str,
+            sha256: &str,
+        ) -> axum::response::Response {
+            get(router, format!("/v1/liveitems/{event_id}/artwork/{sha256}")).await
+        }
+
+        /// Asserts that the event holds the image with the hash `sha256`.
+        async fn assert_held(router: axum::Router, event_id: &str, sha256: &str) {
+            let response = get_artwork(router, event_id, sha256).await;
+            assert_eq!(response.status(), StatusCode::OK, "{sha256} is not held");
+        }
+
+        /// Asserts that the event does not hold the image with the hash
+        /// `sha256`.
+        async fn assert_not_held(router: axum::Router, event_id: &str, sha256: &str) {
+            let response = get_artwork(router, event_id, sha256).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{sha256} is held");
+            assert_eq!(error_code(response).await, "artwork_not_found");
+        }
+
+        /// Tests for the artwork store of ADR 0003, task 002.
+        mod artwork {
+            use super::*;
+
+            #[tokio::test]
+            async fn an_upload_and_a_read_give_the_same_bytes_and_the_three_headers() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+
+                for (bytes, mime) in [(jpeg_bytes(1), "image/jpeg"), (png_bytes(1), "image/png")] {
+                    let sha256 = sha256_of(&bytes);
+                    let response = put_artwork(
+                        router.clone(),
+                        &reserved.event_id,
+                        &sha256,
+                        Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                        bytes.clone(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let uploaded: UploadArtworkResponse = read_json(response).await;
+                    assert_eq!(uploaded.mime, mime);
+                    assert!(uploaded.stored);
+
+                    let response = get_artwork(router.clone(), &reserved.event_id, &sha256).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let headers = response.headers();
+                    assert_eq!(headers[header::CONTENT_TYPE], mime);
+                    assert_eq!(
+                        headers[header::CACHE_CONTROL],
+                        "public, max-age=31536000, immutable"
+                    );
+                    assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+                    let body = to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("read body");
+                    assert_eq!(body.as_ref(), bytes.as_slice());
+                }
+            }
+
+            #[tokio::test]
+            async fn the_type_comes_from_the_bytes_only() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let bytes = jpeg_bytes(2);
+                let sha256 = sha256_of(&bytes);
+
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri(format!(
+                                "/v1/liveitems/{}/artwork/{sha256}",
+                                reserved.event_id
+                            ))
+                            .header(
+                                header::AUTHORIZATION,
+                                format!("Bearer {}", reserved.broadcaster_token),
+                            )
+                            .header(header::CONTENT_TYPE, "image/png")
+                            .body(Body::from(bytes))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let uploaded: UploadArtworkResponse = read_json(response).await;
+                assert_eq!(uploaded.mime, "image/jpeg");
+
+                let response = get_artwork(router, &reserved.event_id, &sha256).await;
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+            }
+
+            #[tokio::test]
+            async fn a_wrong_hash_gives_400_sha256_mismatch() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let authorization = format!("Bearer {}", reserved.broadcaster_token);
+                let bytes = jpeg_bytes(3);
+                let right = sha256_of(&bytes);
+
+                for wrong in [
+                    sha256_of(&jpeg_bytes(4)),
+                    right.to_uppercase(),
+                    right[1..].to_string(),
+                    format!("{right}0"),
+                    SHA256.to_string(),
+                ] {
+                    let response = put_artwork(
+                        router.clone(),
+                        &reserved.event_id,
+                        &wrong,
+                        Some(&authorization),
+                        bytes.clone(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{wrong}");
+                    assert_eq!(error_code(response).await, "sha256_mismatch", "{wrong}");
+                    assert_not_held(router.clone(), &reserved.event_id, &wrong).await;
+                }
+                assert_not_held(router, &reserved.event_id, &right).await;
+            }
+
+            #[tokio::test]
+            async fn bytes_that_are_not_jpeg_or_png_give_400_unsupported_image() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let authorization = format!("Bearer {}", reserved.broadcaster_token);
+
+                let wrong: Vec<Vec<u8>> = vec![
+                    Vec::new(),
+                    b"GIF89a\x01\x00\x01\x00".to_vec(),
+                    b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(),
+                    vec![0xFF, 0xD8],
+                    vec![0xFF, 0xD9, 0xFF, 0xE0],
+                    vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A],
+                    vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0B, 0x00],
+                    [b"x".as_slice(), &jpeg_bytes(5)].concat(),
+                ];
+                for bytes in wrong {
+                    let sha256 = sha256_of(&bytes);
+                    let response = put_artwork(
+                        router.clone(),
+                        &reserved.event_id,
+                        &sha256,
+                        Some(&authorization),
+                        bytes.clone(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bytes:?}");
+                    assert_eq!(error_code(response).await, "unsupported_image", "{bytes:?}");
+                    assert_not_held(router.clone(), &reserved.event_id, &sha256).await;
+                }
+            }
+
+            #[tokio::test]
+            async fn a_body_over_the_limit_gives_413() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let state = RelayState::try_new(AppConfig {
+                    admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+                    state_file: dir.path().join("reserved-items.sqlite3"),
+                    artwork_max_bytes: 1_024,
+                    ..AppConfig::for_tests()
+                })
+                .expect("open state");
+                let router = app(state);
+                let reserved = reserve_ok(router.clone(), None).await;
+                let authorization = format!("Bearer {}", reserved.broadcaster_token);
+                let sized = |len: usize| {
+                    let mut bytes = jpeg_bytes(6);
+                    bytes.resize(len, 0);
+                    bytes
+                };
+
+                // A body of exactly the limit is accepted.
+                upload_ok(router.clone(), &reserved, &sized(1_024)).await;
+
+                // A streamed body over the limit gets the JSON error.
+                let over = sized(1_025);
+                let sha256 = sha256_of(&over);
+                let response = put_artwork(
+                    router.clone(),
+                    &reserved.event_id,
+                    &sha256,
+                    Some(&authorization),
+                    over.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(error_code(response).await, "payload_too_large");
+
+                // The credential comes before the body.
+                let response = put_artwork(
+                    router.clone(),
+                    &reserved.event_id,
+                    &sha256,
+                    None,
+                    over.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(error_code(response).await, "missing_bearer_token");
+
+                // A request that states its length is refused before the
+                // handler runs.
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri(format!(
+                                "/v1/liveitems/{}/artwork/{sha256}",
+                                reserved.event_id
+                            ))
+                            .header(header::AUTHORIZATION, &authorization)
+                            .header(header::CONTENT_LENGTH, over.len())
+                            .body(Body::from(over))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+                assert_not_held(router, &reserved.event_id, &sha256).await;
+            }
+
+            #[tokio::test]
+            async fn the_default_limit_accepts_524288_bytes_and_refuses_one_more() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let mut bytes = jpeg_bytes(7);
+                bytes.resize(524_288, 0);
+                upload_ok(router.clone(), &reserved, &bytes).await;
+
+                bytes.push(0);
+                let response = put_artwork(
+                    router,
+                    &reserved.event_id,
+                    &sha256_of(&bytes),
+                    Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                    bytes,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(error_code(response).await, "payload_too_large");
+            }
+
+            #[tokio::test]
+            async fn a_second_upload_of_one_image_gives_200_with_no_change() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let first = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let second = upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await;
+
+                let response = put_artwork(
+                    router.clone(),
+                    &reserved.event_id,
+                    &first,
+                    Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                    jpeg_bytes(1),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let uploaded: UploadArtworkResponse = read_json(response).await;
+                assert!(!uploaded.stored);
+                assert_eq!(uploaded.mime, "image/jpeg");
+
+                // The order did not change: a third image removes the first.
+                let third = upload_ok(router.clone(), &reserved, &jpeg_bytes(3)).await;
+                assert_not_held(router.clone(), &reserved.event_id, &first).await;
+                assert_held(router.clone(), &reserved.event_id, &second).await;
+                assert_held(router, &reserved.event_id, &third).await;
+            }
+
+            #[tokio::test]
+            async fn a_display_publish_with_an_image_that_is_not_held_gives_409_artwork_missing() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let authorization = format!("Bearer {}", reserved.broadcaster_token);
+                let bytes = jpeg_bytes(1);
+                let sha256 = sha256_of(&bytes);
+                let playing = track(json!({ "sha256": sha256, "mime": "image/jpeg" }));
+
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&authorization),
+                    playing.to_string(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(error_code(response).await, "artwork_missing");
+                assert_eq!(
+                    read_display(router.clone(), &reserved.event_id).await,
+                    json!({ "track": null })
+                );
+
+                // After the upload, the same publish is accepted.
+                upload_ok(router.clone(), &reserved, &bytes).await;
+                let published = publish_display_ok(router.clone(), &reserved, &playing).await;
+                assert_eq!(published.seq, 1);
+            }
+
+            #[tokio::test]
+            async fn a_mime_that_is_not_the_stored_type_gives_400_invalid_display() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let authorization = format!("Bearer {}", reserved.broadcaster_token);
+                let jpeg = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let png = upload_ok(router.clone(), &reserved, &png_bytes(1)).await;
+
+                for (sha256, mime) in [(&jpeg, "image/png"), (&png, "image/jpeg")] {
+                    let response = post_display(
+                        router.clone(),
+                        &reserved.event_id,
+                        Some(&authorization),
+                        track(json!({ "sha256": sha256, "mime": mime })).to_string(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{mime}");
+                    assert_eq!(error_code(response).await, "invalid_display", "{mime}");
+                }
+                assert_eq!(
+                    read_display(router.clone(), &reserved.event_id).await,
+                    json!({ "track": null })
+                );
+                // A refused publish removed no image.
+                assert_held(router.clone(), &reserved.event_id, &jpeg).await;
+                assert_held(router, &reserved.event_id, &png).await;
+            }
+
+            #[tokio::test]
+            async fn after_three_display_states_with_three_images_the_first_image_gives_404() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+
+                let mut hashes = Vec::new();
+                for seed in 1..=3 {
+                    let sha256 = upload_ok(router.clone(), &reserved, &jpeg_bytes(seed)).await;
+                    let state = track(json!({ "sha256": sha256, "mime": "image/jpeg" }));
+                    publish_display_ok(router.clone(), &reserved, &state).await;
+                    hashes.push(sha256);
+                }
+                assert_not_held(router.clone(), &reserved.event_id, &hashes[0]).await;
+                assert_held(router.clone(), &reserved.event_id, &hashes[1]).await;
+                assert_held(router, &reserved.event_id, &hashes[2]).await;
+            }
+
+            #[tokio::test]
+            async fn a_display_publish_removes_each_image_of_neither_the_present_nor_the_previous_state()
+             {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let named = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let unnamed = upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await;
+
+                // A publish removes an upload that no state names.
+                let playing = track(json!({ "sha256": named, "mime": "image/jpeg" }));
+                publish_display_ok(router.clone(), &reserved, &playing).await;
+                assert_held(router.clone(), &reserved.event_id, &named).await;
+                assert_not_held(router.clone(), &reserved.event_id, &unnamed).await;
+
+                // The image of the previous state stays for one more state.
+                let url = track(json!({ "url": "https://example.com/cover.jpg" }));
+                publish_display_ok(router.clone(), &reserved, &url).await;
+                assert_held(router.clone(), &reserved.event_id, &named).await;
+
+                publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+                assert_not_held(router, &reserved.event_id, &named).await;
+            }
+
+            #[tokio::test]
+            async fn three_uploads_with_no_publish_leave_at_most_two_images() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+
+                let hashes = [
+                    upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await,
+                    upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await,
+                    upload_ok(router.clone(), &reserved, &jpeg_bytes(3)).await,
+                ];
+                assert_not_held(router.clone(), &reserved.event_id, &hashes[0]).await;
+                assert_held(router.clone(), &reserved.event_id, &hashes[1]).await;
+                assert_held(router, &reserved.event_id, &hashes[2]).await;
+            }
+
+            #[tokio::test]
+            async fn an_upload_never_removes_the_image_of_the_present_state() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+
+                let previous = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let state = track(json!({ "sha256": previous, "mime": "image/jpeg" }));
+                publish_display_ok(router.clone(), &reserved, &state).await;
+                let present = upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await;
+                let state = track(json!({ "sha256": present, "mime": "image/jpeg" }));
+                publish_display_ok(router.clone(), &reserved, &state).await;
+                assert_held(router.clone(), &reserved.event_id, &previous).await;
+
+                // The first upload removes the image of the previous state.
+                let first = upload_ok(router.clone(), &reserved, &jpeg_bytes(3)).await;
+                assert_not_held(router.clone(), &reserved.event_id, &previous).await;
+                assert_held(router.clone(), &reserved.event_id, &present).await;
+
+                // Each later upload removes the earlier upload.
+                let mut last = first;
+                for seed in 4..=6 {
+                    let next = upload_ok(router.clone(), &reserved, &jpeg_bytes(seed)).await;
+                    assert_not_held(router.clone(), &reserved.event_id, &last).await;
+                    assert_held(router.clone(), &reserved.event_id, &next).await;
+                    assert_held(router.clone(), &reserved.event_id, &present).await;
+                    last = next;
+                }
+                assert_eq!(
+                    read_display(router, &reserved.event_id).await,
+                    track(json!({ "sha256": present, "mime": "image/jpeg" }))
+                );
+            }
+
+            #[tokio::test]
+            async fn a_lease_expiry_with_a_snapshot_removes_the_images() {
+                let (router, state, clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let response = publish(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&reserved.broadcaster_token),
+                    json!({ "title": "on air" }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let named = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let state_with_image = track(json!({ "sha256": named, "mime": "image/jpeg" }));
+                publish_display_ok(router.clone(), &reserved, &state_with_image).await;
+                let unnamed = upload_ok(router.clone(), &reserved, &png_bytes(1)).await;
+
+                // Before the lease ends, the images stay.
+                clock.store(109, Ordering::SeqCst);
+                assert_eq!(state.expire_leases().await, 0);
+                assert_held(router.clone(), &reserved.event_id, &named).await;
+                assert_held(router.clone(), &reserved.event_id, &unnamed).await;
+
+                clock.store(110, Ordering::SeqCst);
+                assert_eq!(state.expire_leases().await, 1);
+                assert_not_held(router.clone(), &reserved.event_id, &named).await;
+                assert_not_held(router.clone(), &reserved.event_id, &unnamed).await;
+                assert_eq!(
+                    read_display(router.clone(), &reserved.event_id).await,
+                    json!({ "track": null })
+                );
+
+                // A display state that names the image needs a new upload.
+                let response = post_display(
+                    router,
+                    &reserved.event_id,
+                    Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                    state_with_image.to_string(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(error_code(response).await, "artwork_missing");
+            }
+
+            #[tokio::test]
+            async fn a_lease_end_with_no_snapshot_removes_the_images() {
+                let (router, state, clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                // Images and no payload, as after a relay restart. One image
+                // is named by a display state, and one is not.
+                let named = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let state_with_image = track(json!({ "sha256": named, "mime": "image/jpeg" }));
+                publish_display_ok(router.clone(), &reserved, &state_with_image).await;
+                let unnamed = upload_ok(router.clone(), &reserved, &png_bytes(1)).await;
+
+                clock.store(200, Ordering::SeqCst);
+                // No snapshot was cleared, so the count stays 0.
+                assert_eq!(state.expire_leases().await, 0);
+                assert_not_held(router.clone(), &reserved.event_id, &named).await;
+                assert_not_held(router.clone(), &reserved.event_id, &unnamed).await;
+
+                // With a null display state, an upload after the lease end
+                // also goes at the next expiry pass.
+                let late = upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await;
+                assert_eq!(state.expire_leases().await, 0);
+                assert_not_held(router, &reserved.event_id, &late).await;
+            }
+
+            #[tokio::test]
+            async fn an_ephemeral_event_gives_409_event_not_reserved_on_both_routes() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let ephemeral = create_event(router.clone()).await;
+                let bytes = jpeg_bytes(1);
+                let sha256 = sha256_of(&bytes);
+
+                let response = put_artwork(
+                    router.clone(),
+                    &ephemeral.event_id,
+                    &sha256,
+                    Some(&format!("Bearer {}", ephemeral.broadcaster_token)),
+                    bytes,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(error_code(response).await, "event_not_reserved");
+
+                let response = get_artwork(router, &ephemeral.event_id, &sha256).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(error_code(response).await, "event_not_reserved");
+            }
+
+            #[tokio::test]
+            async fn a_bad_credential_gives_401_or_403_and_an_unknown_event_gives_404() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), Some("first")).await;
+                let other = reserve_ok(router.clone(), Some("second")).await;
+                let bytes = jpeg_bytes(1);
+                let sha256 = sha256_of(&bytes);
+
+                let cases = [
+                    (None, StatusCode::UNAUTHORIZED, "missing_bearer_token"),
+                    (
+                        Some("Token abc".to_string()),
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_bearer_token",
+                    ),
+                    (
+                        Some("Bearer wrong".to_string()),
+                        StatusCode::FORBIDDEN,
+                        "invalid_token",
+                    ),
+                    (
+                        Some(format!("Bearer {}", other.broadcaster_token)),
+                        StatusCode::FORBIDDEN,
+                        "invalid_token",
+                    ),
+                    (
+                        Some(format!("Bearer {ADMIN_TOKEN}")),
+                        StatusCode::FORBIDDEN,
+                        "invalid_token",
+                    ),
+                ];
+                for (authorization, status, code) in cases {
+                    let response = put_artwork(
+                        router.clone(),
+                        &reserved.event_id,
+                        &sha256,
+                        authorization.as_deref(),
+                        bytes.clone(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), status, "{authorization:?}");
+                    assert_eq!(error_code(response).await, code, "{authorization:?}");
+                }
+                assert_not_held(router.clone(), &reserved.event_id, &sha256).await;
+
+                let response = put_artwork(
+                    router.clone(),
+                    "missing",
+                    &sha256,
+                    Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                    bytes,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(error_code(response).await, "event_not_found");
+                let response = get_artwork(router, "missing", &sha256).await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(error_code(response).await, "event_not_found");
+            }
+
+            #[tokio::test]
+            async fn the_upload_shares_the_publish_rate_limit() {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let clock = Arc::new(AtomicU64::new(100));
+                let state = RelayState::try_with_clock(
+                    AppConfig {
+                        admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+                        state_file: dir.path().join("reserved-items.sqlite3"),
+                        max_publishes_per_event_per_sec: 2,
+                        ..AppConfig::for_tests()
+                    },
+                    {
+                        let clock = clock.clone();
+                        Arc::new(move || clock.load(Ordering::SeqCst))
+                    },
+                )
+                .expect("open state");
+                let router = app(state);
+                let reserved = reserve_ok(router.clone(), None).await;
+
+                let response = publish(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&reserved.broadcaster_token),
+                    json!({ "title": "on air" }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+
+                let bytes = jpeg_bytes(2);
+                let sha256 = sha256_of(&bytes);
+                let response = put_artwork(
+                    router.clone(),
+                    &reserved.event_id,
+                    &sha256,
+                    Some(&format!("Bearer {}", reserved.broadcaster_token)),
+                    bytes.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(error_code(response).await, "publish_rate_limited");
+                assert_not_held(router.clone(), &reserved.event_id, &sha256).await;
+
+                clock.store(101, Ordering::SeqCst);
+                upload_ok(router, &reserved, &bytes).await;
+            }
+
+            #[tokio::test]
+            async fn a_restart_holds_no_image() {
+                let (router, _state, clock, _dir, state_file) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let sha256 = upload_ok(router, &reserved, &jpeg_bytes(1)).await;
+
+                let restarted = app(reserved_state_at(&state_file, &clock).expect("restart"));
+                assert_not_held(restarted, &reserved.event_id, &sha256).await;
+            }
         }
     }
 }

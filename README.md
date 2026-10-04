@@ -31,6 +31,8 @@ GET  /v1/liveitems/{event_id}/events
 POST /v1/liveitems/{event_id}/display
 GET  /v1/liveitems/{event_id}/display
 GET  /v1/liveitems/{event_id}/display/events
+PUT  /v1/liveitems/{event_id}/artwork/{sha256}
+GET  /v1/liveitems/{event_id}/artwork/{sha256}
 GET  /socket.io/*
 ```
 
@@ -484,18 +486,27 @@ A display state is one JSON object:
   `artist` and `title` are strings.
 - `artwork` has one of three forms:
   - `{"sha256": "…", "mime": "…"}`. `sha256` is 64 lowercase hexadecimal
-    characters. `mime` is `image/jpeg` or `image/png`.
+    characters. `mime` is `image/jpeg` or `image/png`. The relay must hold
+    the image for the item, and `mime` must be its stored type. Upload the
+    image first. See "Upload An Image" below.
   - `{"url": "…"}`. The URL uses `http` or `https`, and it has at most 2,048
     characters. The relay does not fetch the image. A client loads it.
   - `null` when the track has no image.
 
-The display state is in memory only. A restart gives `{"track": null}`, a
-display `seq` of zero and an empty display replay buffer.
+The display state and the images are in memory only. A restart gives
+`{"track": null}`, a display `seq` of zero, an empty display replay buffer and
+no image.
 
 When the lease of an item expires, the relay also sets its display state to
 `{"track": null}` and sends that state on `/display/events`. If the display
-state is `{"track": null}` at the expiry, the relay sends nothing more. A display
-publish does not renew the lease. See "The Lease" above.
+state is `{"track": null}` at the expiry, the relay sends nothing more. The
+relay also removes every image of the item, with or without a display state.
+A display publish and an image upload do not renew the lease. See "The Lease"
+above.
+
+The relay examines the leases one time each second. An item that has no live
+lease keeps no image. The relay removes an upload to such an item in one
+second or less. To keep images, publish the live value and send keepalives.
 
 #### Publish The Display State
 
@@ -527,13 +538,17 @@ Status codes:
 - `200` when the relay accepts the display state.
 - `400` with error code `invalid_display` when the body is not a display
   state. This includes a URL with a scheme that is not `http` or `https`,
-  and a URL that is longer than 2,048 characters.
+  a URL that is longer than 2,048 characters, and a `mime` that is not the
+  stored type of the image.
 - `401` with error code `missing_bearer_token`, `invalid_bearer_token` or
   `invalid_authorization_header` when the bearer token is missing or
   malformed. These are the codes of a publish.
 - `403` with error code `invalid_token` when the bearer token is wrong.
 - `404` with error code `event_not_found` when the item does not exist.
 - `409` with error code `event_not_reserved` when the item is ephemeral.
+- `409` with error code `artwork_missing` when the relay does not hold the
+  image of `artwork.sha256` for the item. Upload the image, then publish
+  again.
 - `413` when the body is larger than 8 KiB. The error code is
   `payload_too_large`. A request with a `Content-Length` header over the
   limit gets `413` with a plain text body.
@@ -541,7 +556,8 @@ Status codes:
   rate limit is exceeded.
 
 The relay examines the credential before the body. A body error does not come
-before a `401`, `403`, `404` or `409` answer.
+before a `401`, `403`, `404` or `409 event_not_reserved` answer. The relay
+examines `artwork_missing` and the stored type last, after the rate limit.
 
 #### Read The Display State
 
@@ -586,6 +602,102 @@ Status codes:
 - `503` with error code `max_sse_connections_reached` when the relay has
   `MAX_SSE_CONNECTIONS` streams open. The display streams and the `/events`
   streams share this limit.
+
+#### Upload An Image
+
+```http
+PUT /v1/liveitems/{event_id}/artwork/{sha256}
+Authorization: Bearer <broadcaster_token>
+```
+
+The body is the image bytes. `{sha256}` is the SHA-256 of the body, as 64
+lowercase hexadecimal characters. The body must start with the JPEG bytes
+`FF D8 FF` or the PNG bytes `89 50 4E 47 0D 0A 1A 0A`. The relay gets the
+image type from these bytes only. It ignores the `Content-Type` header of
+the request.
+
+The body limit is `ARTWORK_MAX_BYTES`, 524,288 bytes by default. An upload
+uses the per-event publish rate limit, the same limit as a publish.
+
+Response:
+
+```json
+{
+  "event_id": "<event_id>",
+  "sha256": "<64 lowercase hex characters>",
+  "mime": "image/jpeg",
+  "stored": true
+}
+```
+
+`mime` is the type that the relay read from the first bytes. `stored` is
+`false` when the item held the image already. The relay then changes nothing.
+
+Status codes:
+
+- `200` when the relay holds the image after the request.
+- `400` with error code `sha256_mismatch` when `{sha256}` is not the SHA-256
+  of the body. This includes a `{sha256}` that is not 64 lowercase
+  hexadecimal characters.
+- `400` with error code `unsupported_image` when the body does not start
+  with the JPEG bytes or the PNG bytes.
+- `401` with error code `missing_bearer_token`, `invalid_bearer_token` or
+  `invalid_authorization_header` when the bearer token is missing or
+  malformed.
+- `403` with error code `invalid_token` when the bearer token is wrong.
+- `404` with error code `event_not_found` when the item does not exist.
+- `409` with error code `event_not_reserved` when the item is ephemeral.
+- `413` when the body is larger than `ARTWORK_MAX_BYTES`. The error code is
+  `payload_too_large`. A request with a `Content-Length` header over the
+  limit gets `413` with a plain text body.
+- `429` with error code `publish_rate_limited` when the per-event publish
+  rate limit is exceeded.
+
+The relay examines the credential before the body, as for a display publish.
+
+#### Read An Image
+
+```http
+GET /v1/liveitems/{event_id}/artwork/{sha256}
+```
+
+Returns the image bytes with these headers:
+
+```text
+Content-Type: image/jpeg
+Cache-Control: public, max-age=31536000, immutable
+X-Content-Type-Options: nosniff
+```
+
+`Content-Type` is the stored type, `image/jpeg` or `image/png`. The bytes of
+a path never change, so a client can keep an image in its cache.
+
+Status codes:
+
+- `200` with the image.
+- `404` with error code `artwork_not_found` when the relay does not hold the
+  image for the item.
+- `404` with error code `event_not_found` when the item does not exist.
+- `409` with error code `event_not_reserved` when the item is ephemeral.
+
+#### Image Retention
+
+An item holds two images at most. So the images that the relay holds use at
+most `MAX_RESERVED_ITEMS` multiplied by two images of `ARTWORK_MAX_BYTES`.
+
+- After a display publish, the item keeps the image of the present display
+  state and the image of the state before it. The relay removes every other
+  image.
+- An upload never makes the item hold more than two images. An upload can
+  add a new image to an item that holds two images. The relay then first
+  removes one image that the present display state does not name. It removes the
+  image of the state before the present state, if the item holds it. Else it
+  removes the earlier upload.
+- An upload never removes the image of the present display state.
+- A lease expiry removes every image of the item.
+
+An image can go before a display state names it. A broadcaster that gets
+`409 artwork_missing` uploads the image again and publishes again.
 
 ## RSS `podcast:liveValue`
 
@@ -756,11 +868,12 @@ Configuration is read from environment variables.
 | `MAX_SSE_CONNECTIONS` | `1000` | Maximum concurrent SSE streams. |
 | `EVENT_TTL_SECS` | `86400` | Time before inactive events expire. A reserved item does not expire. |
 | `MAX_CREATES_PER_SEC` | `50` | Global cap on `POST /v1/liveitems` per second. Returns 429 when exceeded. |
-| `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Returns 429 when exceeded. |
+| `MAX_PUBLISHES_PER_EVENT_PER_SEC` | `20` | Per-event cap on metadata publishes per second. Keepalives, display publishes and image uploads use the same cap. Returns 429 when exceeded. |
 | `LEASE_SECS` | `90` | Lease duration for an event. Must be 10 or more. See "The Lease" above. |
 | `ADMIN_TOKEN` | not set | The operator credential for the reserve, list and delete routes of reserved items. It must have 16 bytes or more. When it is not set, these routes answer `404` and the relay opens no state file. |
 | `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay opens it and restores the reserved items only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
 | `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
+| `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. A reserved item holds two images at most. See "Image Retention" above. |
 
 The included systemd unit sets `ProtectSystem=strict`,
 `StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. systemd
@@ -768,7 +881,7 @@ makes `/var/lib/musicindex-live-relay/` with the correct owner and mode 0700,
 and the relay can write the state file there. If the relay cannot open or read
 the state file, it stops at startup and the error names the path.
 
-Metadata request bodies are limited to 64 KiB. Reserve request bodies are limited to 4 KiB. Other routes are unconstrained.
+Metadata request bodies are limited to 64 KiB. Reserve request bodies are limited to 4 KiB. Display request bodies are limited to 8 KiB. Image uploads are limited to `ARTWORK_MAX_BYTES`. Other routes are unconstrained.
 
 Per-IP rate limiting is the responsibility of the front-end proxy (e.g. nginx). The relay's `MAX_CREATES_PER_SEC` is a global safety bound, not a per-client limit.
 

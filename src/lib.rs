@@ -3,6 +3,7 @@ pub mod store;
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
+    fmt::Write as _,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -66,6 +67,17 @@ const DISPLAY_BODY_LIMIT_BYTES: usize = 8 * 1024;
 const MAX_ARTWORK_URL_CHARS: usize = 2_048;
 /// The image types that an `artwork.mime` can name (ADR 0003).
 const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
+/// The default body limit of an image upload, in bytes (ADR 0003).
+const DEFAULT_ARTWORK_MAX_BYTES: usize = 512 * 1024;
+/// The maximum count of images that one event holds (ADR 0003 §Invariants).
+const MAX_EVENT_IMAGES: usize = 2;
+/// The first bytes of a JPEG image.
+const JPEG_MAGIC: &[u8] = &[0xFF, 0xD8, 0xFF];
+/// The first bytes of a PNG image.
+const PNG_MAGIC: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+/// The `Cache-Control` value of an image read. The path holds the hash of
+/// the bytes, so the bytes of a path never change.
+const ARTWORK_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 /// The operator credential for the reserved item routes (ADR 0001).
 ///
@@ -115,6 +127,8 @@ pub struct AppConfig {
     pub state_file: PathBuf,
     /// The maximum count of reserved items in the state file.
     pub max_reserved_items: usize,
+    /// The body limit of an image upload, in bytes (ADR 0003).
+    pub artwork_max_bytes: usize,
 }
 
 impl AppConfig {
@@ -133,6 +147,7 @@ impl AppConfig {
             admin_token: parse_admin_token()?,
             state_file: env_parse("STATE_FILE", PathBuf::from(DEFAULT_STATE_FILE))?,
             max_reserved_items: env_parse("MAX_RESERVED_ITEMS", DEFAULT_MAX_RESERVED_ITEMS)?,
+            artwork_max_bytes: parse_artwork_max_bytes()?,
         })
     }
 
@@ -148,6 +163,7 @@ impl AppConfig {
             admin_token: None,
             state_file: PathBuf::from(DEFAULT_STATE_FILE),
             max_reserved_items: DEFAULT_MAX_RESERVED_ITEMS,
+            artwork_max_bytes: DEFAULT_ARTWORK_MAX_BYTES,
         }
     }
 }
@@ -167,6 +183,11 @@ fn parse_admin_token() -> Result<Option<AdminToken>, ConfigError> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(redacted("not valid unicode".to_string())),
     }
+}
+
+/// Reads `ARTWORK_MAX_BYTES`, the body limit of an image upload.
+fn parse_artwork_max_bytes() -> Result<usize, ConfigError> {
+    env_parse("ARTWORK_MAX_BYTES", DEFAULT_ARTWORK_MAX_BYTES)
 }
 
 fn parse_lease_secs() -> Result<u64, ConfigError> {
@@ -715,6 +736,11 @@ impl RelayState {
     /// never comes before a credential error. A display publish does not renew the
     /// lease and does not change `renewed_at`.
     ///
+    /// The last check runs under the display lock: an `artwork.sha256` must
+    /// name an image that the event holds, with the same type. The same lock
+    /// holds the images, so no upload and no lease expiry can remove that
+    /// image between the check and the state change (ADR 0003).
+    ///
     /// The display lock is the only lock held during the update. It is
     /// released before the update goes to the subscribers. The live value
     /// lock is never taken.
@@ -723,7 +749,9 @@ impl RelayState {
     ///
     /// Returns `404 event_not_found`, `403 invalid_token`,
     /// `409 event_not_reserved`, the error of `body`, `400 invalid_display`,
-    /// or `429 publish_rate_limited`.
+    /// `429 publish_rate_limited`, or `409 artwork_missing`. An
+    /// `artwork.mime` that is not the type of the stored image gives
+    /// `400 invalid_display`.
     pub async fn publish_display(
         &self,
         event_id: &str,
@@ -749,7 +777,7 @@ impl RelayState {
         event.touch(now);
 
         let mut inner = event.display.write().await;
-        let update = inner.apply(display);
+        let update = inner.publish(display)?;
         drop(inner);
         let seq = update.seq;
         let _ = event.display_sender.send(update);
@@ -771,6 +799,96 @@ impl RelayState {
         let (_, event) = self.get_reserved_entry(event_id).await?;
         let state = event.display.read().await.state.clone();
         Ok(state)
+    }
+
+    /// Stores an image for a reserved event (ADR 0003).
+    ///
+    /// The order of checks is: the event exists, the token matches, the
+    /// event is reserved, the body was read in full, the SHA-256 of the body
+    /// is `sha256`, the body starts with the JPEG or PNG bytes, and the
+    /// publish rate limit allows the request. The type comes from the first
+    /// bytes only.
+    ///
+    /// An image that the event holds already gives `stored: false` and no
+    /// change. An event holds at most two images. When it holds two, a new
+    /// image first removes one image that is not the image of the present
+    /// display state: the image of the state before it, else the earlier
+    /// upload. The display lock is the only lock held during the change.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`, `403 invalid_token`,
+    /// `409 event_not_reserved`, the error of `body`, `400 sha256_mismatch`,
+    /// `400 unsupported_image`, or `429 publish_rate_limited`.
+    pub async fn upload_artwork(
+        &self,
+        event_id: &str,
+        sha256: &str,
+        token: &str,
+        body: Result<Bytes, ApiError>,
+    ) -> Result<UploadArtworkResponse, ApiError> {
+        let (stored, event) = self.get_entry(event_id).await?;
+        if !stored.token_hash_matches(&hash_token(token)) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
+        }
+        if stored.class != EventClass::Reserved {
+            return Err(ApiError::new(StatusCode::CONFLICT, "event_not_reserved"));
+        }
+        let body = body?;
+        // The digest text is always 64 lowercase hexadecimal characters, so
+        // this one comparison also checks the form of `sha256`.
+        if sha256_hex(&body) != sha256 {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "sha256_mismatch"));
+        }
+        let mime = image_mime(&body)
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "unsupported_image"))?;
+
+        let now = self.now();
+        if !event.try_acquire_publish_slot(now, self.inner.config.max_publishes_per_event_per_sec) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "publish_rate_limited",
+            ));
+        }
+        event.touch(now);
+
+        // Copy the bytes, so the image does not keep a larger receive buffer
+        // in memory.
+        let image = StoredImage {
+            sha256: sha256.to_string(),
+            mime,
+            bytes: Bytes::copy_from_slice(&body),
+        };
+        let mut display = event.display.write().await;
+        let added = display.store_image(image);
+        drop(display);
+
+        Ok(UploadArtworkResponse {
+            event_id: event_id.to_string(),
+            sha256: sha256.to_string(),
+            mime: mime.to_string(),
+            stored: added,
+        })
+    }
+
+    /// Returns the type and the bytes of an image of a reserved event
+    /// (ADR 0003).
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`, `409 event_not_reserved`, or
+    /// `404 artwork_not_found` when the event does not hold the image.
+    pub async fn artwork(
+        &self,
+        event_id: &str,
+        sha256: &str,
+    ) -> Result<(&'static str, Bytes), ApiError> {
+        let (_, event) = self.get_reserved_entry(event_id).await?;
+        let display = event.display.read().await;
+        display
+            .image(sha256)
+            .map(|image| (image.mime, image.bytes.clone()))
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artwork_not_found"))
     }
 
     async fn subscribe_display(
@@ -982,16 +1100,21 @@ impl RelayState {
     }
 
     /// Sets the display state of `event` to `{"track": null}` and sends it,
-    /// when its lease ended and the state is not null already.
+    /// when its lease ended and the state is not null already. When the
+    /// lease ended, it also removes every image of the event (ADR 0003),
+    /// with or without a display state.
     ///
     /// The caller holds no lock. This takes only the `display` lock, checks the
     /// lease again under it, and sends after it releases the lock.
     async fn clear_display_after_lease(&self, event: &LiveEventState, lease_secs: u64, now: u64) {
         let mut display = event.display.write().await;
         let renewed_at = event.renewed_at.load(Ordering::Relaxed);
-        let cleared = (now.saturating_sub(renewed_at) >= lease_secs
-            && !display.state["track"].is_null())
-        .then(|| display.apply(null_display_state()));
+        let ended = now.saturating_sub(renewed_at) >= lease_secs;
+        let cleared = (ended && !display.state["track"].is_null())
+            .then(|| display.apply(null_display_state()));
+        if ended {
+            display.remove_images();
+        }
         drop(display);
         if let Some(update) = cleared {
             let _ = event.display_sender.send(update);
@@ -1096,7 +1219,11 @@ struct LiveEventInner {
 }
 
 /// The display half of an event (ADR 0003). It is in memory only, so a
-/// restart gives `{"track": null}`.
+/// restart gives `{"track": null}` and no image.
+///
+/// One lock holds the display state and the images. So the check that a
+/// display state names a held image, the state change and the retention
+/// rule are one step for each other writer.
 struct DisplayInner {
     /// The sequence number of the display stream. It is separate from the
     /// `seq` of the live value.
@@ -1104,6 +1231,17 @@ struct DisplayInner {
     /// The present display state. It is always a validated display state.
     state: Value,
     replay: VecDeque<DisplayUpdate>,
+    /// The images of the event, oldest first. At most `MAX_EVENT_IMAGES`.
+    images: Vec<StoredImage>,
+    /// The `artwork.sha256` of the display state before the present one.
+    previous_sha256: Option<String>,
+}
+
+/// One image in the artwork store. Its type comes from its first bytes.
+struct StoredImage {
+    sha256: String,
+    mime: &'static str,
+    bytes: Bytes,
 }
 
 impl DisplayInner {
@@ -1112,7 +1250,81 @@ impl DisplayInner {
             seq: 0,
             state: null_display_state(),
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
+            images: Vec::with_capacity(MAX_EVENT_IMAGES),
+            previous_sha256: None,
         }
+    }
+
+    fn image(&self, sha256: &str) -> Option<&StoredImage> {
+        self.images.iter().find(|image| image.sha256 == sha256)
+    }
+
+    /// Adds `image` and returns `true`, or returns `false` when the event
+    /// holds it already.
+    ///
+    /// When the event holds `MAX_EVENT_IMAGES` images, this first removes
+    /// one image that the present display state does not name. It prefers
+    /// the image of the state before the present one, else the oldest
+    /// image. The image of the present state stays.
+    fn store_image(&mut self, image: StoredImage) -> bool {
+        if self.image(&image.sha256).is_some() {
+            return false;
+        }
+        if self.images.len() >= MAX_EVENT_IMAGES {
+            let present = artwork_sha256(&self.state);
+            let previous = self.previous_sha256.as_deref();
+            let candidates = || {
+                self.images
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, held)| Some(held.sha256.as_str()) != present)
+            };
+            let evict = candidates()
+                .find(|(_, held)| Some(held.sha256.as_str()) == previous)
+                .or_else(|| candidates().next())
+                .map(|(index, _)| index);
+            if let Some(index) = evict {
+                self.images.remove(index);
+            }
+        }
+        self.images.push(image);
+        true
+    }
+
+    /// Publishes a validated display state.
+    ///
+    /// An `artwork.sha256` must name a held image, and its `mime` must be
+    /// the stored type. After the change, the event keeps only the image of
+    /// the present state and the image of the state before it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `409 artwork_missing` or `400 invalid_display`. An error
+    /// changes nothing.
+    fn publish(&mut self, state: Value) -> Result<DisplayUpdate, ApiError> {
+        if let Some(sha256) = artwork_sha256(&state) {
+            let image = self
+                .image(sha256)
+                .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "artwork_missing"))?;
+            if state["track"]["artwork"]["mime"].as_str() != Some(image.mime) {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_display"));
+            }
+        }
+        self.previous_sha256 = artwork_sha256(&self.state).map(str::to_string);
+        let update = self.apply(state);
+        let present = artwork_sha256(&self.state);
+        let previous = self.previous_sha256.as_deref();
+        self.images.retain(|image| {
+            let held = Some(image.sha256.as_str());
+            held == present || held == previous
+        });
+        Ok(update)
+    }
+
+    /// Removes every image. A lease end calls this (ADR 0003).
+    fn remove_images(&mut self) {
+        self.images.clear();
+        self.previous_sha256 = None;
     }
 
     /// Sets the present state, advances `seq`, and adds the update to the
@@ -1143,6 +1355,33 @@ struct DisplayUpdate {
 /// The display state when nothing plays.
 fn null_display_state() -> Value {
     json!({ "track": null })
+}
+
+/// Returns the `artwork.sha256` of a validated display state, if it has one.
+fn artwork_sha256(state: &Value) -> Option<&str> {
+    state["track"]["artwork"]["sha256"].as_str()
+}
+
+/// Returns the SHA-256 of `bytes` as 64 lowercase hexadecimal characters.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+/// Returns the image type from the first bytes of `body`, or `None` when
+/// the body is not a JPEG or a PNG image.
+fn image_mime(body: &[u8]) -> Option<&'static str> {
+    if body.starts_with(JPEG_MAGIC) {
+        Some("image/jpeg")
+    } else if body.starts_with(PNG_MAGIC) {
+        Some("image/png")
+    } else {
+        None
+    }
 }
 
 impl LiveEventState {
@@ -1450,6 +1689,18 @@ pub struct PublishDisplayResponse {
     pub seq: u64,
 }
 
+/// The response of `PUT /v1/liveitems/{event_id}/artwork/{sha256}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadArtworkResponse {
+    pub event_id: String,
+    pub sha256: String,
+    /// The image type that the relay read from the first bytes.
+    pub mime: String,
+    /// `true` when this request stored the image. `false` when the event
+    /// held it already, and nothing changed.
+    pub stored: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeepaliveResponse {
     pub event_id: String,
@@ -1508,6 +1759,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn app(state: RelayState) -> Router {
+    let artwork_max_bytes = state.inner.config.artwork_max_bytes;
     let (socket_layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
 
     register_socket_namespaces(io.clone());
@@ -1543,6 +1795,12 @@ pub fn app(state: RelayState) -> Router {
         .route(
             "/v1/liveitems/{event_id}/display/events",
             get(display_events),
+        )
+        .route(
+            "/v1/liveitems/{event_id}/artwork/{sha256}",
+            get(read_artwork)
+                .put(upload_artwork)
+                .route_layer(RequestBodyLimitLayer::new(artwork_max_bytes)),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -1685,6 +1943,53 @@ async fn display_state(
     Path(event_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.display_state(&event_id).await?))
+}
+
+/// Handles `PUT /v1/liveitems/{event_id}/artwork/{sha256}` (ADR 0003).
+///
+/// The relay checks the credential, the event, and the class before the
+/// result of the body read. A streamed body over `ARTWORK_MAX_BYTES` then
+/// gives `413 payload_too_large`. A request with a `Content-Length` over the
+/// limit gets `413` from `RequestBodyLimitLayer` before this handler runs.
+async fn upload_artwork(
+    AxumState(state): AxumState<RelayState>,
+    Path((event_id, sha256)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<UploadArtworkResponse>, ApiError> {
+    let token = bearer_token(&headers)?;
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+        } else {
+            ApiError::new(StatusCode::BAD_REQUEST, "unsupported_image")
+        }
+    });
+    Ok(Json(
+        state
+            .upload_artwork(&event_id, &sha256, token, body)
+            .await?,
+    ))
+}
+
+/// Handles `GET /v1/liveitems/{event_id}/artwork/{sha256}` (ADR 0003).
+///
+/// It gives the bytes with the stored type, a cache time of one year, and
+/// `X-Content-Type-Options: nosniff`.
+async fn read_artwork(
+    AxumState(state): AxumState<RelayState>,
+    Path((event_id, sha256)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (mime, bytes) = state.artwork(&event_id, &sha256).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, ARTWORK_CACHE_CONTROL),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Handles `GET /v1/liveitems/{event_id}/display/events` (ADR 0003).
@@ -2392,6 +2697,31 @@ mod tests {
     }
 
     #[test]
+    fn artwork_max_bytes_has_a_default_and_reads_the_environment() {
+        assert_eq!(DEFAULT_ARTWORK_MAX_BYTES, 524_288);
+        assert_eq!(
+            AppConfig::for_tests().artwork_max_bytes,
+            DEFAULT_ARTWORK_MAX_BYTES
+        );
+        // SAFETY: this test is the only one in the suite that reads or
+        // writes ARTWORK_MAX_BYTES. It calls only the parser of that one
+        // variable, so it does not race the LEASE_SECS test.
+        unsafe {
+            std::env::set_var("ARTWORK_MAX_BYTES", "1000");
+        }
+        let set = parse_artwork_max_bytes();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("ARTWORK_MAX_BYTES");
+        }
+        assert_eq!(set.expect("a valid value"), 1000);
+        assert_eq!(
+            parse_artwork_max_bytes().expect("the default"),
+            DEFAULT_ARTWORK_MAX_BYTES
+        );
+    }
+
+    #[test]
     fn admin_token_matches_only_the_same_token() {
         let admin_token = AdminToken::new("test-admin-token-0123456789");
 
@@ -2485,6 +2815,20 @@ mod tests {
             function_body(lib, "pub async fn publish_display(")
                 .contains(".token_hash_matches(&hash_token(token))"),
             "ADR 0003 §Routes and AGENTS.md §4: `publish_display` must check the token with \
+             `StoredEvent::token_hash_matches`, never with `==`."
+        );
+    }
+
+    // ADR 0003 §Routes: an image upload checks the broadcaster token as a
+    // publish does. This guard proves that the check goes through
+    // `StoredEvent::token_hash_matches`, which calls `ct_eq`.
+    #[test]
+    fn the_artwork_token_check_uses_the_constant_time_comparison() {
+        let lib = production_source(include_str!("lib.rs"));
+        assert!(
+            function_body(lib, "pub async fn upload_artwork(")
+                .contains(".token_hash_matches(&hash_token(token))"),
+            "ADR 0003 §Routes and AGENTS.md §4: `upload_artwork` must check the token with \
              `StoredEvent::token_hash_matches`, never with `==`."
         );
     }

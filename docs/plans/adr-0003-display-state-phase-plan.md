@@ -2,6 +2,12 @@
 
 Date: 2026-10-04. This plan states no rule. ADR 0003 owns the rules here.
 
+## Status
+
+Tasks 001 and 002 are implemented on 2026-10-04. ADR 0003 stays `Accepted`
+until an implementation review is the named artifact for `Implemented`
+(AGENTS.md §2).
+
 ## Goal
 
 A reserved event gets an optional display state and an image store. When the

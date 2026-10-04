@@ -1,6 +1,6 @@
 # Display State Task 002: The Artwork Store
 
-Status: Ready - 2026-10-04. Do after task 001.
+Status: Implemented - 2026-10-04.
 
 Every criterion is mechanical.
 
@@ -55,6 +55,17 @@ hold. A client reads an image by its hash.
   image of the state before it. After a display publish, it removes every
   other image. An uploaded image that no display state names yet also stays
   until the next display publish.
+- Added 2026-10-04 by the review: an event never holds more than two images.
+  The ADR 0003 invariant on display memory wins over the previous sentence.
+  - An upload can add a new image to an event that holds two. The relay then
+    first removes one image that is not the image of the present display
+    state.
+  - It removes the image of the state before the present state, else the
+    earlier upload.
+  - An upload never removes the image of the present display state.
+  - After a display publish, the retention rule above applies.
+  - A test makes three uploads with no publish. At most two images stay, and
+    the image of the present state stays.
 - A lease expiry removes every image of the event.
 - Every artwork route gives `404 event_not_found` and
   `409 event_not_reserved` as task 001 does.
@@ -116,3 +127,31 @@ commands.
 
 At the end, report: 1. files changed 2. tests run 3. behavior changed
 4. deviations from task 5. unresolved concerns.
+
+## Review Result
+
+Reviewed 2026-10-04. `Cargo.lock` did not change. The full gate passes.
+
+Two task 001 tests changed. Each published a hash of no image, and one used
+one hash with two image types. Task 001 allowed this only until task 002. The
+tests now upload real images and use their hashes. No other test changed.
+
+The images live under the `display` lock. A display publish checks the image
+and changes the state under one write lock. An upload and a lease end also
+need that lock. Thus no publish can name an image that another request
+removes.
+
+The review accepts these decisions of the task:
+
+- An upload gives `200 {event_id, sha256, mime, stored}`.
+- A read of an image that the event does not hold gives
+  `404 artwork_not_found`.
+- A path hash with a wrong form gives `400 sha256_mismatch`.
+
+Behavior to note: a lease end removes the images, also for an event with no
+snapshot. The display path thus needs a live lease. The publisher keeps the
+lease with the dead block and the keepalive. Publisher display task 004 now
+sends the latest display state again after a keepalive `409`.
+
+ADR 0003 stays `Accepted`. Its status changes after an implementation review
+in `docs/reviews/adr-0003-implementation-review.md`.

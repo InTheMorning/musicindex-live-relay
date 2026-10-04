@@ -23,7 +23,8 @@ station runs continuously.
   event goes off air when its broadcaster stops the keepalive
 - [ADR 0003: Display state and artwork](adr/0003-display-state-and-artwork.md)
   — Accepted. Optional display routes and an image store for reserved events.
-  Task 001 is done. Task 002 is next.
+  Tasks 001 and 002 are done. The ADR needs an implementation review before
+  it becomes Implemented.
 
 ## Plans
 
@@ -50,7 +51,7 @@ reserved live items packets first. Task 002 needs task 001.
 - [001 — The display state and its routes](tasks/display-state-task-001-state-and-routes.md)
   — Implemented - 2026-10-04
 - [002 — The artwork store](tasks/display-state-task-002-artwork-store.md)
-  — Ready
+  — Implemented - 2026-10-04
 
 Packets for the live lease plan. Strictly sequential. They can go before or
 after the reserved live items packets.
