@@ -591,8 +591,12 @@ data: {"track":{"artist":"Artist","title":"Title","artwork":null}}
 
 The stream has its own sequence number and its own replay buffer of the last
 100 display states. When `Last-Event-ID` is present and valid, the relay
-replays the display states with a display `seq` greater than that value. The
-stream sends no image bytes. A delete of the item ends the stream.
+replays the display states with a display `seq` greater than that value. With
+no `Last-Event-ID`, the relay first sends the present display state, with its
+present display `seq` as the `id`. Before the first publish, that state is
+`{"track": null}` with the `id` 0. A client thus needs no separate read before
+it subscribes. A state is never sent twice on one stream. The stream sends no
+image bytes. A delete of the item ends the stream.
 
 Status codes:
 

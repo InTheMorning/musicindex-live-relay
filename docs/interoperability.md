@@ -171,7 +171,9 @@ item. Tasks 001 and 002 of the display state plan implement them:
   the broadcaster token.
 - `GET /v1/liveitems/{event_id}/display` gives the present display state.
 - `GET /v1/liveitems/{event_id}/display/events` is an SSE stream of `display`
-  events, with its own `seq` and its own replay buffer.
+  events, with its own `seq` and its own replay buffer. A client with no
+  `Last-Event-ID` first gets the present display state. `/events` does not do
+  this.
 - `PUT /v1/liveitems/{event_id}/artwork/{sha256}` uploads an image. It needs
   the broadcaster token. The body limit is `ARTWORK_MAX_BYTES`, 524,288 bytes
   by default.

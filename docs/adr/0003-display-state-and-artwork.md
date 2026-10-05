@@ -4,6 +4,11 @@
 
 Accepted - 2026-10-04.
 
+Amended 2026-10-04: a client that connects to `/display/events` with no
+`Last-Event-ID` first gets the present display state. The amendment adds to
+the stream and reverses no decision. A client then needs no separate read
+before it subscribes.
+
 Accepted 2026-10-04 by the operator. The implementation needs ADR 0001,
 because only a reserved event can use these routes.
 
@@ -96,6 +101,9 @@ The display state of an event is one JSON object:
 
 - An SSE stream of `display` events. Each event holds a display state. A
   client can reconnect with `Last-Event-ID`, the same as `/events`.
+- A client with no `Last-Event-ID` first gets the present display state, with
+  its present `seq` as the `id`. Before the first publish, that state is
+  `{"track": null}` with the `id` 0. Added 2026-10-04.
 - The stream carries no image bytes.
 
 `GET /v1/liveitems/{event_id}/artwork/{sha256}`

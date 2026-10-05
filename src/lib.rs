@@ -914,19 +914,28 @@ impl RelayState {
         };
 
         event.touch(self.now());
-        let replay = {
+        // Subscribe under the read lock. A publish applies its state under the
+        // write lock and sends after it, so no state falls between the copy
+        // and the subscription. A state that the copy holds can also arrive on
+        // the receiver. The stream skips it by its `seq`.
+        let (replay, receiver) = {
             let inner = event.display.read().await;
-            match last_event_id {
+            let replay = match last_event_id {
                 Some(last_event_id) => inner
                     .replay
                     .iter()
                     .filter(|update| update.seq > last_event_id)
                     .cloned()
                     .collect(),
-                None => Vec::new(),
-            }
+                // A client with no `Last-Event-ID` gets the present state
+                // first (ADR 0003, amended 2026-10-04).
+                None => vec![DisplayUpdate {
+                    seq: inner.seq,
+                    state: inner.state.clone(),
+                }],
+            };
+            (replay, event.display_sender.subscribe())
         };
-        let receiver = event.display_sender.subscribe();
         let closed = event.closed.subscribe();
 
         Ok(DisplaySubscription {
@@ -2011,8 +2020,12 @@ async fn display_events(
 
     let stream = async_stream::stream! {
         let mut subscription = subscription;
+        // The highest `seq` sent on this stream. A state that the replay sent
+        // can also arrive on the receiver, and the stream skips it.
+        let mut sent_seq = last_event_id;
 
         for update in subscription.replay.drain(..) {
+            sent_seq = Some(update.seq);
             yield Ok(display_update_to_sse(update));
         }
 
@@ -2025,7 +2038,11 @@ async fn display_events(
             };
             match received {
                 Ok(update) => {
+                    if sent_seq.is_some_and(|sent| update.seq <= sent) {
+                        continue;
+                    }
                     subscription.event.touch(subscription.state.now());
+                    sent_seq = Some(update.seq);
                     yield Ok(display_update_to_sse(update));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,

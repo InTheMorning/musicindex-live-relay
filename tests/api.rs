@@ -2559,10 +2559,45 @@ mod reserved {
         }
 
         #[tokio::test]
+        async fn a_connect_with_no_last_event_id_first_gets_the_present_state() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            // Before any publish, the present state is null with the id 0.
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("event: display"), "{chunk}");
+            assert!(chunk.contains("id: 0"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), json!({ "track": null }));
+
+            let playing = track(json!({ "url": "https://example.com/cover.jpg" }));
+            publish_display_ok(router.clone(), &reserved, &playing).await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("id: 1"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), playing);
+
+            // A new connection gets the present state with its id, one time.
+            let mut late = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            let chunk = next_sse_chunk(&mut late).await;
+            assert!(chunk.contains("id: 1"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), playing);
+            assert_no_frame(&mut late).await;
+
+            // A reconnect with that id gets nothing until the next publish.
+            let mut resumed =
+                open_display_stream(router.clone(), &reserved.event_id, Some("1")).await;
+            assert_no_frame(&mut resumed).await;
+        }
+
+        #[tokio::test]
         async fn a_subscriber_receives_each_state_and_a_reconnect_receives_the_missed_states() {
             let (router, _state, _clock, _dir, _) = display_app();
             let reserved = reserve_ok(router.clone(), None).await;
             let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            // The stream first sends the present state (ADR 0003, amended
+            // 2026-10-04).
+            let present = next_sse_chunk(&mut body).await;
+            assert!(present.contains("event: display"), "{present}");
 
             let states: Vec<Value> = (1..=3)
                 .map(|index| track(json!({ "url": format!("https://example.com/{index}.jpg") })))
@@ -2874,6 +2909,10 @@ mod reserved {
             let playing = track(json!({ "sha256": jpeg, "mime": "image/jpeg" }));
             publish_display_ok(router.clone(), &reserved, &playing).await;
             let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            // The stream first sends the present state (ADR 0003, amended
+            // 2026-10-04).
+            let present = next_sse_chunk(&mut body).await;
+            assert!(present.contains("event: display"), "{present}");
 
             clock.store(110, Ordering::SeqCst);
             assert_eq!(state.expire_leases().await, 1);
@@ -2917,6 +2956,10 @@ mod reserved {
             let playing = track(json!({ "url": "https://example.com/cover.jpg" }));
             publish_display_ok(router.clone(), &reserved, &playing).await;
             let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            // The stream first sends the present state (ADR 0003, amended
+            // 2026-10-04).
+            let present = next_sse_chunk(&mut body).await;
+            assert!(present.contains("event: display"), "{present}");
 
             clock.store(200, Ordering::SeqCst);
             // No snapshot was cleared, so the count stays 0.
@@ -3094,6 +3137,10 @@ mod reserved {
             let (router, _state, _clock, _dir, _) = display_app();
             let reserved = reserve_ok(router.clone(), None).await;
             let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            // The stream first sends the present state (ADR 0003, amended
+            // 2026-10-04).
+            let present = next_sse_chunk(&mut body).await;
+            assert!(present.contains("event: display"), "{present}");
 
             let response = router
                 .clone()
