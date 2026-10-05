@@ -4,6 +4,11 @@
 
 Accepted - 2026-10-04.
 
+Amended 2026-10-05: "the state before it" in the image retention rule means
+the most recent earlier state with a relay image. A state with no relay image,
+such as `null` or a URL, no longer removes that image. The limit of two
+images for each event does not change.
+
 Amended 2026-10-04: a client that connects to `/display/events` with no
 `Last-Event-ID` first gets the present display state. The amendment adds to
 the stream and reverses no decision. A client then needs no separate read
@@ -133,7 +138,8 @@ Status codes for the write routes:
 - The display state and the images stay in memory. Nothing goes to disk. A
   restart gives `{"track": null}` and no image until the next publish.
 - For each event, the relay keeps the image of the present display state and
-  the image of the state before it. It removes every other image.
+  the image of the most recent earlier state with a relay image. It removes
+  every other image.
 - A display publish does not renew the lease. Only a publish of the payload
   and a keepalive renew it (ADR 0002).
 - When the lease of an event ends, the relay sets its display state to

@@ -690,8 +690,9 @@ An item holds two images at most. So the images that the relay holds use at
 most `MAX_RESERVED_ITEMS` multiplied by two images of `ARTWORK_MAX_BYTES`.
 
 - After a display publish, the item keeps the image of the present display
-  state and the image of the state before it. The relay removes every other
-  image.
+  state and the image of the most recent earlier state with a relay image. A
+  state with no relay image, such as `null` or a URL, does not remove that
+  image. The relay removes every other image.
 - An upload never makes the item hold more than two images. An upload can
   add a new image to an item that holds two images. The relay then first
   removes one image that the present display state does not name. It removes the

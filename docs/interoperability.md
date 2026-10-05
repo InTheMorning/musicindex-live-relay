@@ -212,7 +212,9 @@ Image retention keeps the memory in its limit:
 
 - An item holds two images at most.
 - After a display publish, the item keeps the image of the present state and
-  the image of the state before it. The relay removes every other image.
+  the image of the most recent earlier state with a relay image. The relay
+  removes every other image. A client that is behind the stream can thus
+  still load the image of the last track after a `null` state.
 - An upload to an item that holds two images first removes one image that
   the present state does not name. That is the image of the state before the
   present state, else the earlier upload. An upload never removes the image

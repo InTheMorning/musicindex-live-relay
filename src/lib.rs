@@ -1305,7 +1305,8 @@ impl DisplayInner {
     ///
     /// An `artwork.sha256` must name a held image, and its `mime` must be
     /// the stored type. After the change, the event keeps only the image of
-    /// the present state and the image of the state before it.
+    /// the present state and the image of the most recent earlier state that
+    /// had a relay image.
     ///
     /// # Errors
     ///
@@ -1320,7 +1321,13 @@ impl DisplayInner {
                 return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_display"));
             }
         }
-        self.previous_sha256 = artwork_sha256(&self.state).map(str::to_string);
+        // "Previous" is the most recent earlier state with a relay image. A
+        // state with no relay image, such as `null` or a URL, does not reset
+        // it. Else a second such state removes the image of the track that a
+        // client behind the stream still shows.
+        if let Some(sha256) = artwork_sha256(&self.state) {
+            self.previous_sha256 = Some(sha256.to_string());
+        }
         let update = self.apply(state);
         let present = artwork_sha256(&self.state);
         let previous = self.previous_sha256.as_deref();

@@ -3678,13 +3678,36 @@ mod reserved {
                 assert_held(router.clone(), &reserved.event_id, &named).await;
                 assert_not_held(router.clone(), &reserved.event_id, &unnamed).await;
 
-                // The image of the previous state stays for one more state.
+                // A state with no relay image keeps the image of the most
+                // recent earlier state with one (ADR 0003, amended 2026-10-05).
                 let url = track(json!({ "url": "https://example.com/cover.jpg" }));
                 publish_display_ok(router.clone(), &reserved, &url).await;
                 assert_held(router.clone(), &reserved.event_id, &named).await;
 
                 publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+                assert_held(router.clone(), &reserved.event_id, &named).await;
+
+                // Two newer images replace it.
+                for seed in 3..=4 {
+                    let sha256 = upload_ok(router.clone(), &reserved, &jpeg_bytes(seed)).await;
+                    let state = track(json!({ "sha256": sha256, "mime": "image/jpeg" }));
+                    publish_display_ok(router.clone(), &reserved, &state).await;
+                }
                 assert_not_held(router, &reserved.event_id, &named).await;
+            }
+
+            #[tokio::test]
+            async fn two_null_states_keep_the_image_of_the_last_track() {
+                let (router, _state, _clock, _dir, _) = display_app();
+                let reserved = reserve_ok(router.clone(), None).await;
+                let sha256 = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let playing = track(json!({ "sha256": sha256, "mime": "image/jpeg" }));
+                publish_display_ok(router.clone(), &reserved, &playing).await;
+
+                // A client behind the stream still shows this track.
+                publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+                publish_display_ok(router.clone(), &reserved, &json!({ "track": null })).await;
+                assert_held(router, &reserved.event_id, &sha256).await;
             }
 
             #[tokio::test]
