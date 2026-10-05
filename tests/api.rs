@@ -2590,6 +2590,24 @@ mod reserved {
         }
 
         #[tokio::test]
+        async fn a_reconnect_with_an_old_higher_last_event_id_still_gets_new_states() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            // As after a relay restart: the client sends an id that is higher
+            // than the present `seq`.
+            let mut body =
+                open_display_stream(router.clone(), &reserved.event_id, Some("57")).await;
+            assert_no_frame(&mut body).await;
+
+            let playing = track(json!({ "url": "https://example.com/cover.jpg" }));
+            publish_display_ok(router.clone(), &reserved, &playing).await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("id: 1"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), playing);
+        }
+
+        #[tokio::test]
         async fn a_subscriber_receives_each_state_and_a_reconnect_receives_the_missed_states() {
             let (router, _state, _clock, _dir, _) = display_app();
             let reserved = reserve_ok(router.clone(), None).await;

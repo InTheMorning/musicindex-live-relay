@@ -918,7 +918,7 @@ impl RelayState {
         // write lock and sends after it, so no state falls between the copy
         // and the subscription. A state that the copy holds can also arrive on
         // the receiver. The stream skips it by its `seq`.
-        let (replay, receiver) = {
+        let (replay, subscribed_seq, receiver) = {
             let inner = event.display.read().await;
             let replay = match last_event_id {
                 Some(last_event_id) => inner
@@ -934,7 +934,7 @@ impl RelayState {
                     state: inner.state.clone(),
                 }],
             };
-            (replay, event.display_sender.subscribe())
+            (replay, inner.seq, event.display_sender.subscribe())
         };
         let closed = event.closed.subscribe();
 
@@ -942,6 +942,7 @@ impl RelayState {
             state: self.clone(),
             event,
             replay,
+            subscribed_seq,
             receiver,
             closed,
         })
@@ -1469,6 +1470,10 @@ struct DisplaySubscription {
     state: RelayState,
     event: Arc<LiveEventState>,
     replay: Vec<DisplayUpdate>,
+    /// The display `seq` when the receiver subscribed. A received update with
+    /// this `seq` or a lower one was applied before the subscription, so the
+    /// replay or the client holds it already.
+    subscribed_seq: u64,
     receiver: broadcast::Receiver<DisplayUpdate>,
     closed: watch::Receiver<bool>,
 }
@@ -2020,12 +2025,13 @@ async fn display_events(
 
     let stream = async_stream::stream! {
         let mut subscription = subscription;
-        // The highest `seq` sent on this stream. A state that the replay sent
-        // can also arrive on the receiver, and the stream skips it.
-        let mut sent_seq = last_event_id;
+        // A received state with a `seq` up to the one at the subscription was
+        // applied before it. The replay or the client holds it, so the stream
+        // skips it. Do not start from `Last-Event-ID`: after a relay restart the
+        // `seq` starts again at 1, and a client can send a higher old value.
+        let mut sent_seq = Some(subscription.subscribed_seq);
 
         for update in subscription.replay.drain(..) {
-            sent_seq = Some(update.seq);
             yield Ok(display_update_to_sse(update));
         }
 
