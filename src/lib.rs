@@ -78,6 +78,16 @@ const PNG_MAGIC: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 /// The `Cache-Control` value of an image read. The path holds the hash of
 /// the bytes, so the bytes of a path never change.
 const ARTWORK_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+/// The default of `MAX_LISTENER_DELAY_SECS`, the highest delay that a
+/// publish can set (ADR 0004 §Configuration).
+const DEFAULT_MAX_LISTENER_DELAY_SECS: u64 = 300;
+/// The default of `MAX_PENDING_LISTENER_UPDATES`, the pending listener
+/// updates that the relay keeps for each event (ADR 0004 §Configuration).
+const DEFAULT_MAX_PENDING_LISTENER_UPDATES: usize = 64;
+/// The lowercase name of the listener delay header (ADR 0004 §The Delay).
+/// `HeaderMap` looks up a header by its lowercase name, so the broadcaster
+/// can send the header in any case.
+const LISTENER_DELAY_HEADER: &str = "listener-delay-secs";
 
 /// The operator credential for the reserved item routes (ADR 0001).
 ///
@@ -129,6 +139,12 @@ pub struct AppConfig {
     pub max_reserved_items: usize,
     /// The body limit of an image upload, in bytes (ADR 0003).
     pub artwork_max_bytes: usize,
+    /// The highest delay that a publish can set with the
+    /// `Listener-Delay-Secs` header, in seconds (ADR 0004).
+    pub max_listener_delay_secs: u64,
+    /// The pending listener updates that the relay keeps for each event
+    /// (ADR 0004).
+    pub max_pending_listener_updates: usize,
 }
 
 impl AppConfig {
@@ -148,6 +164,14 @@ impl AppConfig {
             state_file: env_parse("STATE_FILE", PathBuf::from(DEFAULT_STATE_FILE))?,
             max_reserved_items: env_parse("MAX_RESERVED_ITEMS", DEFAULT_MAX_RESERVED_ITEMS)?,
             artwork_max_bytes: parse_artwork_max_bytes()?,
+            max_listener_delay_secs: env_parse(
+                "MAX_LISTENER_DELAY_SECS",
+                DEFAULT_MAX_LISTENER_DELAY_SECS,
+            )?,
+            max_pending_listener_updates: env_parse(
+                "MAX_PENDING_LISTENER_UPDATES",
+                DEFAULT_MAX_PENDING_LISTENER_UPDATES,
+            )?,
         })
     }
 
@@ -164,6 +188,8 @@ impl AppConfig {
             state_file: PathBuf::from(DEFAULT_STATE_FILE),
             max_reserved_items: DEFAULT_MAX_RESERVED_ITEMS,
             artwork_max_bytes: DEFAULT_ARTWORK_MAX_BYTES,
+            max_listener_delay_secs: DEFAULT_MAX_LISTENER_DELAY_SECS,
+            max_pending_listener_updates: DEFAULT_MAX_PENDING_LISTENER_UPDATES,
         }
     }
 }
@@ -581,16 +607,31 @@ impl RelayState {
         self.get_entry(event_id).await.map(|(_, event)| event)
     }
 
+    /// Publishes a live value update.
+    ///
+    /// The order of checks is: the event exists, the token matches, the
+    /// `Listener-Delay-Secs` header is valid, the body is a valid live value
+    /// payload, and the publish rate limit allows the request. The caller
+    /// gives `listener_delay_secs` as the result of the header check, so a
+    /// bad header never uses a publish slot (ADR 0004 §The Delay).
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`, `403 invalid_token`,
+    /// `400 invalid_listener_delay`, the error of `body`, or
+    /// `429 publish_rate_limited`.
     pub async fn publish_metadata(
         &self,
         event_id: &str,
         token: &str,
+        listener_delay_secs: Result<u64, ApiError>,
         body: PublishMetadataRequest,
     ) -> Result<PublishMetadataResponse, ApiError> {
         let (stored, event) = self.get_entry(event_id).await?;
         if !stored.token_hash_matches(&hash_token(token)) {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "invalid_token"));
         }
+        let listener_delay_secs = listener_delay_secs?;
         let metadata = body.into_metadata(event_id)?;
 
         let now = self.now();
@@ -602,6 +643,7 @@ impl RelayState {
         }
         event.touch(now);
         event.renew_lease(now);
+        event.set_listener_delay_secs(listener_delay_secs);
 
         let mut inner = event.inner.write().await;
         inner.seq += 1;
@@ -637,6 +679,18 @@ impl RelayState {
 
     fn keepalive_interval_secs(&self) -> u64 {
         self.inner.config.lease.as_secs() / 3
+    }
+
+    /// Returns the delay of the last accepted publish of an event, in
+    /// seconds (ADR 0004 §The Delay). The value is 0 before the first
+    /// publish and after a publish with no `Listener-Delay-Secs` header.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`.
+    pub async fn listener_delay_secs(&self, event_id: &str) -> Result<u64, ApiError> {
+        let event = self.get_event(event_id).await?;
+        Ok(event.listener_delay_secs())
     }
 
     pub async fn latest_metadata(
@@ -1208,6 +1262,10 @@ struct LiveEventState {
     /// it. A keepalive does not. It is in memory only, so a restart clears
     /// it (ADR 0001).
     last_publish_at: Mutex<Option<u64>>,
+    /// The delay of the last accepted publish, in whole seconds (ADR 0004
+    /// §The Delay). It starts at 0. A keepalive does not change it. It is
+    /// in memory only, so a restart clears it, the same as the snapshot.
+    listener_delay_secs: AtomicU64,
     inner: RwLock<LiveEventInner>,
     sender: broadcast::Sender<MetadataSnapshot>,
     /// Changes to `true` when an operator deletes the event. Each SSE stream
@@ -1409,6 +1467,7 @@ impl LiveEventState {
             renewed_at: AtomicU64::new(now),
             publish_window: AtomicU64::new(0),
             last_publish_at: Mutex::new(None),
+            listener_delay_secs: AtomicU64::new(0),
             inner: RwLock::new(LiveEventInner {
                 seq: 0,
                 latest: None,
@@ -1438,6 +1497,17 @@ impl LiveEventState {
             .last_publish_at
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(now);
+    }
+
+    /// Returns the delay of the last accepted publish, in seconds (ADR 0004
+    /// §The Delay).
+    fn listener_delay_secs(&self) -> u64 {
+        self.listener_delay_secs.load(Ordering::Relaxed)
+    }
+
+    /// Sets the delay of the last accepted publish (ADR 0004 §The Delay).
+    fn set_listener_delay_secs(&self, delay: u64) {
+        self.listener_delay_secs.store(delay, Ordering::Relaxed);
     }
 
     fn last_publish_at(&self) -> Option<u64> {
@@ -1909,6 +1979,11 @@ async fn delete_reserved(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Handles `POST /v1/liveitems/{event_id}/metadata`.
+///
+/// The `Listener-Delay-Secs` header carries the broadcaster's listener
+/// delay (ADR 0004). This handler reads it and gives the result to
+/// `RelayState::publish_metadata`, which checks it after the token check.
 async fn publish_metadata(
     AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
@@ -1916,7 +1991,13 @@ async fn publish_metadata(
     Json(body): Json<PublishMetadataRequest>,
 ) -> Result<Json<PublishMetadataResponse>, ApiError> {
     let token = bearer_token(&headers)?;
-    Ok(Json(state.publish_metadata(&event_id, token, body).await?))
+    let listener_delay_secs =
+        parse_listener_delay_header(&headers, state.inner.config.max_listener_delay_secs);
+    Ok(Json(
+        state
+            .publish_metadata(&event_id, token, listener_delay_secs, body)
+            .await?,
+    ))
 }
 
 async fn latest_metadata(
@@ -2206,6 +2287,43 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
     Ok(token)
 }
 
+/// Reads and checks the `Listener-Delay-Secs` header of a publish (ADR 0004
+/// §The Delay).
+///
+/// A request with no such header has the delay 0. The handler calls this
+/// before it calls `RelayState::publish_metadata`, which applies the
+/// result after its token check, so a bad header never uses a publish slot.
+///
+/// # Errors
+///
+/// Returns `400 invalid_listener_delay` for more than one header, a header
+/// value that is not ASCII text, an empty value, a value that is not a
+/// whole number, and a value over `max_listener_delay_secs`.
+fn parse_listener_delay_header(
+    headers: &HeaderMap,
+    max_listener_delay_secs: u64,
+) -> Result<u64, ApiError> {
+    let invalid = || ApiError::new(StatusCode::BAD_REQUEST, "invalid_listener_delay");
+
+    let mut values = headers.get_all(LISTENER_DELAY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(0);
+    };
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+
+    let text = value.to_str().map_err(|_| invalid())?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let delay: u64 = text.parse().map_err(|_| invalid())?;
+    if delay > max_listener_delay_secs {
+        return Err(invalid());
+    }
+    Ok(delay)
+}
+
 fn hash_token(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
@@ -2283,6 +2401,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({
                     "event_id": created.event_id.clone(),
                     "metadata": {"title": "First"},
@@ -2295,6 +2414,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 "wrong",
+                Ok(0),
                 PublishMetadataRequest(json!({
                     "event_id": created.event_id.clone(),
                     "metadata": {"title": "Second"},
@@ -2313,6 +2433,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({
                     "event_id": "different",
                     "metadata": {},
@@ -2334,6 +2455,7 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
+                    Ok(0),
                     PublishMetadataRequest(json!({
                         "event_id": created.event_id.clone(),
                         "metadata": {"title": title},
@@ -2363,6 +2485,7 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
+                    Ok(0),
                     PublishMetadataRequest(json!({
                         "event_id": created.event_id.clone(),
                         "metadata": {"index": index},
@@ -2413,6 +2536,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(payload.clone()),
             )
             .await
@@ -2445,6 +2569,7 @@ mod tests {
                 .publish_metadata(
                     &created.event_id,
                     &created.broadcaster_token,
+                    Ok(0),
                     PublishMetadataRequest(json!({"x": 1})),
                 )
                 .await
@@ -2455,6 +2580,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"x": 1})),
             )
             .await
@@ -2466,6 +2592,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"x": 1})),
             )
             .await
@@ -2574,6 +2701,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"title": "Live"})),
             )
             .await
@@ -2591,6 +2719,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"title": "Live"})),
             )
             .await
@@ -2614,6 +2743,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"title": "Live"})),
             )
             .await
@@ -2643,6 +2773,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"title": "Live"})),
             )
             .await
@@ -2670,6 +2801,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"title": "First"})),
             )
             .await
@@ -2683,6 +2815,7 @@ mod tests {
             .publish_metadata(
                 &created.event_id,
                 &created.broadcaster_token,
+                Ok(0),
                 PublishMetadataRequest(json!({"title": "Back"})),
             )
             .await
@@ -2706,6 +2839,24 @@ mod tests {
         let event = state.get_event(&created.event_id).await.expect("event");
         assert_eq!(event.last_activity.load(Ordering::Relaxed), 1);
         assert!(event.inner.read().await.latest.is_none());
+    }
+
+    #[test]
+    fn max_pending_listener_updates_that_is_not_a_number_is_a_configuration_error() {
+        // SAFETY: this test is the only one in the suite that reads or
+        // writes MAX_PENDING_LISTENER_UPDATES, so no other test races this
+        // mutation of the process environment.
+        unsafe {
+            std::env::set_var("MAX_PENDING_LISTENER_UPDATES", "not-a-number");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("MAX_PENDING_LISTENER_UPDATES");
+        }
+
+        let err = result.expect_err("a non-numeric value is rejected");
+        assert!(err.to_string().contains("MAX_PENDING_LISTENER_UPDATES"));
     }
 
     #[test]

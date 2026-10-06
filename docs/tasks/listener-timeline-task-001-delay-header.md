@@ -1,6 +1,6 @@
 # Listener Timeline Task 001: The Delay Header
 
-Status: Ready - 2026-10-06. ADR 0004 is accepted.
+Status: Implemented - 2026-10-06.
 
 Every criterion is mechanical.
 
@@ -128,3 +128,27 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-06. The full gate passes. No existing test in
+`tests/api.rs` changed. The unit tests in `src/lib.rs` pass `Ok(0)` for the
+new parameter, which keeps their meaning.
+
+The review accepts these decisions of the task:
+
+- The handler parses the header into a `Result`, and `publish_metadata`
+  applies it after the token check. That is the pattern of
+  `publish_display`. The check order agrees with the packet: token, header,
+  body, rate limit.
+- `RelayState::listener_delay_secs` is a new public read method. The tests
+  need it to read the stored delay without a new route.
+
+The review made one change. The test for a `MAX_PENDING_LISTENER_UPDATES`
+value that is not a number changed the process environment inside
+`tests/api.rs`, where many async tests run in parallel. It moved to the unit
+tests of `src/lib.rs`, next to the other configuration tests that use the
+same pattern.
+
+`README.md` says that the relay stores the delay and does not use it yet.
+Task 002 changes that text.

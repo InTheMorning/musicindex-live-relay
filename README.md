@@ -266,6 +266,7 @@ examines the credential.
 POST /v1/liveitems/{event_id}/metadata
 Authorization: Bearer <broadcaster_token>
 Content-Type: application/json
+Listener-Delay-Secs: <optional, a whole number of seconds>
 ```
 
 Request body:
@@ -306,6 +307,8 @@ For compatibility with the widely used Socket.IO live value implementation, the 
 }
 ```
 
+A broadcaster can send the optional request header `Listener-Delay-Secs` with a publish (ADR 0004). The value is a whole number of seconds from 0 to `MAX_LISTENER_DELAY_SECS`. With no header, the delay is 0. The relay keeps the delay of the last accepted publish. A restart clears it, the same as the snapshot. Today, the relay does not use this delay to change when a route sends an update.
+
 On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, broadcasts a Socket.IO `remoteValue` event, and also broadcasts the same raw payload over SSE for fallback clients. The publish also renews the event lease. See "The Lease" above.
 
 Response:
@@ -325,11 +328,13 @@ Response:
 Status codes:
 
 - `400` when the path and body event IDs differ.
+- `400` with error code `invalid_listener_delay` when the `Listener-Delay-Secs` value is not a whole number from 0 to `MAX_LISTENER_DELAY_SECS`.
+- `400` with the same error code when the request sends `Listener-Delay-Secs` more than one time.
 - `401` when the bearer token is missing or malformed.
 - `403` when the bearer token is wrong.
 - `404` when the event does not exist.
 - `413` when the request body exceeds 64 KiB.
-- `429` when per-event publish rate limit is exceeded.
+- `429` when per-event publish rate limit is exceeded. A bad `Listener-Delay-Secs` header does not use a slot of this limit.
 
 The `Bearer` scheme is matched case-insensitively (`bearer`, `BEARER`, etc.).
 
@@ -879,6 +884,8 @@ Configuration is read from environment variables.
 | `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay opens it and restores the reserved items only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
 | `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
 | `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. A reserved item holds two images at most. See "Image Retention" above. |
+| `MAX_LISTENER_DELAY_SECS` | `300` | The highest value of the `Listener-Delay-Secs` header that a publish can send (ADR 0004). See "Publish Metadata" above. |
+| `MAX_PENDING_LISTENER_UPDATES` | `64` | The pending listener updates that the relay keeps for each event (ADR 0004). Today, the relay holds no pending update. |
 
 The included systemd unit sets `ProtectSystem=strict`,
 `StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. systemd

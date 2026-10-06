@@ -105,6 +105,39 @@ async fn publish(
         .expect("publish response")
 }
 
+/// Publishes with explicit `Listener-Delay-Secs` header values (ADR 0004).
+///
+/// An empty `listener_delay_values` sends no header. More than one value
+/// sends the header more than once.
+async fn publish_with_listener_delay(
+    router: axum::Router,
+    event_id: &str,
+    token: Option<&str>,
+    listener_delay_values: &[&str],
+    body: Value,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/liveitems/{event_id}/metadata"))
+        .header(header::CONTENT_TYPE, "application/json");
+
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    for value in listener_delay_values {
+        builder = builder.header("Listener-Delay-Secs", *value);
+    }
+
+    router
+        .oneshot(
+            builder
+                .body(Body::from(body.to_string()))
+                .expect("publish request"),
+        )
+        .await
+        .expect("publish response")
+}
+
 async fn keepalive(
     router: axum::Router,
     event_id: &str,
@@ -716,6 +749,203 @@ async fn latest_metadata_includes_renewed_at_and_lease_expires_at() {
     let body: LatestMetadataResponse = read_json(response).await;
     assert!(!body.renewed_at.is_empty());
     assert!(!body.lease_expires_at.is_empty());
+}
+
+/// Tests for the `Listener-Delay-Secs` header of ADR 0004 (task 001). No
+/// test in this group checks timing. ADR 0004 task 002 and task 003 add the
+/// listener timeline that this header feeds.
+mod listener_delay_header {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_publish_with_no_header_is_accepted_with_delay_zero() {
+        let (router, state, _clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            state
+                .listener_delay_secs(&created.event_id)
+                .await
+                .expect("delay"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_with_a_valid_header_is_accepted_and_stores_the_delay() {
+        let (router, state, _clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish_with_listener_delay(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["30"],
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            state
+                .listener_delay_secs(&created.event_id)
+                .await
+                .expect("delay"),
+            30
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_header_value_returns_400_invalid_listener_delay() {
+        let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        for value in ["-1", "1.5", "abc", "", "301"] {
+            let response = publish_with_listener_delay(
+                router.clone(),
+                &created.event_id,
+                Some(&created.broadcaster_token),
+                &[value],
+                json!({"title": "Live"}),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "value {value:?} must be rejected"
+            );
+            let body: Value = read_json(response).await;
+            assert_eq!(body["error"], "invalid_listener_delay", "value {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn more_than_one_header_returns_400_invalid_listener_delay() {
+        let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish_with_listener_delay(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["5", "6"],
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = read_json(response).await;
+        assert_eq!(body["error"], "invalid_listener_delay");
+    }
+
+    #[tokio::test]
+    async fn a_bad_header_does_not_use_a_publish_rate_limit_slot() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_publishes_per_event_per_sec: 1,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["abc"],
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The rate limit allows one publish per second. The bad header above
+        // did not use that slot, so this publish still succeeds.
+        let response = publish(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn max_listener_delay_secs_sets_the_accepted_range() {
+        let (router, state, _clock) = test_app_with(AppConfig {
+            max_listener_delay_secs: 10,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["11"],
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = read_json(response).await;
+        assert_eq!(body["error"], "invalid_listener_delay");
+
+        let response = publish_with_listener_delay(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["10"],
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .listener_delay_secs(&created.event_id)
+                .await
+                .expect("delay"),
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn the_header_name_is_matched_with_no_case() {
+        let (router, state, _clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", created.broadcaster_token),
+                    )
+                    .header("LISTENER-DELAY-SECS", "15")
+                    .body(Body::from(json!({"title": "Live"}).to_string()))
+                    .expect("publish request"),
+            )
+            .await
+            .expect("publish response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .listener_delay_secs(&created.event_id)
+                .await
+                .expect("delay"),
+            15
+        );
+    }
 }
 
 /// Tests for the reserved live items of ADR 0001: the reserve route
