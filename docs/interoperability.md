@@ -274,13 +274,26 @@ socket.io emission only, instead of at the publisher? The publisher would then
 send on sight, this service would hold the socket.io emission for the target
 delay, and the HTTP snapshot would show the current truth without a delay.
 
-Answer: ADR 0004 (Accepted 2026-10-06, not yet implemented). The broadcaster sends the
-delay with each publish. Socket.IO and `GET /remoteValue` wait for it. SSE,
-`GET /metadata` and the display routes are instant. The consumers that wait
-for an in-band key, such as the ICY sync of the private app, need the instant
-routes. Until ADR 0004 and publisher ADR 0011 are implemented, the publisher applies the
-delay, and every transport gets the delayed payload. A measurement of the real
-delay is still necessary to select a good value.
+Answer: ADR 0004 (Accepted 2026-10-06). The relay code now applies this
+timing:
+
+- Socket.IO `remoteValue`, and the value it sends on connect, wait for the
+  delay of the last publish.
+- `GET /v1/liveitems/{event_id}/remoteValue` waits for the delay too.
+- `GET /v1/liveitems/{event_id}/events` (SSE) is instant.
+- `GET /v1/liveitems/{event_id}/metadata` is instant.
+- The display routes are instant.
+
+A lease expiry also joins this timing. It reaches Socket.IO and
+`GET /remoteValue` after the delay of the last publish, so it never
+arrives before the last block. The consumers that wait for an in-band key,
+such as the ICY sync of the private app, need the instant routes.
+
+The broadcaster sends the delay with each publish, in the
+`Listener-Delay-Secs` header. See `README.md`. Publisher ADR 0011 removes
+the delay from the publisher side. Until that change reaches production,
+the delay could apply two times. A measurement of the real delay is still
+necessary to select a good value.
 
 ## References
 

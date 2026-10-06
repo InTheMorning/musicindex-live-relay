@@ -948,6 +948,409 @@ mod listener_delay_header {
     }
 }
 
+/// Tests for the listener timeline of ADR 0004 (task 002). Socket.IO and
+/// `GET /remoteValue` read the listener value. SSE and `GET /metadata`
+/// still read `latest`, and stay instant.
+mod listener_timeline {
+    use super::*;
+
+    async fn remote_value(router: axum::Router, event_id: &str) -> Value {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{event_id}/remoteValue"))
+                    .body(Body::empty())
+                    .expect("remoteValue request"),
+            )
+            .await
+            .expect("remoteValue response");
+        read_json(response).await
+    }
+
+    async fn latest_metadata_value(router: axum::Router, event_id: &str) -> Value {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{event_id}/metadata"))
+                    .body(Body::empty())
+                    .expect("metadata request"),
+            )
+            .await
+            .expect("metadata response");
+        let latest: LatestMetadataResponse = read_json(response).await;
+        latest.metadata
+    }
+
+    #[tokio::test]
+    async fn a_publish_with_no_header_changes_the_listener_value_at_once() {
+        let (router, _state, _clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // No call to `release_listener_updates`: the fast path alone makes
+        // the new payload visible at once, as before ADR 0004.
+        assert_eq!(
+            remote_value(router, &created.event_id).await,
+            json!({"title": "Live"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delayed_publish_reaches_the_instant_timeline_at_once_and_the_listener_timeline_after_the_delay()
+     {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        // T = 1: an undelayed publish gives the listener timeline a
+        // previous value to keep until the release.
+        let response = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "First"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // T = 2: a publish with a 30-second delay.
+        clock.store(2, Ordering::SeqCst);
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["30"],
+            json!({"title": "Second"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The instant timeline, `GET /metadata`, gets the new value at once.
+        assert_eq!(
+            latest_metadata_value(router.clone(), &created.event_id).await,
+            json!({"title": "Second"})
+        );
+
+        // T = 31 (T + 29): the listener timeline still gives the previous
+        // value. The sweep releases nothing.
+        clock.store(31, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 0);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({"title": "First"})
+        );
+
+        // T = 32 (T + 30): the sweep releases the update onto the listener
+        // timeline.
+        clock.store(32, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(
+            remote_value(router, &created.event_id).await,
+            json!({"title": "Second"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_delay_after_a_long_delay_is_released_in_the_order_of_the_instant_timeline() {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        // T = 1: a publish with a 30-second delay. Nothing has reached the
+        // listener timeline yet, so `GET /remoteValue` still gives `{}`.
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["30"],
+            json!({"title": "A"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // T = 2 (T + 1): a publish with no delay. Its release still waits
+        // for the update ahead of it on the listener timeline.
+        clock.store(2, Ordering::SeqCst);
+        let response = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "B"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(state.release_listener_updates().await, 0);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({}),
+            "the second update must not release at T + 1"
+        );
+
+        // T = 31 (the first publish's T + 30): both updates release
+        // together, in order, so the second update's payload is the final
+        // listener value.
+        clock.store(31, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 2);
+        assert_eq!(
+            remote_value(router, &created.event_id).await,
+            json!({"title": "B"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_with_no_header_after_a_full_release_is_at_once_again() {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["30"],
+            json!({"title": "Delayed"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        clock.store(31, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({"title": "Delayed"})
+        );
+
+        // With no pending update left, a new publish with no header is at
+        // once again, with no sweep.
+        clock.store(32, Ordering::SeqCst);
+        let response = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            remote_value(router, &created.event_id).await,
+            json!({"title": "Live"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_pending_list_has_the_new_update_replace_the_newest_pending_update() {
+        let (router, state, clock) = test_app_with(AppConfig {
+            max_pending_listener_updates: 2,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+
+        for (time, title) in [(1_u64, "First"), (2, "Second"), (3, "Third")] {
+            clock.store(time, Ordering::SeqCst);
+            let response = publish_with_listener_delay(
+                router.clone(),
+                &created.event_id,
+                Some(&created.broadcaster_token),
+                &["30"],
+                json!({"title": title}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // The pending list holds at most 2 updates: "First" and "Third".
+        // "Second" was replaced before it ever reached the listener
+        // timeline.
+        clock.store(33, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 2);
+        assert_eq!(
+            remote_value(router, &created.event_id).await,
+            json!({"title": "Third"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_reads_the_listener_value_while_an_update_waits_gets_the_old_value() {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Old"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        clock.store(2, Ordering::SeqCst);
+        let response = publish_with_listener_delay(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["30"],
+            json!({"title": "New"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // `register_socket_namespaces` reads the initial emit through
+        // `RelayState::listener_value`, the same function this test calls.
+        // A client that connects now, before the release, gets "Old", not
+        // the newest published payload.
+        assert_eq!(
+            state
+                .listener_value(&created.event_id)
+                .await
+                .expect("listener value"),
+            json!({"title": "Old"})
+        );
+    }
+
+    /// ADR 0004 §The Lease And The `404`: a lease expiry joins the
+    /// listener timeline with the delay of the last publish, so `{}`
+    /// arrives on the listener timeline after the last block, not before
+    /// it (task 003).
+    #[tokio::test]
+    async fn a_lease_expiry_joins_the_listener_timeline_with_the_delay_of_the_last_publish() {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        // T = 1: a publish with a 30-second delay.
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["30"],
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // T = 31 (T + 30): the sweep releases the payload.
+        clock.store(31, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({"title": "Live"})
+        );
+
+        // T = 91 (T + 90, the default lease): the lease expires. The
+        // instant side, `GET /metadata`, gives `404` at once.
+        clock.store(91, Ordering::SeqCst);
+        assert_eq!(state.expire_leases().await, 1);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                    .body(Body::empty())
+                    .expect("metadata request"),
+            )
+            .await
+            .expect("metadata response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // T = 120 (T + 119): the listener timeline still gives the payload.
+        clock.store(120, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 0);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({"title": "Live"})
+        );
+
+        // T = 121 (T + 120): `{}` reaches the listener timeline.
+        clock.store(121, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(remote_value(router, &created.event_id).await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_delay_longer_than_the_lease_keeps_the_order_through_the_expiry() {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        // T = 1: a publish with a 120-second delay.
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["120"],
+            json!({"title": "First"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // T = 6 (T + 5): a second publish, also with a 120-second delay.
+        clock.store(6, Ordering::SeqCst);
+        let response = publish_with_listener_delay(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            &["120"],
+            json!({"title": "Second"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // T = 96 (T + 95): the lease expires before either update
+        // releases. The order rule holds the `{}` behind both.
+        clock.store(96, Ordering::SeqCst);
+        assert_eq!(state.expire_leases().await, 1);
+        assert_eq!(state.release_listener_updates().await, 0);
+
+        // T = 121 (T + 120): the first payload releases.
+        clock.store(121, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({"title": "First"})
+        );
+
+        // T = 126 (T + 125): the second payload releases.
+        clock.store(126, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(
+            remote_value(router.clone(), &created.event_id).await,
+            json!({"title": "Second"})
+        );
+
+        // T = 216 (T + 215): `{}` releases last.
+        clock.store(216, Ordering::SeqCst);
+        assert_eq!(state.release_listener_updates().await, 1);
+        assert_eq!(remote_value(router, &created.event_id).await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_lease_expiry_with_no_delay_gives_the_empty_object_at_once() {
+        let (router, state, clock) = test_app_with(AppConfig::for_tests());
+        let created = create_event(router.clone()).await;
+
+        let response = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        clock.store(91, Ordering::SeqCst); // T + 90, the default lease
+        assert_eq!(state.expire_leases().await, 1);
+
+        // No call to `release_listener_updates`: a delay of 0 with no
+        // pending update reaches the listener timeline at once, exactly as
+        // before this ADR.
+        assert_eq!(remote_value(router, &created.event_id).await, json!({}));
+    }
+}
+
 /// Tests for the reserved live items of ADR 0001: the reserve route
 /// (task 002), and the restore and the TTL exemption (task 003).
 mod reserved {
@@ -2098,6 +2501,39 @@ mod reserved {
             assert_eq!(response.status(), StatusCode::OK);
             let chunk = next_sse_chunk(&mut ephemeral_body).await;
             assert!(chunk.contains("still live"), "{chunk}");
+        }
+
+        /// ADR 0004 §The Pending Updates: a delete removes the pending
+        /// listener updates of the event, so no later sweep sends one
+        /// (task 003).
+        #[tokio::test]
+        async fn a_delete_with_a_pending_update_sends_no_release() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_file = dir.path().join("reserved-items.sqlite3");
+            let clock = Arc::new(AtomicU64::new(1));
+            let state = reserved_state_at(&state_file, &clock).expect("open state");
+            let router = app(state.clone());
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let response = publish_with_listener_delay(
+                router.clone(),
+                &reserved.event_id,
+                Some(&reserved.broadcaster_token),
+                &["30"],
+                json!({"title": "Pending"}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = delete(router, &reserved.event_id, Some(ADMIN_TOKEN)).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+            clock.store(100, Ordering::SeqCst); // past the release time
+            assert_eq!(
+                state.release_listener_updates().await,
+                0,
+                "a deleted event sends no pending update"
+            );
         }
 
         #[tokio::test]

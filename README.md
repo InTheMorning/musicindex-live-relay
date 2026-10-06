@@ -63,6 +63,31 @@ A background task checks all leases each second. No transport serves the
 removed snapshot after an expiry. The replay buffer does not serve it
 either.
 
+## The Listener Timeline
+
+A broadcaster can send the delay of a publish with the
+`Listener-Delay-Secs` header (ADR 0004). See "Publish Metadata" below.
+
+Each route reads one of two timelines of the same updates:
+
+| Route | Timeline |
+|---|---|
+| Socket.IO `remoteValue`, and the value it sends on connect | Listener |
+| `GET /v1/liveitems/{event_id}/remoteValue` | Listener |
+| `GET /v1/liveitems/{event_id}/events` (SSE) | Instant |
+| `GET /v1/liveitems/{event_id}/metadata` | Instant |
+| `GET /v1/liveitems/{event_id}/display` and `/display/events` | Instant |
+
+The instant timeline gets an update at the time of its publish. The
+listener timeline gets the same update at that time plus the delay.
+
+The listener timeline keeps the order of the instant timeline. A publish
+with no header and no waiting update changes the listener value at once.
+This is the same behavior as before ADR 0004.
+
+A client that pays from SSE pays before the listener hears the track.
+Only a client that waits for an in-band key may pay from SSE.
+
 ## API
 
 ### Create Live Item
@@ -307,9 +332,13 @@ For compatibility with the widely used Socket.IO live value implementation, the 
 }
 ```
 
-A broadcaster can send the optional request header `Listener-Delay-Secs` with a publish (ADR 0004). The value is a whole number of seconds from 0 to `MAX_LISTENER_DELAY_SECS`. With no header, the delay is 0. The relay keeps the delay of the last accepted publish. A restart clears it, the same as the snapshot. Today, the relay does not use this delay to change when a route sends an update.
+A broadcaster can send the optional request header `Listener-Delay-Secs` with a publish (ADR 0004). The value is a whole number of seconds from 0 to `MAX_LISTENER_DELAY_SECS`. With no header, the delay is 0. The relay keeps the delay of the last accepted publish. A restart clears it, the same as the snapshot.
 
-On success, the relay increments the live item's sequence number, stores the latest snapshot, appends the update to the replay buffer, broadcasts a Socket.IO `remoteValue` event, and also broadcasts the same raw payload over SSE for fallback clients. The publish also renews the event lease. See "The Lease" above.
+The delay sets the listener timeline. See "The Listener Timeline" above.
+
+On success, the relay increments the live item's sequence number. It stores the latest snapshot and appends the update to the replay buffer. It sends the same raw payload over SSE for fallback clients. It also updates the listener timeline, and sends the Socket.IO `remoteValue` event when the update reaches that timeline. See "The Listener Timeline" above.
+
+The publish also renews the event lease. See "The Lease" above.
 
 Response:
 
@@ -378,7 +407,8 @@ A keepalive never restores a removed snapshot. Only a publish brings an event ba
 GET /v1/liveitems/{event_id}/metadata
 ```
 
-Returns the latest published metadata snapshot.
+Returns the latest published metadata snapshot. This route always follows
+the instant timeline (ADR 0004). See "The Listener Timeline" above.
 
 Response:
 
@@ -405,7 +435,7 @@ The Socket.IO-compatible raw payload is also available at:
 GET /v1/liveitems/{event_id}/remoteValue
 ```
 
-When the event exists but no metadata has been published yet, this endpoint returns `200 OK` with `{}` (mirrors Socket.IO's initial-emit behavior). It returns `404` only when the event itself does not exist.
+When the event exists but no metadata has been published yet, this endpoint returns `200 OK` with `{}` (mirrors Socket.IO's initial-emit behavior). It returns `404` only when the event itself does not exist. This route always follows the listener timeline (ADR 0004). See "The Listener Timeline" above.
 
 ### Subscribe With Socket.IO
 
@@ -425,7 +455,7 @@ socket.on("remoteValue", payload => {
 });
 ```
 
-The relay immediately emits the current `remoteValue` payload after a successful connection. If no metadata has been published yet, it emits `{}`. Future publishes emit the raw live value payload:
+The relay immediately emits the current `remoteValue` payload after a successful connection. If no metadata has been published yet, it emits `{}`. This is the listener timeline value, not always the newest published payload. See "The Listener Timeline" above. A publish with a delay reaches this emit after the delay. Future publishes emit the raw live value payload:
 
 ```json
 {
@@ -465,6 +495,9 @@ When `Last-Event-ID` is present and valid, the relay replays buffered events wit
 The replay buffer is in memory only. After a restart, a reserved item has an empty replay buffer, and its `seq` starts again at zero. See "Restart And Idle TTL" above.
 
 The stream also sends periodic keepalive comments.
+
+SSE always follows the instant timeline (ADR 0004). It never waits for
+the delay of a publish. See "The Listener Timeline" above.
 
 ### Display State
 
@@ -885,7 +918,7 @@ Configuration is read from environment variables.
 | `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
 | `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. A reserved item holds two images at most. See "Image Retention" above. |
 | `MAX_LISTENER_DELAY_SECS` | `300` | The highest value of the `Listener-Delay-Secs` header that a publish can send (ADR 0004). See "Publish Metadata" above. |
-| `MAX_PENDING_LISTENER_UPDATES` | `64` | The pending listener updates that the relay keeps for each event (ADR 0004). Today, the relay holds no pending update. |
+| `MAX_PENDING_LISTENER_UPDATES` | `64` | The highest count of pending listener updates that the relay keeps for each event (ADR 0004). Must be 1 or more. See "The Listener Timeline" above. |
 
 The included systemd unit sets `ProtectSystem=strict`,
 `StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. systemd

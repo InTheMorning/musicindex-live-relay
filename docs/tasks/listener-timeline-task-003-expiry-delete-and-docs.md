@@ -1,6 +1,6 @@
 # Listener Timeline Task 003: Expiry, Delete And Documents
 
-Status: Ready after task 002.
+Status: Implemented - 2026-10-06, together with task 002.
 
 Every criterion is mechanical. The visual check is in a separate list.
 
@@ -136,3 +136,14 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-06 in one change with task 002. See the review result of
+task 002. A lease expiry uses the publish rule with the delay of the last
+publish. The test with a delay of 120 seconds and a lease of 90 seconds gives
+the releases at T + 120, T + 125 and T + 215. A delete clears the pending
+updates under `listener_order` before it disconnects the Socket.IO clients.
+
+The visual check stays open: a podcast app on Socket.IO changes the block at
+the same time as before.

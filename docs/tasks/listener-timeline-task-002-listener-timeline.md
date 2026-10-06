@@ -1,6 +1,6 @@
 # Listener Timeline Task 002: The Listener Timeline
 
-Status: Ready after task 001.
+Status: Implemented - 2026-10-06, together with task 003.
 
 Every criterion is mechanical.
 
@@ -152,3 +152,47 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-06, together with task 003. The full gate passes three
+times in a row: 165 tests, 0 failures.
+
+The agent stopped at the second escalation trigger. With this task alone, a
+lease expiry did not reach the listener value, so `GET /remoteValue` kept a
+stale block after an expiry. That was a fault of the plan: task 002 changed
+the readers, and task 003 changed the expiry. The planner joined the two
+tasks into one change. Three existing tests failed with task 002 alone. They
+pass with tasks 002 and 003 together, with no change to their code.
+
+The review found two defects and the agent fixed them:
+
+- **The order of the Socket.IO emits.** The sweep changed the listener value,
+  released the lock, and then emitted. A publish with delay 0 could emit its
+  block in that gap, and the sweep then emitted the older block after it.
+  Socket.IO clients then kept the previous block. Each event now has the lock
+  `listener_order`. A publish, an expiry, the sweep and a delete take it
+  before the event lock, and hold it through their emits. The unit test
+  `a_publish_waits_for_a_held_listener_order_lock` fails when the publish
+  does not take the lock.
+- **`MAX_PENDING_LISTENER_UPDATES=0`** dropped each delayed update. It is now
+  a configuration error.
+
+The review accepts these decisions:
+
+- `LiveEventInner::apply_listener_update` is the one implementation of the
+  publish rule. A publish and an expiry call it.
+- `RelayState::listener_value` is a public read method. `GET /remoteValue`,
+  the Socket.IO connect handler and the tests use it.
+- The configuration tests of `src/lib.rs` hold `ENV_LOCK`, because
+  `AppConfig::from_env` reads each variable. Before, one test could see the
+  value of another test.
+
+Lock order, checked by the reviewer: the table lock is released before
+`listener_order`. `listener_order` comes before the event lock, and both are
+released before the display lock. The Socket.IO connect handler joins the room
+before it reads the listener value, so a client gets the present value or its
+emit, never an older value.
+
+No test can see the real sequence of Socket.IO emits. The lock structure and
+the unit test are the evidence.

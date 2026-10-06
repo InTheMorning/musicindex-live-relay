@@ -46,8 +46,17 @@ packet.
     event does not hold.
   - An ephemeral event gets `409 event_not_reserved`.
 - ADR 0004, a delayed listener timeline for Socket.IO, has the status
-  `Accepted`. Its three packets are ready, and no implementation exists yet.
-  Every transport gives each payload at the time that it arrives.
+  `Accepted`. Its three task packets are done. ADR 0004 becomes
+  `Implemented` only after an implementation review, as for ADR 0001 and
+  ADR 0003. That review does not exist yet.
+  - The broadcaster sends the delay of a publish in the
+    `Listener-Delay-Secs` header.
+  - Socket.IO `remoteValue`, and the value it sends on connect, follow the
+    delay of each publish. `GET /v1/liveitems/{event_id}/remoteValue`
+    follows it too.
+  - SSE, `GET /metadata`, and the display routes are instant.
+  - A lease expiry joins the listener timeline with the delay of the
+    event's last publish, so its `{}` never arrives before the last block.
 - ADR 0005, two optional display track keys for the HLS tagger, has the
   status `Proposed`. No implementation exists. A display track still accepts
   exactly `artist`, `title` and `artwork`.

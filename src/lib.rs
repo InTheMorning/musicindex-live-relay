@@ -84,6 +84,10 @@ const DEFAULT_MAX_LISTENER_DELAY_SECS: u64 = 300;
 /// The default of `MAX_PENDING_LISTENER_UPDATES`, the pending listener
 /// updates that the relay keeps for each event (ADR 0004 §Configuration).
 const DEFAULT_MAX_PENDING_LISTENER_UPDATES: usize = 64;
+/// The lowest accepted value of `MAX_PENDING_LISTENER_UPDATES`. A bound of
+/// 0 would leave no slot for a delayed update, so every one of them would
+/// have nowhere to wait.
+const MIN_PENDING_LISTENER_UPDATES: usize = 1;
 /// The lowercase name of the listener delay header (ADR 0004 §The Delay).
 /// `HeaderMap` looks up a header by its lowercase name, so the broadcaster
 /// can send the header in any case.
@@ -168,10 +172,7 @@ impl AppConfig {
                 "MAX_LISTENER_DELAY_SECS",
                 DEFAULT_MAX_LISTENER_DELAY_SECS,
             )?,
-            max_pending_listener_updates: env_parse(
-                "MAX_PENDING_LISTENER_UPDATES",
-                DEFAULT_MAX_PENDING_LISTENER_UPDATES,
-            )?,
+            max_pending_listener_updates: parse_max_pending_listener_updates()?,
         })
     }
 
@@ -226,6 +227,23 @@ fn parse_lease_secs() -> Result<u64, ConfigError> {
         });
     }
     Ok(secs)
+}
+
+/// Reads `MAX_PENDING_LISTENER_UPDATES`, the pending listener updates that
+/// the relay keeps for each event (ADR 0004 §Configuration).
+fn parse_max_pending_listener_updates() -> Result<usize, ConfigError> {
+    let count = env_parse(
+        "MAX_PENDING_LISTENER_UPDATES",
+        DEFAULT_MAX_PENDING_LISTENER_UPDATES,
+    )?;
+    if count < MIN_PENDING_LISTENER_UPDATES {
+        return Err(ConfigError {
+            key: "MAX_PENDING_LISTENER_UPDATES",
+            value: count.to_string(),
+            message: format!("must be {MIN_PENDING_LISTENER_UPDATES} or more"),
+        });
+    }
+    Ok(count)
 }
 
 #[derive(Debug)]
@@ -543,11 +561,17 @@ impl RelayState {
     ///    lock held, as a reserve does.
     /// 2. The live state leaves memory. The table write lock is then
     ///    released.
-    /// 3. Each SSE stream of the item stops.
-    /// 4. Each Socket.IO client of the item gets `{}` and is disconnected.
+    /// 3. The item's `listener_order` lock is taken first (ADR 0004,
+    ///    payment safety). The lock order is `listener_order`, then
+    ///    `inner`. Under it, the pending listener updates leave memory.
+    ///    Each SSE stream of the item stops. Each Socket.IO client of the
+    ///    item gets `{}` and is disconnected. Holding `listener_order`
+    ///    through the disconnect blocks a release sweep, a publish, or a
+    ///    lease expiry that already copied this item. None of them can
+    ///    emit a stale value for it after this step.
     ///
-    /// If step 1 fails, nothing changes. No lock is held during step 3 or
-    /// step 4.
+    /// If step 1 fails, nothing changes. Step 3 holds only
+    /// `listener_order`, and briefly `inner` too.
     ///
     /// # Errors
     ///
@@ -579,10 +603,24 @@ impl RelayState {
         let live = events.live.remove(event_id);
         drop(events);
 
-        if let Some(live) = live {
-            live.close();
+        match live {
+            Some(live) => {
+                // Lock order (ADR 0004, payment safety): `listener_order`,
+                // then `inner`. Holding `listener_order` through the
+                // disconnect blocks a concurrent publish, lease expiry, or
+                // release sweep of this event. None of them can emit a
+                // stale listener value once the event is gone.
+                let listener_order = live.listener_order.lock().await;
+                // Remove the pending listener updates before the disconnect
+                // (ADR 0004 §The Pending Updates), so no later release sweep
+                // sends one for this event.
+                live.inner.write().await.pending_listener_updates.clear();
+                live.close();
+                self.disconnect_socket_clients(event_id).await;
+                drop(listener_order);
+            }
+            None => self.disconnect_socket_clients(event_id).await,
         }
-        self.disconnect_socket_clients(event_id).await;
         tracing::info!(%event_id, "deleted reserved live item");
         Ok(())
     }
@@ -615,6 +653,14 @@ impl RelayState {
     /// gives `listener_delay_secs` as the result of the header check, so a
     /// bad header never uses a publish slot (ADR 0004 §The Delay).
     ///
+    /// SSE and the stored snapshot get the update at once, on the instant
+    /// timeline. The listener timeline, which Socket.IO and
+    /// `GET /remoteValue` read, gets the update at once only when the delay
+    /// is 0 and no earlier update still waits. Else the update joins the
+    /// pending list, and a later call to `release_listener_updates` moves
+    /// it onto the listener timeline (ADR 0004 §Two Timelines, §The Order On
+    /// The Listener Timeline, §The Pending Updates).
+    ///
     /// # Errors
     ///
     /// Returns `404 event_not_found`, `403 invalid_token`,
@@ -645,6 +691,13 @@ impl RelayState {
         event.renew_lease(now);
         event.set_listener_delay_secs(listener_delay_secs);
 
+        // Lock order (ADR 0004, payment safety): `listener_order`, then
+        // `inner`. Taking `listener_order` before the snapshot write keeps
+        // the snapshot order and the listener order the same. Holding it
+        // through the emit below keeps the listener value and the
+        // Socket.IO emit in step. This holds even with a concurrent lease
+        // expiry, release sweep, or delete of this event.
+        let listener_order = event.listener_order.lock().await;
         let mut inner = event.inner.write().await;
         inner.seq += 1;
         let seq = inner.seq;
@@ -664,9 +717,14 @@ impl RelayState {
         }
 
         let metadata = snapshot.metadata.clone();
+        let listener_emit =
+            inner.apply_listener_update(&self.inner.config, now, listener_delay_secs, metadata);
         drop(inner);
         let _ = event.sender.send(snapshot);
-        self.emit_socket_remote_value(event_id, &metadata).await;
+        if let Some(value) = listener_emit {
+            self.emit_socket_remote_value(event_id, &value).await;
+        }
+        drop(listener_order);
 
         Ok(PublishMetadataResponse {
             event_id: event_id.to_string(),
@@ -691,6 +749,20 @@ impl RelayState {
     pub async fn listener_delay_secs(&self, event_id: &str) -> Result<u64, ApiError> {
         let event = self.get_event(event_id).await?;
         Ok(event.listener_delay_secs())
+    }
+
+    /// Returns the value that Socket.IO and `GET /remoteValue` give now
+    /// (ADR 0004 §Two Timelines). It is `{}` before the listener timeline
+    /// holds an update. `register_socket_namespaces` reads this same value
+    /// on connect, so a client that connects while an update waits gets
+    /// this value, not the newest published payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `404 event_not_found`.
+    pub async fn listener_value(&self, event_id: &str) -> Result<Value, ApiError> {
+        let event = self.get_event(event_id).await?;
+        Ok(event.inner.read().await.listener_value.clone())
     }
 
     pub async fn latest_metadata(
@@ -1121,12 +1193,17 @@ impl RelayState {
                 continue;
             }
 
+            // Lock order (ADR 0004, payment safety): `listener_order`,
+            // then `inner`.
+            let listener_order = event.listener_order.lock().await;
             let mut inner = event.inner.write().await;
             // Check the lease again under the write lock. A publish renews the
             // lease before it takes this lock, so a publish that arrived after
             // the first check is visible here, and its snapshot stays.
             let renewed_at = event.renewed_at.load(Ordering::Relaxed);
             if now.saturating_sub(renewed_at) < lease_secs {
+                drop(inner);
+                drop(listener_order);
                 continue;
             }
             if inner.latest.is_none() {
@@ -1134,6 +1211,7 @@ impl RelayState {
                 // state clears (ADR 0003). This covers an event that published
                 // a display state and no payload, for example after a restart.
                 drop(inner);
+                drop(listener_order);
                 self.clear_display_after_lease(&event, lease_secs, now)
                     .await;
                 continue;
@@ -1150,10 +1228,20 @@ impl RelayState {
             while inner.replay.len() > REPLAY_CAPACITY {
                 inner.replay.pop_front();
             }
+
+            // The `{}` joins the listener timeline with the delay of the
+            // last publish, so it never arrives before the last block
+            // (ADR 0004 §The Lease And The `404`).
+            let delay = event.listener_delay_secs();
+            let listener_emit =
+                inner.apply_listener_update(&self.inner.config, now, delay, json!({}));
             drop(inner);
 
             let _ = event.sender.send(snapshot);
-            self.emit_socket_remote_value(&event_id, &json!({})).await;
+            if let Some(value) = listener_emit {
+                self.emit_socket_remote_value(&event_id, &value).await;
+            }
+            drop(listener_order);
 
             self.clear_display_after_lease(&event, lease_secs, now)
                 .await;
@@ -1161,6 +1249,71 @@ impl RelayState {
         }
 
         expired_count
+    }
+
+    /// Moves each pending update whose release time is not after now onto
+    /// the listener value of its event, in order, and emits each one on
+    /// Socket.IO (ADR 0004 §The Order On The Listener Timeline).
+    ///
+    /// This follows the lock rule of `expire_leases`: it copies the
+    /// candidate events, takes one event lock at a time, and releases the
+    /// lock before each emit. For each event it also takes that event's
+    /// `listener_order` lock before `inner`. It keeps that lock until the
+    /// emits of that event are sent. This keeps a concurrent publish,
+    /// lease expiry, or delete of the same event from interleaving with
+    /// this sweep (ADR 0004, payment safety).
+    ///
+    /// `spawn_lease_task` calls this each second, after `expire_leases`.
+    ///
+    /// Returns the count of released updates, over every event.
+    pub async fn release_listener_updates(&self) -> usize {
+        let now = self.now();
+
+        // Copy the candidates, then release the table lock before the
+        // first event lock.
+        let candidates: Vec<(String, Arc<LiveEventState>)> = {
+            let events = self.inner.events.read().await;
+            events
+                .store
+                .list_ids()
+                .into_iter()
+                .filter_map(|event_id| {
+                    let event = Arc::clone(events.live.get(&event_id)?);
+                    Some((event_id, event))
+                })
+                .collect()
+        };
+
+        let mut released_count = 0;
+        for (event_id, event) in candidates {
+            // Lock order (ADR 0004, payment safety): `listener_order`,
+            // then `inner`.
+            let listener_order = event.listener_order.lock().await;
+            let released: Vec<Value> = {
+                let mut inner = event.inner.write().await;
+                let mut released = Vec::new();
+                while inner
+                    .pending_listener_updates
+                    .front()
+                    .is_some_and(|update| update.release_at <= now)
+                {
+                    let update = inner
+                        .pending_listener_updates
+                        .pop_front()
+                        .expect("the front was checked above");
+                    inner.listener_value = update.value.clone();
+                    released.push(update.value);
+                }
+                released
+            };
+            for value in released {
+                self.emit_socket_remote_value(&event_id, &value).await;
+                released_count += 1;
+            }
+            drop(listener_order);
+        }
+
+        released_count
     }
 
     /// Sets the display state of `event` to `{"track": null}` and sends it,
@@ -1267,6 +1420,24 @@ struct LiveEventState {
     /// in memory only, so a restart clears it, the same as the snapshot.
     listener_delay_secs: AtomicU64,
     inner: RwLock<LiveEventInner>,
+    /// Orders every change to the listener timeline of this event
+    /// (`inner.listener_value` and `inner.pending_listener_updates`)
+    /// together with the Socket.IO emit that reports the change (ADR 0004,
+    /// payment safety).
+    ///
+    /// Lock order: `listener_order`, then `inner`. Never take
+    /// `listener_order` while holding `inner` or the table lock
+    /// (`RelayStateInner::events`). A writer takes `listener_order` first,
+    /// then `inner`. It changes the listener state and drops `inner`. It
+    /// emits on Socket.IO, and only then drops `listener_order`.
+    ///
+    /// Holding `listener_order` across the emit is the purpose of this
+    /// lock. It keeps the listener value and the Socket.IO emit in the
+    /// same order, for every writer of this event: a publish, a lease
+    /// expiry, the release sweep, and a delete. The rule "never hold a
+    /// lock across an emit" still applies to the table lock, `inner`, and
+    /// `display`.
+    listener_order: tokio::sync::Mutex<()>,
     sender: broadcast::Sender<MetadataSnapshot>,
     /// Changes to `true` when an operator deletes the event. Each SSE stream
     /// of the event then stops. Only a delete sets it, and only a reserved
@@ -1284,6 +1455,91 @@ struct LiveEventInner {
     seq: u64,
     latest: Option<MetadataSnapshot>,
     replay: VecDeque<MetadataSnapshot>,
+    /// The value that Socket.IO and `GET /remoteValue` give now (ADR 0004
+    /// §Two Timelines). It starts as `{}`. Only a publish with no delay and
+    /// no waiting update, or `RelayState::release_listener_updates`, change
+    /// it.
+    listener_value: Value,
+    /// The updates that wait to reach the listener timeline, oldest first
+    /// (ADR 0004 §The Pending Updates). Each release time is never earlier
+    /// than the release time of the update before it, so the order of the
+    /// instant timeline is kept. It holds at most
+    /// `max_pending_listener_updates` updates.
+    pending_listener_updates: VecDeque<PendingListenerUpdate>,
+}
+
+/// One update that waits to reach the listener timeline (ADR 0004 §The
+/// Pending Updates). It is in memory only, the same as the pending list
+/// that holds it.
+struct PendingListenerUpdate {
+    /// The time the update reaches the listener timeline.
+    release_at: u64,
+    /// The live value of the update.
+    value: Value,
+}
+
+impl LiveEventInner {
+    /// Applies one update to the listener timeline (ADR 0004 §Two
+    /// Timelines, §The Order On The Listener Timeline, §The Pending
+    /// Updates). Only one function implements the publish rule. A publish
+    /// and a lease expiry call it, and nothing else does.
+    ///
+    /// With `delay` 0 and no pending update, this sets the listener value
+    /// and returns it, so the caller emits it on Socket.IO. Else it
+    /// computes a release time of `now` plus `delay`. That time is never
+    /// earlier than the release time of the newest pending update. It
+    /// joins the pending list with that time, and returns `None`.
+    ///
+    /// When the pending list already holds
+    /// `config.max_pending_listener_updates` updates, this update
+    /// replaces the newest one instead of growing the list. It keeps the
+    /// later release time of the two.
+    ///
+    /// The caller holds this event's `inner` write lock and its
+    /// `listener_order` lock. It keeps holding `listener_order` through
+    /// the emit of the returned value. This keeps the listener order and
+    /// the Socket.IO emit order from separating (ADR 0004, payment
+    /// safety).
+    fn apply_listener_update(
+        &mut self,
+        config: &AppConfig,
+        now: u64,
+        delay: u64,
+        value: Value,
+    ) -> Option<Value> {
+        if delay == 0 && self.pending_listener_updates.is_empty() {
+            // Fast path (ADR 0004 §Two Timelines): no delay and nothing
+            // waits, so the update reaches the listener timeline at once.
+            self.listener_value = value.clone();
+            return Some(value);
+        }
+
+        // The order rule (ADR 0004 §The Order On The Listener Timeline): a
+        // release time is never earlier than the release time of the
+        // update before it.
+        let release_at = now.saturating_add(delay);
+        let release_at = self
+            .pending_listener_updates
+            .back()
+            .map_or(release_at, |newest| release_at.max(newest.release_at));
+
+        if self.pending_listener_updates.len() < config.max_pending_listener_updates {
+            self.pending_listener_updates
+                .push_back(PendingListenerUpdate { release_at, value });
+        } else {
+            // The bound (ADR 0004 §The Pending Updates): the new update
+            // replaces the newest pending update, and keeps the later
+            // release time of the two. `AppConfig::from_env` rejects a
+            // bound below 1, so the list is not empty here.
+            let newest = self
+                .pending_listener_updates
+                .back_mut()
+                .expect("max_pending_listener_updates is at least 1");
+            newest.release_at = release_at;
+            newest.value = value;
+        }
+        None
+    }
 }
 
 /// The display half of an event (ADR 0003). It is in memory only, so a
@@ -1472,7 +1728,10 @@ impl LiveEventState {
                 seq: 0,
                 latest: None,
                 replay: VecDeque::with_capacity(REPLAY_CAPACITY),
+                listener_value: json!({}),
+                pending_listener_updates: VecDeque::new(),
             }),
+            listener_order: tokio::sync::Mutex::new(()),
             sender,
             closed: watch::channel(false).0,
             display: RwLock::new(DisplayInner::new()),
@@ -1914,10 +2173,12 @@ pub fn spawn_cleanup_task(state: RelayState) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Spawns the background task that expires leases each second.
+/// Spawns the background task that expires leases and releases pending
+/// listener updates each second.
 ///
-/// The task calls [`RelayState::expire_leases`] on a one-second tick for the
-/// life of the process.
+/// The task calls [`RelayState::expire_leases`], then
+/// [`RelayState::release_listener_updates`] (ADR 0004), on a one-second tick
+/// for the life of the process.
 pub fn spawn_lease_task(state: RelayState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -1927,6 +2188,10 @@ pub fn spawn_lease_task(state: RelayState) -> tokio::task::JoinHandle<()> {
             let expired = state.expire_leases().await;
             if expired > 0 {
                 tracing::info!(expired, "expired live leases");
+            }
+            let released = state.release_listener_updates().await;
+            if released > 0 {
+                tracing::info!(released, "released pending listener updates");
             }
         }
     })
@@ -2156,20 +2421,16 @@ fn display_update_to_sse(update: DisplayUpdate) -> Event {
         .expect("display states are serializable")
 }
 
+/// Handles `GET /v1/liveitems/{event_id}/remoteValue`.
+///
+/// This route follows the listener timeline, not the instant timeline
+/// (ADR 0004 §Two Timelines). It gives the same value as the last
+/// Socket.IO `remoteValue` emit of this event.
 async fn remote_value(
     AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let event = state.get_event(&event_id).await?;
-    let metadata = event
-        .inner
-        .read()
-        .await
-        .latest
-        .as_ref()
-        .map(|snapshot| snapshot.metadata.clone())
-        .unwrap_or_else(|| json!({}));
-    Ok(Json(metadata))
+    Ok(Json(state.listener_value(&event_id).await?))
 }
 
 async fn events(
@@ -2224,8 +2485,12 @@ fn register_socket_namespaces(io: SocketIo) {
                 return;
             };
 
-            let event = match state.get_event(&event_id).await {
-                Ok(event) => event,
+            // The initial emit reads the listener value through the same
+            // function as `GET /remoteValue` (ADR 0004 §Two Timelines), so
+            // a client that connects while an update waits gets the
+            // listener value, not the newest published payload.
+            let current = match state.listener_value(&event_id).await {
+                Ok(current) => current,
                 Err(_) => {
                     let _ = socket.emit("remoteValue", &json!({}));
                     socket.disconnect().ok();
@@ -2234,15 +2499,6 @@ fn register_socket_namespaces(io: SocketIo) {
             };
 
             socket.join(event_id.clone());
-
-            let current = event
-                .inner
-                .read()
-                .await
-                .latest
-                .as_ref()
-                .map(|snapshot| snapshot.metadata.clone())
-                .unwrap_or_else(|| json!({}));
 
             if let Err(err) = socket.emit("remoteValue", &current) {
                 tracing::warn!(%event_id, ?err, "failed to emit initial Socket.IO remoteValue");
@@ -2352,6 +2608,14 @@ fn format_timestamp(timestamp: u64) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    /// Serializes the configuration tests that mutate the process
+    /// environment. `cargo test` runs tests of one process on parallel
+    /// threads, and `AppConfig::from_env` reads every variable, so one
+    /// test's value can leak into another test's read. Each such test
+    /// holds this lock for its whole body: the set, the read, and the
+    /// remove.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_state(now: u64) -> (RelayState, Arc<AtomicU64>) {
         test_state_with_lease(now, DEFAULT_LEASE_SECS)
@@ -2843,9 +3107,11 @@ mod tests {
 
     #[test]
     fn max_pending_listener_updates_that_is_not_a_number_is_a_configuration_error() {
-        // SAFETY: this test is the only one in the suite that reads or
-        // writes MAX_PENDING_LISTENER_UPDATES, so no other test races this
-        // mutation of the process environment.
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::set_var("MAX_PENDING_LISTENER_UPDATES", "not-a-number");
         }
@@ -2860,10 +3126,32 @@ mod tests {
     }
 
     #[test]
+    fn max_pending_listener_updates_of_zero_is_a_configuration_error() {
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("MAX_PENDING_LISTENER_UPDATES", "0");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("MAX_PENDING_LISTENER_UPDATES");
+        }
+
+        let err = result.expect_err("a bound of 0 is rejected");
+        assert!(err.to_string().contains("MAX_PENDING_LISTENER_UPDATES"));
+    }
+
+    #[test]
     fn lease_secs_below_minimum_is_a_configuration_error() {
-        // SAFETY: this test is the only one in the suite that reads or
-        // writes LEASE_SECS, so no other test races this mutation of the
-        // process environment.
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::set_var("LEASE_SECS", "5");
         }
@@ -2884,9 +3172,11 @@ mod tests {
             AppConfig::for_tests().artwork_max_bytes,
             DEFAULT_ARTWORK_MAX_BYTES
         );
-        // SAFETY: this test is the only one in the suite that reads or
-        // writes ARTWORK_MAX_BYTES. It calls only the parser of that one
-        // variable, so it does not race the LEASE_SECS test.
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             std::env::set_var("ARTWORK_MAX_BYTES", "1000");
         }
@@ -2900,6 +3190,65 @@ mod tests {
             parse_artwork_max_bytes().expect("the default"),
             DEFAULT_ARTWORK_MAX_BYTES
         );
+    }
+
+    // ADR 0004, payment safety: the listener value and its Socket.IO emit
+    // must never separate. `publish_metadata`, `expire_leases`,
+    // `release_listener_updates`, and `delete_reserved` each take the
+    // event's `listener_order` lock before they change the listener
+    // timeline, and hold it through the emit.
+    //
+    // This test cannot observe the sequence of Socket.IO emits.
+    // `emit_socket_remote_value` talks to a real `socketioxide::SocketIo`,
+    // attached only by `app()`. Nothing in this crate records what it
+    // sends, or in what order.
+    //
+    // So this test proves the lock structure directly instead. It holds
+    // `listener_order` itself, the way a release sweep holds it across
+    // its own emit. It shows that a concurrent publish cannot finish
+    // until the lock is free. The other three call sites take the same
+    // lock in the same order (`listener_order`, then `inner`), so the
+    // same proof applies to each pair of them.
+    #[tokio::test]
+    async fn a_publish_waits_for_a_held_listener_order_lock() {
+        let (state, _clock) = test_state(1);
+        let created = state.create_event().await.expect("create event");
+        let event = state.get_event(&created.event_id).await.expect("event");
+
+        let guard = event.listener_order.lock().await;
+
+        let publish_task = {
+            let state = state.clone();
+            let event_id = created.event_id.clone();
+            let token = created.broadcaster_token.clone();
+            tokio::spawn(async move {
+                state
+                    .publish_metadata(
+                        &event_id,
+                        &token,
+                        Ok(0),
+                        PublishMetadataRequest(json!({"title": "Live"})),
+                    )
+                    .await
+            })
+        };
+
+        // Give the spawned task every chance to run. It must still be
+        // waiting for `listener_order`.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !publish_task.is_finished(),
+            "a publish must wait for a held listener_order lock"
+        );
+
+        drop(guard);
+        let response = publish_task
+            .await
+            .expect("publish task joins")
+            .expect("publish succeeds once listener_order is free");
+        assert!(response.accepted);
     }
 
     #[test]
