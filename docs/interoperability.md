@@ -274,11 +274,11 @@ socket.io emission only, instead of at the publisher? The publisher would then
 send on sight, this service would hold the socket.io emission for the target
 delay, and the HTTP snapshot would show the current truth without a delay.
 
-Proposed answer: ADR 0004 (Proposed 2026-10-06). The broadcaster sends the
+Answer: ADR 0004 (Accepted 2026-10-06, not yet implemented). The broadcaster sends the
 delay with each publish. Socket.IO and `GET /remoteValue` wait for it. SSE,
 `GET /metadata` and the display routes are instant. The consumers that wait
 for an in-band key, such as the ICY sync of the private app, need the instant
-routes. Until ADR 0004 is accepted and implemented, the publisher applies the
+routes. Until ADR 0004 and publisher ADR 0011 are implemented, the publisher applies the
 delay, and every transport gets the delayed payload. A measurement of the real
 delay is still necessary to select a good value.
 

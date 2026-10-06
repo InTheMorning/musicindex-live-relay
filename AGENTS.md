@@ -46,8 +46,11 @@ packet.
     event does not hold.
   - An ephemeral event gets `409 event_not_reserved`.
 - ADR 0004, a delayed listener timeline for Socket.IO, has the status
-  `Proposed`. No implementation exists. Every transport gives each payload at
-  the time that it arrives.
+  `Accepted`. Its three packets are ready, and no implementation exists yet.
+  Every transport gives each payload at the time that it arrives.
+- ADR 0005, two optional display track keys for the HLS tagger, has the
+  status `Proposed`. No implementation exists. A display track still accepts
+  exactly `artist`, `title` and `artwork`.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

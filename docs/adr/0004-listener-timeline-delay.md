@@ -2,6 +2,14 @@
 
 ## Status
 
+Accepted - 2026-10-06.
+
+Accepted 2026-10-06 by the operator, as written. Items 1 and 2 of §Before
+Acceptance are done: publisher ADR 0011 is accepted, and
+`docs/interoperability.md` names this ADR. Item 3, the `v4vmm` view, stays
+open as a request in `v4vmm`. The packets are in
+`docs/plans/adr-0004-listener-timeline-phase-plan.md`.
+
 Proposed 2026-10-06.
 
 Class: situational. Supersede this record when podcast apps get a sync signal

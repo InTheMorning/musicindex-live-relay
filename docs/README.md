@@ -26,8 +26,11 @@ station runs continuously.
   Tasks 001 and 002 are done. The ADR needs an implementation review before
   it becomes Implemented.
 - [ADR 0004: A delayed listener timeline for Socket.IO](adr/0004-listener-timeline-delay.md)
-  — Proposed. The broadcaster sends the delay with each publish. Socket.IO and
+  — Accepted. The broadcaster sends the delay with each publish. Socket.IO and
   `GET /remoteValue` wait for it. SSE and the other reads are instant
+- [ADR 0005: The display state carries the song line and the value identity](adr/0005-display-song-line-and-value.md)
+  — Proposed. Two optional track keys, `songLine` and `value`, for the HLS
+  tagger of publisher ADR 0009
 
 ## Plans
 
@@ -36,6 +39,10 @@ station runs continuously.
   that ADR 0002 answers
 - [Live lease phase plan](plans/adr-0002-live-lease-phase-plan.md)
 - [Display state phase plan](plans/adr-0003-display-state-phase-plan.md)
+- [Listener timeline phase plan](plans/adr-0004-listener-timeline-phase-plan.md)
+  — Ready. Three packets
+- [Display pairing phase plan](plans/adr-0005-display-pairing-phase-plan.md)
+  — Proposed. One packet
 
 ## Tasks
 
@@ -62,6 +69,18 @@ after the reserved live items packets.
 - [001 — Lease state and expiry](tasks/live-lease-task-001-lease-state-and-expiry.md)
 - [002 — Keepalive route and documents](tasks/live-lease-task-002-keepalive-route-and-docs.md)
 
+Packets for the listener timeline plan. ADR 0004 governs them. Strictly
+sequential. Ready - 2026-10-06.
+
+- [001 — The delay header](tasks/listener-timeline-task-001-delay-header.md)
+- [002 — The listener timeline](tasks/listener-timeline-task-002-listener-timeline.md)
+- [003 — Expiry, delete and documents](tasks/listener-timeline-task-003-expiry-delete-and-docs.md)
+
+Packet for the display pairing plan. ADR 0005 governs it. It starts after the
+operator accepts ADR 0005.
+
+- [001 — The song line and the value identity](tasks/display-pairing-task-001-song-line-and-value.md)
+
 ## Runbooks
 
 - [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
@@ -72,6 +91,8 @@ after the reserved live items packets.
 - [ADR 0001 implementation review](reviews/adr-0001-implementation-review.md)
   — the named artifact for the `Implemented` status of ADR 0001
 - [Live lease review checklist](reviews/live-lease-review-checklist.md)
+- [ADR 0004 review checklist](reviews/adr-0004-review-checklist.md) — open
+- [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — open
 
 ## Research
 
