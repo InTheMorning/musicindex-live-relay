@@ -45,6 +45,9 @@ packet.
   - A display publish gives `409 artwork_missing` for an image that the
     event does not hold.
   - An ephemeral event gets `409 event_not_reserved`.
+- ADR 0004, a delayed listener timeline for Socket.IO, has the status
+  `Proposed`. No implementation exists. Every transport gives each payload at
+  the time that it arrives.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

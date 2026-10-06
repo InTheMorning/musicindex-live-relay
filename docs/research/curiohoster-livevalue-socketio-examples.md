@@ -271,3 +271,45 @@ Formatted payload:
 - Music payloads may include `chaptersUrl: null`, `enclosureUrl`, `feedGuid`, `feedUrl`, `medium`, and `itemGuid`.
 - Timing fields can be numeric. Observed fields include `startTime`, `duration`, `eventTimestamp`, and `broadcastTimestamp`.
 - A polling response can contain multiple Engine.IO packets separated by the record separator, including more than one `remoteValue` packet.
+
+## Capture Of 2026-10-06
+
+This section adds evidence. It does not change the observations above.
+
+The source is the test feed that the proposal author named in
+podcast-namespace discussion #547 on 2026-03-23:
+`https://curiocaster.com/rss/feed.xml`. On 2026-10-06 that feed held:
+
+```xml
+<podcast:liveValue uri="https://curiohoster.com/event?event_id=test" protocol="socket.io" />
+```
+
+The polling sequence of §Source, with `event_id=test`, gave three
+`remoteValue` events from 03:45:38 to 03:46:53 UTC on 2026-10-06. No
+repository holds the raw capture. It is at
+`~/build/musicindex-research/sources/captures/2026-10-06-curiohoster-event-test-remoteValue.txt`.
+
+Observations:
+
+- The server sends the current block at once when a client connects to the
+  namespace `/event`.
+- Each event has these fields: `image`, `title`, `line`, `description`,
+  `value`, `type`, `link`, `chaptersUrl`, `enclosureUrl`, `feedGuid`,
+  `itemGuid`, `eventGuid`, `eventAPI`, `duration`, `blockGuid`, `settings`,
+  `startTime` and `eventTimestamp`. Some events also have `feedUrl` and
+  `medium`.
+- `title` is the song. `line` is `[album, artist]`.
+- `image` is the album art of the song, and it changes with each song.
+- `value` has the nested form `{model: {type, method}, destinations}`.
+- A `split` can be a number (`100`) or a string (`"1"`) in the same stream.
+- `eventTimestamp` is `0`. No field places the block on the audio timeline of
+  a listener.
+
+The proposal author gave a revised payload on 2026-03-19 in discussion #547:
+`title`, `author`, `podcastName`, `image`, `link` and a flat
+`value {type, method, destinations}`. The server did not send that shape on
+2026-10-06.
+
+`musicindex-live-publisher` ADR 0010 uses these observations for the shape of
+its payload. This relay passes each payload through and does not depend on
+its fields.

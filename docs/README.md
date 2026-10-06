@@ -25,6 +25,9 @@ station runs continuously.
   — Accepted. Optional display routes and an image store for reserved events.
   Tasks 001 and 002 are done. The ADR needs an implementation review before
   it becomes Implemented.
+- [ADR 0004: A delayed listener timeline for Socket.IO](adr/0004-listener-timeline-delay.md)
+  — Proposed. The broadcaster sends the delay with each publish. Socket.IO and
+  `GET /remoteValue` wait for it. SSE and the other reads are instant
 
 ## Plans
 
@@ -76,3 +79,5 @@ after the reserved live items packets.
   seven viable credential models with evidence from the cloned prior art, and
   the availability defect that makes a decision necessary
 - [Curiohoster liveValue Socket.IO examples](research/curiohoster-livevalue-socketio-examples.md)
+  — the client sequence, three examples from 2026-05-15, and a capture of the
+  model server on 2026-10-06
