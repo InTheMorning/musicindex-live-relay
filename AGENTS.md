@@ -33,9 +33,8 @@ packet.
   unit stops after five failed starts.
 - The reserved class is not deployed on a host. `v4vmm` has no packet yet to
   reserve an event from the app.
-- ADR 0003, display state and artwork, has the status `Accepted`. Tasks 001
-  and 002 are done. ADR 0003 becomes `Implemented` only after an
-  implementation review, as for ADR 0001. That review does not exist yet.
+- ADR 0003, display state and artwork, has the status `Implemented`. The
+  review is `docs/reviews/adr-0003-implementation-review.md`.
   - A reserved event has a display state, with `POST` and
     `GET /v1/liveitems/{event_id}/display` and the SSE stream
     `/display/events`.
@@ -47,8 +46,9 @@ packet.
   - An ephemeral event gets `409 event_not_reserved`.
 - ADR 0004, a delayed listener timeline for Socket.IO, has the status
   `Accepted`. Its three task packets are done. ADR 0004 becomes
-  `Implemented` only after an implementation review, as for ADR 0001 and
-  ADR 0003. That review does not exist yet.
+  `Implemented` when the two open gates of
+  `docs/reviews/adr-0004-implementation-review.md` close: the deployment
+  and a Socket.IO app check.
   - The broadcaster sends the delay of a publish in the
     `Listener-Delay-Secs` header.
   - Socket.IO `remoteValue`, and the value it sends on connect, follow the

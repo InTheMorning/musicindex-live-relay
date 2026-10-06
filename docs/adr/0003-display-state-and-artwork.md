@@ -2,6 +2,11 @@
 
 ## Status
 
+Implemented - 2026-10-06.
+
+Implemented 2026-10-06: display state tasks 001 and 002 are done. The
+review is `docs/reviews/adr-0003-implementation-review.md`.
+
 Accepted - 2026-10-04.
 
 Amended 2026-10-05: "the state before it" in the image retention rule means

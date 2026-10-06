@@ -22,9 +22,8 @@ station runs continuously.
 - [ADR 0002: A live event is a lease](adr/0002-live-lease.md) — Implemented. An
   event goes off air when its broadcaster stops the keepalive
 - [ADR 0003: Display state and artwork](adr/0003-display-state-and-artwork.md)
-  — Accepted. Optional display routes and an image store for reserved events.
-  Tasks 001 and 002 are done. The ADR needs an implementation review before
-  it becomes Implemented.
+  — Implemented. Optional display routes and an image store for reserved
+  events
 - [ADR 0004: A delayed listener timeline for Socket.IO](adr/0004-listener-timeline-delay.md)
   — Accepted. The broadcaster sends the delay with each publish. Socket.IO and
   `GET /remoteValue` wait for it. SSE and the other reads are instant
@@ -90,7 +89,12 @@ operator accepts ADR 0005.
 
 - [ADR 0001 implementation review](reviews/adr-0001-implementation-review.md)
   — the named artifact for the `Implemented` status of ADR 0001
+- [ADR 0003 implementation review](reviews/adr-0003-implementation-review.md)
+  — the named artifact for the `Implemented` status of ADR 0003
 - [Live lease review checklist](reviews/live-lease-review-checklist.md)
+- [ADR 0004 implementation review](reviews/adr-0004-implementation-review.md)
+  — pass for the mechanical items. The deployment gate and the visual gate
+  are open
 - [ADR 0004 review checklist](reviews/adr-0004-review-checklist.md) — open
 - [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — open
 
