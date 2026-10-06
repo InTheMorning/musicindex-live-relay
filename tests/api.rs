@@ -3543,6 +3543,198 @@ mod reserved {
         }
 
         #[tokio::test]
+        async fn a_track_with_song_line_and_value_is_accepted() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let state_with_both = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "songLine": "Artist - Title",
+                    "value": { "eventGuid": "event123", "blockGuid": "block456" }
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_both).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_both);
+
+            let state_with_only_song_line = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "songLine": "Artist - Title"
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_only_song_line).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_only_song_line);
+
+            let state_with_only_value = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "value": { "eventGuid": "event789", "blockGuid": "block000" }
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_only_value).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_only_value);
+
+            // The limit counts characters: 1,024 two-byte characters pass.
+            let state_with_long_song_line = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "songLine": "é".repeat(1_024)
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_long_song_line).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_long_song_line);
+        }
+
+        #[tokio::test]
+        async fn a_subscriber_receives_states_with_song_line_and_value() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+
+            let first_state = next_sse_chunk(&mut body).await;
+            assert!(first_state.contains("event: display"), "{first_state}");
+
+            let state = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "songLine": "Artist - Title",
+                    "value": { "eventGuid": "event123", "blockGuid": "block456" }
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("event: display"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), state);
+        }
+
+        #[tokio::test]
+        async fn invalid_song_line_and_value_give_400() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+
+            let wrong: Vec<String> = [
+                // Empty songLine
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "songLine": ""
+                    }
+                }),
+                // songLine too long (1025 characters)
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "songLine": "a".repeat(1025)
+                    }
+                }),
+                // songLine not a string
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "songLine": 123
+                    }
+                }),
+                // value with third key
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "value": { "eventGuid": "event123", "blockGuid": "block456", "extra": "key" }
+                    }
+                }),
+                // value with empty blockGuid
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "value": { "eventGuid": "event123", "blockGuid": "" }
+                    }
+                }),
+                // blockGuid of 129 characters
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "value": { "eventGuid": "event123", "blockGuid": "b".repeat(129) }
+                    }
+                }),
+                // value missing blockGuid
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "value": { "eventGuid": "event123" }
+                    }
+                }),
+                // value missing eventGuid
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "value": { "blockGuid": "block456" }
+                    }
+                }),
+                // Unknown track key
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "unknown": "key"
+                    }
+                }),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect();
+
+            for body in wrong {
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&authorization),
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(error_code(response).await, "invalid_display", "{body}");
+            }
+
+            // No refused body changed the state.
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+        }
+
+        #[tokio::test]
         async fn a_display_publish_does_not_move_the_lease() {
             let (router, state, clock, _dir, _) = display_app();
             let reserved = reserve_ok(router.clone(), None).await;

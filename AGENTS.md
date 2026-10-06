@@ -58,8 +58,10 @@ packet.
   - A lease expiry joins the listener timeline with the delay of the
     event's last publish, so its `{}` never arrives before the last block.
 - ADR 0005, two optional display track keys for the HLS tagger, has the
-  status `Proposed`. No implementation exists. A display track still accepts
-  exactly `artist`, `title` and `artwork`.
+  status `Accepted`. Its task 001 is done. A display track has `artist`,
+  `title` and `artwork`, and can also have `songLine` and `value`. ADR 0005
+  becomes `Implemented` when the deployment item of
+  `docs/reviews/adr-0005-review-checklist.md` passes.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

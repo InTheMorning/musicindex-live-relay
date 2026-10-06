@@ -28,7 +28,7 @@ station runs continuously.
   — Accepted. The broadcaster sends the delay with each publish. Socket.IO and
   `GET /remoteValue` wait for it. SSE and the other reads are instant
 - [ADR 0005: The display state carries the song line and the value identity](adr/0005-display-song-line-and-value.md)
-  — Proposed. Two optional track keys, `songLine` and `value`, for the HLS
+  — Accepted. Two optional track keys, `songLine` and `value`, for the HLS
   tagger of publisher ADR 0009
 
 ## Plans
@@ -41,7 +41,7 @@ station runs continuously.
 - [Listener timeline phase plan](plans/adr-0004-listener-timeline-phase-plan.md)
   — Ready. Three packets
 - [Display pairing phase plan](plans/adr-0005-display-pairing-phase-plan.md)
-  — Proposed. One packet
+  — Ready. One packet
 
 ## Tasks
 
@@ -75,10 +75,11 @@ sequential. Ready - 2026-10-06.
 - [002 — The listener timeline](tasks/listener-timeline-task-002-listener-timeline.md)
 - [003 — Expiry, delete and documents](tasks/listener-timeline-task-003-expiry-delete-and-docs.md)
 
-Packet for the display pairing plan. ADR 0005 governs it. It starts after the
-operator accepts ADR 0005.
+Packet for the display pairing plan. ADR 0005 governs it. Ready -
+2026-10-06.
 
 - [001 — The song line and the value identity](tasks/display-pairing-task-001-song-line-and-value.md)
+  — Implemented - 2026-10-06
 
 ## Runbooks
 
@@ -96,7 +97,8 @@ operator accepts ADR 0005.
   — pass for the mechanical items. The deployment gate and the visual gate
   are open
 - [ADR 0004 review checklist](reviews/adr-0004-review-checklist.md) — open
-- [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — open
+- [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — open.
+  The deployment item remains
 
 ## Research
 

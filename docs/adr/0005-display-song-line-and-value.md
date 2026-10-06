@@ -2,6 +2,12 @@
 
 ## Status
 
+Accepted - 2026-10-06.
+
+Accepted 2026-10-06 by the operator. Item 1 of §Before Acceptance is done:
+publisher ADR 0012 is accepted. Item 2, the deployment order, is a gate of
+the review checklist.
+
 Proposed 2026-10-06.
 
 Class: situational. Supersede this record when the tagger of

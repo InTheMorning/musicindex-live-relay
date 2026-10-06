@@ -513,15 +513,23 @@ A display state is one JSON object:
   "track": {
     "artist": "Artist",
     "title": "Title",
-    "artwork": { "sha256": "<64 lowercase hex characters>", "mime": "image/jpeg" }
+    "artwork": { "sha256": "<64 lowercase hex characters>", "mime": "image/jpeg" },
+    "songLine": "Artist - Title",
+    "value": { "eventGuid": "event123", "blockGuid": "block456" }
   }
 }
 ```
 
 - The object has only the key `track`.
 - `track` is `null` when nothing plays. Send `null` explicitly.
-- A `track` object has only the keys `artist`, `title` and `artwork`.
-  `artist` and `title` are strings.
+- A `track` object has the required keys `artist`, `title` and `artwork`.
+  It can optionally have `songLine` and `value`. `artist` and `title` are
+  strings.
+- `songLine` is an optional string of 1 to 1,024 characters. It is the ICY
+  title line that the broadcaster sends (ADR 0005).
+- `value` is an optional object with only the keys `eventGuid` and
+  `blockGuid`. Each is a string of 1 to 128 characters. It names the live
+  value block of the track (ADR 0005).
 - `artwork` has one of three forms:
   - `{"sha256": "…", "mime": "…"}`. `sha256` is 64 lowercase hexadecimal
     characters. `mime` is `image/jpeg` or `image/png`. The relay must hold

@@ -65,6 +65,11 @@ const MAX_LABEL_CHARS: usize = 200;
 const DISPLAY_BODY_LIMIT_BYTES: usize = 8 * 1024;
 /// The maximum length of an `artwork.url`, in characters (ADR 0003).
 const MAX_ARTWORK_URL_CHARS: usize = 2_048;
+/// The maximum length of a display track `songLine`, in characters (ADR 0005).
+const MAX_SONG_LINE_CHARS: usize = 1_024;
+/// The maximum length of a display track `eventGuid` or `blockGuid`, in
+/// characters (ADR 0005).
+const MAX_VALUE_GUID_CHARS: usize = 128;
 /// The image types that an `artwork.mime` can name (ADR 0003).
 const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 /// The default body limit of an image upload, in bytes (ADR 0003).
@@ -1847,12 +1852,36 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     }
 
     let track = track.as_object().ok_or_else(invalid)?;
-    if track.len() != 3 || !track.get("artist").is_some_and(Value::is_string) {
+    // `artist`, `title` and `artwork` are required. `songLine` and `value`
+    // are optional (ADR 0005). Any other key makes the state invalid.
+    let known_keys = ["artist", "title", "artwork", "songLine", "value"];
+    if !track.keys().all(|key| known_keys.contains(&key.as_str())) {
+        return Err(invalid());
+    }
+    if !track.get("artist").is_some_and(Value::is_string) {
         return Err(invalid());
     }
     if !track.get("title").is_some_and(Value::is_string) {
         return Err(invalid());
     }
+    if let Some(song_line) = track.get("songLine")
+        && !is_text_of_length(song_line, MAX_SONG_LINE_CHARS)
+    {
+        return Err(invalid());
+    }
+    if let Some(value) = track.get("value") {
+        let value = value.as_object().ok_or_else(invalid)?;
+        let valid = value.len() == 2
+            && ["eventGuid", "blockGuid"].iter().all(|key| {
+                value
+                    .get(*key)
+                    .is_some_and(|guid| is_text_of_length(guid, MAX_VALUE_GUID_CHARS))
+            });
+        if !valid {
+            return Err(invalid());
+        }
+    }
+
     let artwork = track.get("artwork").ok_or_else(invalid)?;
     if artwork.is_null() {
         return Ok(state);
@@ -1893,6 +1922,13 @@ fn is_valid_artwork_url(url: &str) -> bool {
     };
     (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
         && !rest.is_empty()
+}
+
+/// Returns `true` for a string of 1 to `max_chars` characters.
+fn is_text_of_length(value: &Value, max_chars: usize) -> bool {
+    value
+        .as_str()
+        .is_some_and(|text| (1..=max_chars).contains(&text.chars().count()))
 }
 
 /// Returns `true` for exactly 64 lowercase hexadecimal characters.

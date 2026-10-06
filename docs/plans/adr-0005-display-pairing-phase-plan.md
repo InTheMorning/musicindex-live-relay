@@ -1,7 +1,7 @@
 # ADR 0005 Display Pairing: Phase Plan
 
-Status: Proposed 2026-10-06. This plan does not make rules. ADR 0005 owns
-them. The packet starts after the operator accepts ADR 0005.
+Status: Ready 2026-10-06. This plan does not make rules. ADR 0005 owns
+them. The operator accepted ADR 0005 on 2026-10-06.
 
 ## Goal
 

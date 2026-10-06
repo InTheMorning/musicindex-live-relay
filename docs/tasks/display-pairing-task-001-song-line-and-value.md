@@ -1,6 +1,6 @@
 # Display Pairing Task 001: The Song Line And The Value Identity
 
-Status: Ready after the operator accepts ADR 0005.
+Status: Implemented - 2026-10-06.
 
 Every criterion is mechanical.
 
@@ -122,3 +122,19 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-06. `Cargo.lock` did not change. The full gate passes.
+
+No existing test changed. The review made four changes to the first
+implementation:
+
+- Two constants, `MAX_SONG_LINE_CHARS` and `MAX_VALUE_GUID_CHARS`, replace
+  the literal limits.
+- One helper, `is_text_of_length`, checks `songLine`, `eventGuid` and
+  `blockGuid`.
+- A test publishes a `songLine` of 1,024 two-byte characters. It shows that
+  the limit counts characters, not bytes.
+- `docs/interoperability.md` gives the track shape, as step 4 of this packet
+  says.
