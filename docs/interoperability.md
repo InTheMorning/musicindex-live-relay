@@ -169,7 +169,8 @@ item. Tasks 001 and 002 of the display state plan implement them:
 
 - `POST /v1/liveitems/{event_id}/display` publishes a display state. It needs
   the broadcaster token.
-- `GET /v1/liveitems/{event_id}/display` gives the present display state.
+- `GET /v1/liveitems/{event_id}/display` gives the present display state,
+  with `seq`, the `id` of the same state on `/display/events`.
 - `GET /v1/liveitems/{event_id}/display/events` is an SSE stream of `display`
   events, with its own `seq` and its own replay buffer. A client with no
   `Last-Event-ID` first gets the present display state. `/events` does not do

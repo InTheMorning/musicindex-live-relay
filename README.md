@@ -614,8 +614,23 @@ examines `artwork_missing` and the stored type last, after the rate limit.
 GET /v1/liveitems/{event_id}/display
 ```
 
-Returns the present display state. Returns `{"track": null}` when the item
-has no display state.
+Returns the present display state, with its display sequence number:
+
+```json
+{
+  "seq": 12,
+  "track": {"artist": "Artist", "title": "Title", "artwork": null}
+}
+```
+
+- `seq` is the `id` of the same state on `/display/events`. A client can read
+  this route, and then open the stream with `Last-Event-ID` set to a lower
+  value to get the states before it. The replay buffer holds the last 100
+  states.
+- Before the first publish, and after a restart, the body is
+  `{"seq": 0, "track": null}`.
+- `track` has the shape of §The Display State. Ignore an unknown top-level
+  key.
 
 Status codes:
 

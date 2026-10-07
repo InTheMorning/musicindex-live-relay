@@ -7,6 +7,12 @@ Implemented - 2026-10-06.
 Implemented 2026-10-06: display state tasks 001 and 002 are done. The
 review is `docs/reviews/adr-0003-implementation-review.md`.
 
+Amended 2026-10-06: the body of `GET /display` also has `seq`, the display
+`seq` of the present state. It is the `id` of the same state on
+`/display/events`. A client can thus read the state and then replay recent
+states with `Last-Event-ID`. The `track` key does not change. The request came
+from `citizenradio`. The amendment adds a key and reverses no decision.
+
 Accepted - 2026-10-04.
 
 Amended 2026-10-05: "the state before it" in the image retention rule means
@@ -106,6 +112,10 @@ The display state of an event is one JSON object:
 
 - It gives the present display state. It gives `{"track": null}` when the
   event has none.
+- The body also has `seq`, the display `seq` of that state. It is the `id`
+  of the same state on `/display/events`. The relay reads the state and
+  `seq` under one lock. Before the first publish, the body is
+  `{"seq": 0, "track": null}`. Added 2026-10-06.
 
 `GET /v1/liveitems/{event_id}/display/events`
 

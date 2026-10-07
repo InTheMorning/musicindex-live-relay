@@ -923,15 +923,22 @@ impl RelayState {
     }
 
     /// Returns the present display state of a reserved event, or
-    /// `{"track": null}` when it has none (ADR 0003).
+    /// `{"track": null}` when it has none (ADR 0003). The body also has
+    /// `seq`, the display sequence number of that state. It is the `id` of
+    /// the same state on `/display/events`. The relay reads the state and
+    /// `seq` under one lock.
     ///
     /// # Errors
     ///
     /// Returns `404 event_not_found` or `409 event_not_reserved`.
     pub async fn display_state(&self, event_id: &str) -> Result<Value, ApiError> {
         let (_, event) = self.get_reserved_entry(event_id).await?;
-        let state = event.display.read().await.state.clone();
-        Ok(state)
+        let display = event.display.read().await;
+        let mut body = display.state.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("seq".to_owned(), Value::from(display.seq));
+        }
+        Ok(body)
     }
 
     /// Stores an image for a reserved event (ADR 0003).

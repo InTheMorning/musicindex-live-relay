@@ -3136,10 +3136,31 @@ mod reserved {
             published
         }
 
+        /// Reads `GET /display` and gives the state without its `seq`.
         async fn read_display(router: axum::Router, event_id: &str) -> Value {
+            read_display_with_seq(router, event_id).await.1
+        }
+
+        /// Reads `GET /display` and gives its `seq` and the state.
+        async fn read_display_with_seq(router: axum::Router, event_id: &str) -> (u64, Value) {
             let response = get(router, format!("/v1/liveitems/{event_id}/display")).await;
             assert_eq!(response.status(), StatusCode::OK);
-            read_json(response).await
+            let mut body: Value = read_json(response).await;
+            let seq = body
+                .as_object_mut()
+                .and_then(|object| object.remove("seq"))
+                .and_then(|seq| seq.as_u64())
+                .unwrap_or_else(|| panic!("GET /display has no numeric seq"));
+            (seq, body)
+        }
+
+        /// Gives the `id` of an SSE chunk.
+        fn chunk_id(chunk: &str) -> u64 {
+            chunk
+                .lines()
+                .find_map(|line| line.strip_prefix("id: "))
+                .and_then(|id| id.parse().ok())
+                .unwrap_or_else(|| panic!("no id line: {chunk}"))
         }
 
         async fn open_stream(
@@ -3253,6 +3274,66 @@ mod reserved {
             let mut resumed =
                 open_display_stream(router.clone(), &reserved.event_id, Some("1")).await;
             assert_no_frame(&mut resumed).await;
+        }
+
+        #[tokio::test]
+        async fn get_display_gives_seq_0_and_a_null_track_before_the_first_publish() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let response = get(
+                router.clone(),
+                format!("/v1/liveitems/{}/display", reserved.event_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = read_json(response).await;
+            assert_eq!(body, json!({ "seq": 0, "track": null }));
+        }
+
+        #[tokio::test]
+        async fn the_get_display_seq_is_the_stream_id_of_the_same_state() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            for index in 0..3 {
+                let state = track(json!({ "url": format!("https://example.com/{index}.jpg") }));
+                publish_display_ok(router.clone(), &reserved, &state).await;
+                let (seq, read_back) =
+                    read_display_with_seq(router.clone(), &reserved.event_id).await;
+                assert_eq!(read_back, state);
+
+                // A connect with no Last-Event-ID first gets the present state.
+                let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+                let chunk = next_sse_chunk(&mut body).await;
+                assert_eq!(chunk_id(&chunk), seq, "{chunk}");
+                assert_eq!(chunk_data(&chunk), state);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stream_from_the_get_display_seq_minus_one_replays_that_state() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let first = track(json!({ "url": "https://example.com/first.jpg" }));
+            let second = track(json!({ "url": "https://example.com/second.jpg" }));
+            publish_display_ok(router.clone(), &reserved, &first).await;
+            publish_display_ok(router.clone(), &reserved, &second).await;
+
+            let (seq, _) = read_display_with_seq(router.clone(), &reserved.event_id).await;
+            let last_event_id = (seq - 2).to_string();
+            let mut body = open_display_stream(
+                router.clone(),
+                &reserved.event_id,
+                Some(last_event_id.as_str()),
+            )
+            .await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert_eq!(chunk_id(&chunk), seq - 1, "{chunk}");
+            assert_eq!(chunk_data(&chunk), first);
+            let chunk = next_sse_chunk(&mut body).await;
+            assert_eq!(chunk_id(&chunk), seq, "{chunk}");
+            assert_eq!(chunk_data(&chunk), second);
         }
 
         #[tokio::test]
