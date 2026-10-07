@@ -31,7 +31,7 @@ station runs continuously.
   — Implemented. Two optional track keys, `songLine` and `value`, for the HLS
   tagger of publisher ADR 0009
 - [ADR 0006: The display track carries the album](adr/0006-display-album.md)
-  — Accepted. One optional track key, `album`, so an app shows the album of
+  — Implemented. One optional track key, `album`, so an app shows the album of
   each track
 
 ## Plans
@@ -110,7 +110,8 @@ Packet for the display album plan. ADR 0006 governs it. Ready - 2026-10-06.
   The visual item remains
 - [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0005
-- [ADR 0006 review checklist](reviews/adr-0006-review-checklist.md) — open
+- [ADR 0006 review checklist](reviews/adr-0006-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0006
 
 ## Research
 

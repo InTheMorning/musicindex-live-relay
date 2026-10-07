@@ -62,9 +62,7 @@ packet.
   status `Implemented`. A display track has `artist`, `title` and `artwork`,
   and can also have `songLine` and `value`.
 - ADR 0006, the optional display track key `album`, has the status
-  `Accepted`. Its task 001 is done. A display track can also have `album`.
-  ADR 0006 becomes `Implemented` when the deployment item of
-  `docs/reviews/adr-0006-review-checklist.md` passes.
+  `Implemented`. A display track can also have `album`.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

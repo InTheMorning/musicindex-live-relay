@@ -1,8 +1,7 @@
 # ADR 0006 Review Checklist
 
-Status: open - 2026-10-06. Task 001 is done, and each item above
-§Cross-Repository passes. The deployment item is open. ADR 0006 becomes
-`Implemented` only when each item passes.
+Status: closed - 2026-10-06. Each item passes. This checklist is the named
+artifact for the `Implemented` status of ADR 0006.
 
 ## Invariants
 
@@ -24,4 +23,6 @@ Status: open - 2026-10-06. Task 001 is done, and each item above
 
 ## Cross-Repository
 
-- [ ] This relay is deployed before a publisher of ADR 0013 sends the key.
+- [x] This relay is deployed before a publisher of ADR 0013 sends the key.
+  Done 2026-10-06 on `api.musicindex.org`. The display state had `album` for
+  a V4V track and for a track that is not V4V.

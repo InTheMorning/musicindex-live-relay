@@ -2,6 +2,12 @@
 
 ## Status
 
+Implemented - 2026-10-06.
+
+Implemented 2026-10-06: task 001 is done, and the relay is deployed before
+the publisher. The named artifact is
+`docs/reviews/adr-0006-review-checklist.md`, with no open item.
+
 Accepted - 2026-10-06.
 
 Accepted 2026-10-06 by the operator. Item 1 of §Before Acceptance is done:
