@@ -28,7 +28,7 @@ station runs continuously.
   — Accepted. The broadcaster sends the delay with each publish. Socket.IO and
   `GET /remoteValue` wait for it. SSE and the other reads are instant
 - [ADR 0005: The display state carries the song line and the value identity](adr/0005-display-song-line-and-value.md)
-  — Accepted. Two optional track keys, `songLine` and `value`, for the HLS
+  — Implemented. Two optional track keys, `songLine` and `value`, for the HLS
   tagger of publisher ADR 0009
 
 ## Plans
@@ -94,11 +94,12 @@ Packet for the display pairing plan. ADR 0005 governs it. Ready -
   — the named artifact for the `Implemented` status of ADR 0003
 - [Live lease review checklist](reviews/live-lease-review-checklist.md)
 - [ADR 0004 implementation review](reviews/adr-0004-implementation-review.md)
-  — pass for the mechanical items. The deployment gate and the visual gate
-  are open
-- [ADR 0004 review checklist](reviews/adr-0004-review-checklist.md) — open
-- [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — open.
-  The deployment item remains
+  — pass for the mechanical items and the deployment. The visual gate is
+  open
+- [ADR 0004 review checklist](reviews/adr-0004-review-checklist.md) — open.
+  The visual item remains
+- [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0005
 
 ## Research
 

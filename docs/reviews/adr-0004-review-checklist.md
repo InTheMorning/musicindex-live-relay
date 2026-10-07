@@ -1,7 +1,7 @@
 # ADR 0004 Review Checklist
 
-Status: open - 2026-10-06. Each mechanical item passes. The deployment item
-and the visual item are open. ADR 0004 becomes `Implemented` only when each
+Status: open - 2026-10-06. Each mechanical item and the deployment item
+pass. The visual item is open. ADR 0004 becomes `Implemented` only when each
 item passes.
 
 ## Invariants
@@ -38,7 +38,9 @@ item passes.
 
 - [x] `musicindex-live-publisher` ADR 0011 is accepted. Without it, the delay
   applies two times.
-- [ ] The relay is deployed before a publisher that sends the header.
+- [x] The relay is deployed before a publisher that sends the header. Done
+  2026-10-06. `docs/reviews/adr-0004-implementation-review.md` gives the
+  measured delay.
 
 ## Visual
 

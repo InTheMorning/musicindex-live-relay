@@ -2,7 +2,9 @@
 
 ## Status
 
-Pass - 2026-10-06 (mechanical gates). The deployment and visual gates remain open. This review is the named artifact for the `Implemented` status of ADR 0004 when those gates close.
+Pass - 2026-10-06. The mechanical gates and the deployment gate pass. The
+visual gate is open. This review is the named artifact for the `Implemented`
+status of ADR 0004 when that gate closes.
 
 ## Reviewed Artifacts
 
@@ -135,11 +137,18 @@ Merge when both open gates close. Each mechanical invariant has a passing test.
 The code follows the ADR requirements. Lock ordering is correct and enforced by
 a unit test. The tests cover edge cases.
 
-Keep the deployment gate open:
+The deployment gate passed on 2026-10-06:
 
-- Deploy this relay before a publisher that sends the header.
-- Then publish with the new publisher, and make sure that `GET /remoteValue`
-  changes one delay after `GET /metadata`.
+On 2026-10-06 the operator deployed this relay to `api.musicindex.org`, then
+publisher `r83` (commit `9dbd0a1`) with `stream_delay_secs = 15`. A poller
+read `/metadata`, `/remoteValue` and `/display` of a reserved event two times
+each second:
+
+- With no delay setting, `remoteValue` changed in the same poll as
+  `metadata`.
+- With 15 seconds, `remoteValue` changed 15.5 s after `metadata` for a dead
+  block, and 15.6 s after it for a track block.
+- `display` changed in the same poll as `metadata`.
 
 Keep the visual gate open:
 

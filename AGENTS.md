@@ -31,8 +31,9 @@ packet.
 - `docs/runbooks/reserved-live-items.md` holds the operator procedures for
   reserved events. A corrupt state file stops the relay at startup, and the
   unit stops after five failed starts.
-- The reserved class is not deployed on a host. `v4vmm` has no packet yet to
-  reserve an event from the app.
+- The relay runs on `api.musicindex.org`, and the operator's station uses a
+  reserved event there. `v4vmm` has no packet yet to reserve an event from
+  the app.
 - ADR 0003, display state and artwork, has the status `Implemented`. The
   review is `docs/reviews/adr-0003-implementation-review.md`.
   - A reserved event has a display state, with `POST` and
@@ -46,9 +47,9 @@ packet.
   - An ephemeral event gets `409 event_not_reserved`.
 - ADR 0004, a delayed listener timeline for Socket.IO, has the status
   `Accepted`. Its three task packets are done. ADR 0004 becomes
-  `Implemented` when the two open gates of
-  `docs/reviews/adr-0004-implementation-review.md` close: the deployment
-  and a Socket.IO app check.
+  `Implemented` when the visual gate of
+  `docs/reviews/adr-0004-implementation-review.md` closes: a Socket.IO app
+  check. The relay runs on `api.musicindex.org`.
   - The broadcaster sends the delay of a publish in the
     `Listener-Delay-Secs` header.
   - Socket.IO `remoteValue`, and the value it sends on connect, follow the
@@ -58,10 +59,8 @@ packet.
   - A lease expiry joins the listener timeline with the delay of the
     event's last publish, so its `{}` never arrives before the last block.
 - ADR 0005, two optional display track keys for the HLS tagger, has the
-  status `Accepted`. Its task 001 is done. A display track has `artist`,
-  `title` and `artwork`, and can also have `songLine` and `value`. ADR 0005
-  becomes `Implemented` when the deployment item of
-  `docs/reviews/adr-0005-review-checklist.md` passes.
+  status `Implemented`. A display track has `artist`, `title` and `artwork`,
+  and can also have `songLine` and `value`.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

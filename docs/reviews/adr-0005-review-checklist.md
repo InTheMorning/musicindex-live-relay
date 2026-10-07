@@ -1,8 +1,7 @@
 # ADR 0005 Review Checklist
 
-Status: open - 2026-10-06. Task 001 is done, and each item above
-§Cross-Repository passes. The deployment item is open. ADR 0005 becomes
-`Implemented` only when each item passes.
+Status: closed - 2026-10-06. Each item passes. This checklist is the named
+artifact for the `Implemented` status of ADR 0005.
 
 ## Invariants
 
@@ -24,4 +23,8 @@ Status: open - 2026-10-06. Task 001 is done, and each item above
 
 ## Cross-Repository
 
-- [ ] This relay is deployed before a publisher of ADR 0012 sends the keys.
+- [x] This relay is deployed before a publisher of ADR 0012 sends the keys.
+  Done 2026-10-06. On `api.musicindex.org`, publisher `r83` sent a display
+  state with `songLine` and no `value` before its payload. In the next poll,
+  it sent the same state again with the `value` of that payload. The relay
+  accepted both.
