@@ -70,6 +70,8 @@ const MAX_SONG_LINE_CHARS: usize = 1_024;
 /// The maximum length of a display track `eventGuid` or `blockGuid`, in
 /// characters (ADR 0005).
 const MAX_VALUE_GUID_CHARS: usize = 128;
+/// The maximum length of a display track `album`, in characters (ADR 0006).
+const MAX_ALBUM_CHARS: usize = 1_024;
 /// The image types that an `artwork.mime` can name (ADR 0003).
 const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 /// The default body limit of an image upload, in bytes (ADR 0003).
@@ -1852,9 +1854,9 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     }
 
     let track = track.as_object().ok_or_else(invalid)?;
-    // `artist`, `title` and `artwork` are required. `songLine` and `value`
-    // are optional (ADR 0005). Any other key makes the state invalid.
-    let known_keys = ["artist", "title", "artwork", "songLine", "value"];
+    // `artist`, `title` and `artwork` are required. `songLine`, `value` and
+    // `album` are optional (ADR 0005, ADR 0006). Any other key makes the state invalid.
+    let known_keys = ["artist", "title", "artwork", "songLine", "value", "album"];
     if !track.keys().all(|key| known_keys.contains(&key.as_str())) {
         return Err(invalid());
     }
@@ -1880,6 +1882,11 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
         if !valid {
             return Err(invalid());
         }
+    }
+    if let Some(album) = track.get("album")
+        && !is_text_of_length(album, MAX_ALBUM_CHARS)
+    {
+        return Err(invalid());
     }
 
     let artwork = track.get("artwork").ok_or_else(invalid)?;

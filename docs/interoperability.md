@@ -199,12 +199,12 @@ A consumer must know these facts:
 - The display path does not change the live value. `remoteValue`, `/events`,
   Socket.IO and the metadata route do not send a display state. The display
   `seq` and the live value `seq` are different counters.
-- A display track has the keys `artist`, `title` and `artwork`. It can also
-  have `songLine` and `value` (ADR 0005). Any other key gets
-  `400 invalid_display`. The relay stores and sends the state as it receives
-  it. Publisher ADR 0012 is the only sender of the two keys. Deploy the relay
-  before a publisher that sends them, because an older relay refuses each
-  such state.
+- A display track has the keys `artist`, `title` and `artwork`, and can also
+  have `songLine`, `value` and `album` (ADR 0005, ADR 0006). Other keys get
+  `400 invalid_display`. The relay stores and sends the track as received.
+  Publisher ADR 0012 sends `songLine` and `value`. Publisher ADR 0013 sends
+  `album`. Deploy the relay before a publisher sends these keys, because an
+  older relay refuses each such track.
 - An `artwork.sha256` in a display state must name an image that the item
   holds. Else the publish gets `409 artwork_missing`. Its `mime` must be the
   stored type, else the publish gets `400 invalid_display`. The relay gets

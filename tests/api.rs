@@ -3482,7 +3482,7 @@ mod reserved {
                 json!({ "track": { "artist": 1, "title": "Title", "artwork": null } }),
                 json!({ "track": { "artist": "Artist", "title": null, "artwork": null } }),
                 json!({ "track": {
-                    "artist": "Artist", "title": "Title", "artwork": null, "album": "Album"
+                    "artist": "Artist", "title": "Title", "artwork": null, "genre": "Genre"
                 } }),
                 track(json!("https://example.com/cover.jpg")),
                 track(json!({})),
@@ -3732,6 +3732,152 @@ mod reserved {
                 read_display(router.clone(), &reserved.event_id).await,
                 json!({ "track": null })
             );
+        }
+
+        #[tokio::test]
+        async fn a_track_with_album_is_accepted() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let state_with_album = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "album": "Album Name"
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_album).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_album);
+        }
+
+        #[tokio::test]
+        async fn a_track_with_album_song_line_and_value_is_accepted() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let state_with_all = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "album": "Album Name",
+                    "songLine": "Artist - Title",
+                    "value": { "eventGuid": "event123", "blockGuid": "block456" }
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_all).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_all);
+        }
+
+        #[tokio::test]
+        async fn an_album_of_1024_two_byte_characters_is_accepted() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+
+            let state_with_long_album = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "album": "é".repeat(1_024)
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state_with_long_album).await;
+            let read_back = read_display(router.clone(), &reserved.event_id).await;
+            assert_eq!(read_back, state_with_long_album);
+        }
+
+        #[tokio::test]
+        async fn invalid_album_gives_400() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+
+            let wrong: Vec<String> = [
+                // Empty album
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "album": ""
+                    }
+                }),
+                // Album too long (1025 characters)
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "album": "a".repeat(1025)
+                    }
+                }),
+                // Album is null
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "album": null
+                    }
+                }),
+                // Album is a number
+                json!({
+                    "track": {
+                        "artist": "Artist",
+                        "title": "Title",
+                        "artwork": null,
+                        "album": 123
+                    }
+                }),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect();
+
+            for body in wrong {
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&authorization),
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(error_code(response).await, "invalid_display", "{body}");
+            }
+
+            // No refused body changed the state.
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                json!({ "track": null })
+            );
+        }
+
+        #[tokio::test]
+        async fn a_subscriber_receives_album() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+
+            let first_state = next_sse_chunk(&mut body).await;
+            assert!(first_state.contains("event: display"), "{first_state}");
+
+            let state = json!({
+                "track": {
+                    "artist": "Artist",
+                    "title": "Title",
+                    "artwork": null,
+                    "album": "Album Name"
+                }
+            });
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("event: display"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), state);
         }
 
         #[tokio::test]

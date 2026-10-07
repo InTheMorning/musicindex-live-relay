@@ -30,6 +30,9 @@ station runs continuously.
 - [ADR 0005: The display state carries the song line and the value identity](adr/0005-display-song-line-and-value.md)
   — Implemented. Two optional track keys, `songLine` and `value`, for the HLS
   tagger of publisher ADR 0009
+- [ADR 0006: The display track carries the album](adr/0006-display-album.md)
+  — Accepted. One optional track key, `album`, so an app shows the album of
+  each track
 
 ## Plans
 
@@ -41,6 +44,8 @@ station runs continuously.
 - [Listener timeline phase plan](plans/adr-0004-listener-timeline-phase-plan.md)
   — Ready. Three packets
 - [Display pairing phase plan](plans/adr-0005-display-pairing-phase-plan.md)
+  — Ready. One packet
+- [Display album phase plan](plans/adr-0006-display-album-phase-plan.md)
   — Ready. One packet
 
 ## Tasks
@@ -81,6 +86,11 @@ Packet for the display pairing plan. ADR 0005 governs it. Ready -
 - [001 — The song line and the value identity](tasks/display-pairing-task-001-song-line-and-value.md)
   — Implemented - 2026-10-06
 
+Packet for the display album plan. ADR 0006 governs it. Ready - 2026-10-06.
+
+- [001 — The album key](tasks/display-album-task-001-album-key.md)
+  — Implemented - 2026-10-06
+
 ## Runbooks
 
 - [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
@@ -100,6 +110,7 @@ Packet for the display pairing plan. ADR 0005 governs it. Ready -
   The visual item remains
 - [ADR 0005 review checklist](reviews/adr-0005-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0005
+- [ADR 0006 review checklist](reviews/adr-0006-review-checklist.md) — open
 
 ## Research
 
