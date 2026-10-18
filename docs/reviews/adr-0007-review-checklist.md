@@ -58,5 +58,9 @@ The operator completed these items on `api.musicindex.org` on 2026-10-18.
   `packaging/env/live-relay.compose.env` in the Stophammer deployment, and
   recreated the container. The second run passed. Network B got `200`.
 - The gateway address belongs to the Compose network. If the network is
-  made again with a different subnet, `TRUSTED_PROXIES` must change too.
-  `README.md` §The Client Address states this.
+  made again with a different subnet, the gateway changes. The amendment of
+  2026-10-18 lets `TRUSTED_PROXIES` hold a range for this reason.
+- After the amendment of 2026-10-18, the operator set
+  `TRUSTED_PROXIES=127.0.0.1,::1,172.16.0.0/12` and did check 2 again on
+  2026-10-18. Network B got `200`. The log had no warning for an ignored
+  `X-Real-IP`.
