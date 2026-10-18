@@ -109,6 +109,25 @@ The reserve response holds the fields of the create response, and `label`.
 `events_url` from it. Do not rename them. The status codes `201`, `401`,
 `403`, `404`, and `409` each have one meaning. See `README.md`.
 
+### A client has listener limits
+
+ADR 0007 is accepted. It is not implemented. After the implementation, these
+limits apply to the listener connections of one client address: Socket.IO
+connections, `/events` streams and `/display/events` streams.
+
+| Limit | Default | Result at the limit |
+|---|---|---|
+| Open listener connections | 50 | Socket.IO: `{}`, then a disconnect. SSE: `429 listener_limit_reached`. |
+| New listener connections in one second | 10 | The same |
+| Open Socket.IO connections of the full relay | 20000 | Socket.IO: `{}`, then a disconnect |
+
+- After `{}` and a disconnect, the Socket.IO client does not reconnect. An
+  app then uses the static `<podcast:value>` of the live item.
+- Behind a proxy, the client address is `X-Real-IP` from a trusted proxy.
+  Listeners behind one shared address share one limit.
+- `v4vmm` and the publisher open no listener connection, so the limits do not
+  apply to them.
+
 ### An idle event expires
 
 The reaper removes an ephemeral event when its last activity is older than the

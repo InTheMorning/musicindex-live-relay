@@ -34,7 +34,7 @@ station runs continuously.
   — Implemented. One optional track key, `album`, so an app shows the album of
   each track
 - [ADR 0007: Listener connection limits for each client](adr/0007-listener-connection-limits.md)
-  — Proposed. A limit for each client address on open listener connections
+  — Accepted. A limit for each client address on open listener connections
   and on new connects, a global Socket.IO limit, and trust of `X-Real-IP`
   from a proxy
 
@@ -51,6 +51,8 @@ station runs continuously.
   — Ready. One packet
 - [Display album phase plan](plans/adr-0006-display-album-phase-plan.md)
   — Ready. One packet
+- [Listener limits phase plan](plans/adr-0007-listener-limits-phase-plan.md)
+  — Ready. Two packets
 
 ## Tasks
 
@@ -95,6 +97,13 @@ Packet for the display album plan. ADR 0006 governs it. Ready - 2026-10-06.
 - [001 — The album key](tasks/display-album-task-001-album-key.md)
   — Implemented - 2026-10-06
 
+Packets for the listener limits plan. ADR 0007 governs them. Ready - 2026-10-18.
+
+- [001 — The client address and the SSE limits](tasks/listener-limits-task-001-client-address-and-sse.md)
+  — Ready - 2026-10-18
+- [002 — The Socket.IO limits](tasks/listener-limits-task-002-socket-io.md)
+  — Ready - 2026-10-18
+
 ## Runbooks
 
 - [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
@@ -116,6 +125,7 @@ Packet for the display album plan. ADR 0006 governs it. Ready - 2026-10-06.
   named artifact for the `Implemented` status of ADR 0005
 - [ADR 0006 review checklist](reviews/adr-0006-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0006
+- [ADR 0007 review checklist](reviews/adr-0007-review-checklist.md) — open
 
 ## Research
 

@@ -64,7 +64,7 @@ packet.
 - ADR 0006, the optional display track key `album`, has the status
   `Implemented`. A display track can also have `album`.
 - ADR 0007, listener connection limits for each client, has the status
-  `Proposed`. It adds a limit for each client address on listener
+  `Accepted`. Its plan is `docs/plans/adr-0007-listener-limits-phase-plan.md`. It adds a limit for each client address on listener
   connections, a global Socket.IO limit, and trust of `X-Real-IP` from a
   proxy. Until it is implemented, Socket.IO has no connection limit.
 - The broadcaster identity model is open. The options are in

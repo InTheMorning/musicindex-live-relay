@@ -2,6 +2,13 @@
 
 ## Status
 
+Accepted - 2026-10-18.
+
+Accepted 2026-10-18 by the operator. The operator confirmed the defaults 50,
+10 and 20000, and the scope that includes SSE. `docs/interoperability.md`
+records the limits. The plan is
+`docs/plans/adr-0007-listener-limits-phase-plan.md`.
+
 Proposed 2026-10-18.
 
 Class: durable. AGENTS.md §5 requires a configurable limit with a default for
@@ -106,9 +113,9 @@ relay closes such a session after 10 seconds. The handshake counts against
 
 ## Before Acceptance
 
-- The operator confirms the defaults: 50, 10 and 20000.
+- The operator confirms the defaults: 50, 10 and 20000. Done on 2026-10-18.
 - `docs/interoperability.md` gets the new limits and the new `429`, because
-  a consumer can see them.
+  a consumer can see them. Done on 2026-10-18.
 
 ## Verification After Implementation
 
