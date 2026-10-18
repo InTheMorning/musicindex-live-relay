@@ -33,6 +33,10 @@ station runs continuously.
 - [ADR 0006: The display track carries the album](adr/0006-display-album.md)
   — Implemented. One optional track key, `album`, so an app shows the album of
   each track
+- [ADR 0007: Listener connection limits for each client](adr/0007-listener-connection-limits.md)
+  — Proposed. A limit for each client address on open listener connections
+  and on new connects, a global Socket.IO limit, and trust of `X-Real-IP`
+  from a proxy
 
 ## Plans
 
