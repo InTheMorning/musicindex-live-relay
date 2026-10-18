@@ -113,7 +113,7 @@ The reserve response holds the fields of the create response, and `label`.
 
 ADR 0007 gives these limits. They apply to the listener connections of one
 client address: Socket.IO connections, `/events` streams and
-`/display/events` streams. The deployment to `api.musicindex.org` is open.
+`/display/events` streams. The relay on `api.musicindex.org` applies them.
 
 | Limit | Default | Result at the limit |
 |---|---|---|

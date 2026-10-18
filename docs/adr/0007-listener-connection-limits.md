@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted - 2026-10-18.
+Implemented - 2026-10-18.
+
+Implemented 2026-10-18. The named artifact is
+`docs/reviews/adr-0007-review-checklist.md`, which has no open gates.
 
 Accepted 2026-10-18 by the operator. The operator confirmed the defaults 50,
 10 and 20000, and the scope that includes SSE. `docs/interoperability.md`

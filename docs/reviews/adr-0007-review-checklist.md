@@ -1,8 +1,7 @@
 # ADR 0007 Listener Limits: Review Checklist
 
-Status: open - 2026-10-18. Tasks 001 and 002 are done, and each code and
-document item passes. The deployment items are open. ADR 0007 becomes
-`Implemented` only when each item passes.
+Status: closed - 2026-10-18. Each item passes. This checklist is the named
+artifact for the `Implemented` status of ADR 0007.
 
 ## Invariants Of ADR 0007
 
@@ -30,18 +29,34 @@ document item passes. The deployment items are open. ADR 0007 becomes
 - [x] `AGENTS.md` §5 lists the new limits.
 - [x] `docs/interoperability.md` §A client has listener limits describes the
   limits as present.
-- [ ] ADR 0007 gets the status `Implemented`, with a dated sentence that
+- [x] ADR 0007 gets the status `Implemented`, with a dated sentence that
   names this checklist.
 
 ## Deployment
 
-A person must complete these items on `api.musicindex.org`. Report each one
-as open until then.
+The operator completed these items on `api.musicindex.org` on 2026-10-18.
 
-- [ ] nginx sends `X-Real-IP $remote_addr` on `/socket.io/` and on
+- [x] nginx sends `X-Real-IP $remote_addr` on `/socket.io/` and on
   `/v1/liveitems/`.
-- [ ] After the deployment, network A opens 50 `/events` streams to one
+- [x] After the deployment, network A opens 50 `/events` streams to one
   event, and stream 51 gets `429 listener_limit_reached`. At the same time,
   a stream from network B connects. This proves that the relay sees the
   address of each network, not `127.0.0.1`. The relay does not log client
   addresses, so this check uses the result.
+
+## Deployment Result
+
+- `nginx -T` shows one `X-Real-IP $remote_addr` line in each of the
+  locations `= /v1/liveitems`, `^~ /socket.io/` and `^~ /v1/liveitems/`.
+- The first run of check 2 did not pass. Network B also got `429`. The relay runs
+  in the Docker Compose service `live-relay` on the network
+  `stophammer_default`. Docker forwards the nginx connection into the
+  container from the bridge gateway `172.18.0.1`, not from `127.0.0.1`. That
+  address was not in `TRUSTED_PROXIES`, so the relay used the gateway as the
+  client address of each listener.
+- The operator added `TRUSTED_PROXIES=127.0.0.1,::1,172.18.0.1` to
+  `packaging/env/live-relay.compose.env` in the Stophammer deployment, and
+  recreated the container. The second run passed. Network B got `200`.
+- The gateway address belongs to the Compose network. If the network is
+  made again with a different subnet, `TRUSTED_PROXIES` must change too.
+  `README.md` §The Client Address states this.

@@ -1014,6 +1014,20 @@ The default `TRUSTED_PROXIES` trusts loopback only, because the default
 `BIND` sits behind a local proxy. On `api.musicindex.org`, nginx sets
 `X-Real-IP $remote_addr` on every request, so a client cannot set it itself.
 
+A relay in a container sees a different TCP peer. With a Docker bridge
+network and a published port, the peer is the gateway of that network, for
+example `172.18.0.1`, not `127.0.0.1`. Add that gateway to
+`TRUSTED_PROXIES`. If you do not, the relay uses the gateway as the client
+address of each listener, and the limit for each client becomes a limit for
+the full relay. Show the gateway with this command:
+
+```bash
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' CONTAINER
+```
+
+The gateway belongs to the network. If the network is made again with a
+different subnet, change `TRUSTED_PROXIES` too.
+
 `MAX_LISTENER_CONNECTIONS_PER_CLIENT` and
 `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC` apply to the client address of
 `/events`, `/display/events`, and a Socket.IO connection to `/event`,

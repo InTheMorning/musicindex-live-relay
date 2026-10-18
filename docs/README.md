@@ -34,7 +34,7 @@ station runs continuously.
   — Implemented. One optional track key, `album`, so an app shows the album of
   each track
 - [ADR 0007: Listener connection limits for each client](adr/0007-listener-connection-limits.md)
-  — Accepted. A limit for each client address on open listener connections
+  — Implemented. A limit for each client address on open listener connections
   and on new connects, a global Socket.IO limit, and trust of `X-Real-IP`
   from a proxy
 
@@ -125,7 +125,8 @@ Packets for the listener limits plan. ADR 0007 governs them. Ready - 2026-10-18.
   named artifact for the `Implemented` status of ADR 0005
 - [ADR 0006 review checklist](reviews/adr-0006-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0006
-- [ADR 0007 review checklist](reviews/adr-0007-review-checklist.md) — open
+- [ADR 0007 review checklist](reviews/adr-0007-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0007
 
 ## Research
 

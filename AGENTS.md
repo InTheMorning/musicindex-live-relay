@@ -64,10 +64,11 @@ packet.
 - ADR 0006, the optional display track key `album`, has the status
   `Implemented`. A display track can also have `album`.
 - ADR 0007, listener connection limits for each client, has the status
-  `Accepted`. Its two packets are done. The relay limits the listener
-  connections of each client address, and the open Socket.IO connections of
-  the full relay. It trusts `X-Real-IP` only from `TRUSTED_PROXIES`. The two
-  deployment checks of `docs/reviews/adr-0007-review-checklist.md` are open.
+  `Implemented`. The artifact is `docs/reviews/adr-0007-review-checklist.md`.
+  The relay limits the listener connections of each client address, and the
+  open Socket.IO connections of the full relay. It trusts `X-Real-IP` only
+  from `TRUSTED_PROXIES`. On `api.musicindex.org` the relay runs in Docker
+  Compose, and `TRUSTED_PROXIES` includes the bridge gateway.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
