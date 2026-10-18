@@ -1,6 +1,6 @@
 # ADR 0007 Listener Limits: Phase Plan
 
-Status: Ready 2026-10-18. This plan does not make rules. ADR 0007 owns them.
+Status: Packets done 2026-10-18. The deployment checks are open. This plan does not make rules. ADR 0007 owns them.
 
 ## Goal
 

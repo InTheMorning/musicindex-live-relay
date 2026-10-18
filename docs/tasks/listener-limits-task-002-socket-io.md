@@ -1,6 +1,6 @@
 # Listener Limits Task 002: The Socket.IO Limits
 
-Status: Ready - 2026-10-18. It needs task 001.
+Status: Implemented - 2026-10-18. It needs task 001.
 
 Every criterion is mechanical.
 
@@ -39,6 +39,12 @@ seconds.
 
 ## Constraints
 
+- Task 001 gives these functions in `src/lib.rs`. Use them, and do not copy
+  their rules: `client_address` (the address rule), the `ClientPeerAddr`
+  extractor (the TCP peer, or `0.0.0.0` with no `ConnectInfo`),
+  `try_acquire_client_slot` and `release_client_slot` (the open count and
+  the connect rate of each client), and `client_counter` (the amortized
+  sweep). A Socket.IO connection uses the same slots as an SSE stream.
 - `MAX_SOCKETIO_CONNECTIONS`, default `20000`.
 - In the `/event` handler, the client address comes from
   `socket.req_parts()`, with the function of task 001.
@@ -141,3 +147,30 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-18. The full gate passes with 200 tests. The baseline at
+`9c74809` had 176.
+
+- The check sequence, the handshake count and the client address rule were
+  correct at the first review. The handshake takes only the connect rate.
+  The namespace connect takes only the open count. So one connection never
+  counts two times.
+- The first review found a race. `on_disconnect` was registered after
+  `listener_value(...).await`. A disconnect during that await released no
+  slot. The fix registers the handler directly after the slots are taken,
+  and each later refusal only disconnects. `Socket::close` in socketioxide
+  0.18.3 (`socket.rs`) takes the handler one time.
+- The second review found a smaller window. socketioxide spawns the connect
+  handler (`handler/connect.rs`, `tokio::spawn`) after it marks the socket
+  connected. A disconnect before the handler runs finds no handler. The fix
+  checks `socket.connected()` directly after the registration. A guard with
+  an `AtomicBool` releases the slots one time for the two paths. `close()`
+  sets the socket not connected before it takes the handler, so each order
+  of events releases the slots.
+- No test can control the order of two spawned tasks through `oneshot`. A
+  unit test proves that the guard releases one time.
+- `MAX_SOCKETIO_CONNECTIONS` has no value that turns it off, as for
+  `MAX_SSE_CONNECTIONS`.
+

@@ -38,9 +38,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "listening");
 
-    axum::serve(listener, app(state).layer(TraceLayer::new_for_http()))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Serve with the TCP peer address in `ConnectInfo<SocketAddr>`, so a
+    // handler can find the client address of a request (ADR 0007 §The
+    // Client Address).
+    axum::serve(
+        listener,
+        app(state)
+            .layer(TraceLayer::new_for_http())
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

@@ -1,6 +1,6 @@
 # Listener Limits Task 001: The Client Address And The SSE Limits
 
-Status: Ready - 2026-10-18.
+Status: Implemented - 2026-10-18.
 
 Every criterion is mechanical.
 
@@ -153,3 +153,24 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-10-18. The full gate passes with 190 tests. The baseline at
+`9c74809` had 176.
+
+- The address rule, the refusal rollback and the guards were correct at the
+  first review. The tests use `MockConnectInfo` and the injected clock.
+- The first review found that the map of client counters could grow without
+  a bound. A connection that opened and closed in one second left its entry,
+  because the prune at release keeps an entry with a connect in the current
+  second. One client with many IPv6 addresses could grow the map.
+- The fix has two parts. The TTL reaper calls `sweep_client_limits`, which
+  runs one time each hour with the default TTL. `client_counter` sweeps the
+  map when it reaches a threshold, and sets the next threshold to two times
+  the size after the sweep, with a floor of 1024. The map thus holds the
+  addresses with an open connection and the addresses of the current second,
+  amortized. One shared function holds the removal rule.
+- The review added one line: the hourly sweep also resets the threshold, so
+  a flood does not leave a high threshold.
+

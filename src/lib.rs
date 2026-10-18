@@ -4,11 +4,11 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     fmt::Write as _,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, Once, OnceLock, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -18,8 +18,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State as AxumState, rejection::BytesRejection},
+    extract::{ConnectInfo, FromRequestParts, Path, State as AxumState, rejection::BytesRejection},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -99,6 +100,41 @@ const MIN_PENDING_LISTENER_UPDATES: usize = 1;
 /// `HeaderMap` looks up a header by its lowercase name, so the broadcaster
 /// can send the header in any case.
 const LISTENER_DELAY_HEADER: &str = "listener-delay-secs";
+/// The default of `TRUSTED_PROXIES` (ADR 0007 §The Client Address). The
+/// default `BIND` sits behind a local proxy, so the default trusts
+/// loopback only.
+const DEFAULT_TRUSTED_PROXIES: &str = "127.0.0.1,::1";
+/// The default of `MAX_LISTENER_CONNECTIONS_PER_CLIENT`, the open listener
+/// connections of one client address (ADR 0007 §Three Limits).
+const DEFAULT_MAX_LISTENER_CONNECTIONS_PER_CLIENT: usize = 50;
+/// The default of `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC`, the new
+/// listener connections of one client address in one second (ADR 0007
+/// §Three Limits).
+const DEFAULT_MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC: u32 = 10;
+/// The lowercase name of the trusted proxy's client address header (ADR
+/// 0007 §The Client Address).
+const X_REAL_IP_HEADER: &str = "x-real-ip";
+/// The client address the relay uses when a request carries no
+/// `ConnectInfo` (ADR 0007 §The Client Address). A test that gives no peer
+/// address keeps working this way.
+const NO_CONNECT_INFO_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+/// The lowest length at which the client-limiter map of ADR 0007 runs its
+/// amortized sweep (ADR 0007 §Three Limits, AGENTS.md §5). Not an
+/// environment setting: an operator has no reason to tune it, since the
+/// map is already bounded by the addresses with an open connection or a
+/// recent connect, not by this value.
+const CLIENT_LIMITS_SWEEP_FLOOR: usize = 1024;
+/// The default of `MAX_SOCKETIO_CONNECTIONS`, the open Socket.IO
+/// connections of the full relay (ADR 0007 §Three Limits).
+const DEFAULT_MAX_SOCKETIO_CONNECTIONS: usize = 20_000;
+/// The amount of time an Engine.IO session can stay open with no
+/// namespace connect, before the relay closes it (ADR 0007 §A Socket.IO
+/// Session With No Namespace).
+const SOCKETIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The Engine.IO request path, the default of `SocketIoBuilder::req_path`
+/// (ADR 0007). A request to this path with no `sid` query parameter is a
+/// new Engine.IO handshake. See [`is_socketio_handshake`].
+const SOCKET_IO_REQ_PATH: &str = "/socket.io";
 
 /// The operator credential for the reserved item routes (ADR 0001).
 ///
@@ -156,6 +192,20 @@ pub struct AppConfig {
     /// The pending listener updates that the relay keeps for each event
     /// (ADR 0004).
     pub max_pending_listener_updates: usize,
+    /// The TCP peers the relay trusts to set `X-Real-IP` (ADR 0007 §The
+    /// Client Address).
+    pub trusted_proxies: Vec<IpAddr>,
+    /// The highest count of open listener connections from one client
+    /// address, Socket.IO and SSE together (ADR 0007 §Three Limits). A
+    /// value of 0 turns this limit off.
+    pub max_listener_connections_per_client: usize,
+    /// The highest count of new listener connections from one client
+    /// address in one second (ADR 0007 §Three Limits). A value of 0 turns
+    /// this limit off.
+    pub max_listener_connects_per_client_per_sec: u32,
+    /// The highest count of open Socket.IO connections of the full relay
+    /// (ADR 0007 §Three Limits).
+    pub max_socketio_connections: usize,
 }
 
 impl AppConfig {
@@ -180,6 +230,19 @@ impl AppConfig {
                 DEFAULT_MAX_LISTENER_DELAY_SECS,
             )?,
             max_pending_listener_updates: parse_max_pending_listener_updates()?,
+            trusted_proxies: parse_trusted_proxies()?,
+            max_listener_connections_per_client: env_parse(
+                "MAX_LISTENER_CONNECTIONS_PER_CLIENT",
+                DEFAULT_MAX_LISTENER_CONNECTIONS_PER_CLIENT,
+            )?,
+            max_listener_connects_per_client_per_sec: env_parse(
+                "MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC",
+                DEFAULT_MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC,
+            )?,
+            max_socketio_connections: env_parse(
+                "MAX_SOCKETIO_CONNECTIONS",
+                DEFAULT_MAX_SOCKETIO_CONNECTIONS,
+            )?,
         })
     }
 
@@ -198,6 +261,11 @@ impl AppConfig {
             artwork_max_bytes: DEFAULT_ARTWORK_MAX_BYTES,
             max_listener_delay_secs: DEFAULT_MAX_LISTENER_DELAY_SECS,
             max_pending_listener_updates: DEFAULT_MAX_PENDING_LISTENER_UPDATES,
+            trusted_proxies: default_trusted_proxies(),
+            max_listener_connections_per_client: DEFAULT_MAX_LISTENER_CONNECTIONS_PER_CLIENT,
+            max_listener_connects_per_client_per_sec:
+                DEFAULT_MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC,
+            max_socketio_connections: DEFAULT_MAX_SOCKETIO_CONNECTIONS,
         }
     }
 }
@@ -253,6 +321,45 @@ fn parse_max_pending_listener_updates() -> Result<usize, ConfigError> {
     Ok(count)
 }
 
+/// Reads `TRUSTED_PROXIES`, the TCP peers the relay trusts to set
+/// `X-Real-IP` (ADR 0007 §The Client Address).
+///
+/// # Errors
+///
+/// Returns a `ConfigError` for a value that is not valid unicode, or that
+/// holds an entry that is not a correct IP address.
+fn parse_trusted_proxies() -> Result<Vec<IpAddr>, ConfigError> {
+    let value = match std::env::var("TRUSTED_PROXIES") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(default_trusted_proxies()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError {
+                key: "TRUSTED_PROXIES",
+                value: "<not unicode>".to_string(),
+                message: "not valid unicode".to_string(),
+            });
+        }
+    };
+    value
+        .split(',')
+        .map(|part| {
+            part.trim().parse::<IpAddr>().map_err(|err| ConfigError {
+                key: "TRUSTED_PROXIES",
+                value: value.clone(),
+                message: err.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The parsed value of `DEFAULT_TRUSTED_PROXIES`.
+fn default_trusted_proxies() -> Vec<IpAddr> {
+    DEFAULT_TRUSTED_PROXIES
+        .split(',')
+        .map(|part| part.parse().expect("default trusted proxies are valid"))
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct ConfigError {
     key: &'static str,
@@ -305,6 +412,20 @@ struct RelayStateInner {
     create_window: AtomicU64,
     socket_io: OnceLock<SocketIo>,
     clock: Clock,
+    /// The open Socket.IO connections of the full relay (ADR 0007 §Three
+    /// Limits). [`RelayState::try_acquire_socketio_slot`] and
+    /// [`RelayState::release_socketio_slot`] keep it. It is the Socket.IO
+    /// counterpart of `sse_connections`, checked before the client-address
+    /// limiter in the `/event` namespace handler.
+    socketio_connections: AtomicUsize,
+    /// The open and new listener connections of each client address (ADR
+    /// 0007), amortized-swept on growth. The map is bounded by the
+    /// addresses that have an open connection, plus the addresses that
+    /// connected in the current second: [`RelayState::client_counter`]
+    /// sweeps it once its length reaches `ClientLimits::sweep_at`, and the
+    /// hourly TTL reaper ([`RelayState::sweep_client_limits`]) is a second
+    /// safety net.
+    client_limits: Mutex<ClientLimits>,
 }
 
 /// The identity half and the live half of each event.
@@ -392,6 +513,8 @@ impl RelayState {
                 create_window: AtomicU64::new(0),
                 socket_io: OnceLock::new(),
                 clock,
+                socketio_connections: AtomicUsize::new(0),
+                client_limits: Mutex::new(ClientLimits::new()),
             }),
         })
     }
@@ -1031,14 +1154,282 @@ impl RelayState {
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artwork_not_found"))
     }
 
+    /// Returns the open and new connection counter of `client_addr` (ADR
+    /// 0007), making one when the address has none.
+    ///
+    /// Making one for an address the map does not hold is the point at
+    /// which the map can grow. When its length has reached
+    /// `ClientLimits::sweep_at`, this runs the sweep of
+    /// [`sweep_stale_client_limits`] first, so the map is bounded by the
+    /// addresses that have an open connection, plus the addresses that
+    /// connected in the current second, amortized over insertions
+    /// (AGENTS.md §5). [`RelayState::sweep_client_limits`], on the TTL
+    /// reaper's schedule, is a second safety net.
+    fn client_counter(&self, client_addr: IpAddr) -> Arc<ClientCounter> {
+        let mut limits = self
+            .inner
+            .client_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(counter) = limits.counters.get(&client_addr) {
+            return Arc::clone(counter);
+        }
+
+        if limits.counters.len() >= limits.sweep_at {
+            let now_window = self.now() & 0xFFFF_FFFF;
+            sweep_stale_client_limits(&mut limits.counters, now_window);
+            limits.sweep_at = std::cmp::max(limits.floor, 2 * limits.counters.len());
+        }
+
+        Arc::clone(
+            limits
+                .counters
+                .entry(client_addr)
+                .or_insert_with(|| Arc::new(ClientCounter::new())),
+        )
+    }
+
+    /// Acquires one listener-connection slot of `client_addr` for an SSE
+    /// stream (ADR 0007 §Three Limits).
+    ///
+    /// Checks the open-connections limit
+    /// ([`RelayState::try_acquire_client_open_slot`]), then the new-
+    /// connections-per-second limit
+    /// ([`RelayState::try_acquire_client_connect_rate`]). A refused attempt
+    /// takes no slot of either count: the open-connections increment rolls
+    /// back when the second check fails. The caller releases the slot with
+    /// [`RelayState::release_client_slot`] when the connection ends, also
+    /// after an error.
+    ///
+    /// A Socket.IO connection does not use this combined check (ADR 0007 §A
+    /// Socket.IO Session With No Namespace). Its Engine.IO handshake checks
+    /// only the connect rate
+    /// ([`RelayState::try_acquire_socketio_handshake_rate`]), and its
+    /// namespace connect checks only the open count
+    /// ([`RelayState::try_acquire_client_open_slot`]), so the handshake and
+    /// the namespace connect never count the same connection twice against
+    /// the connect rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `429 listener_limit_reached`.
+    fn try_acquire_client_slot(&self, client_addr: IpAddr) -> Result<Arc<ClientCounter>, ApiError> {
+        let counter = self.try_acquire_client_open_slot(client_addr)?;
+        if !self.try_acquire_client_connect_rate(&counter) {
+            counter.open.fetch_sub(1, Ordering::AcqRel);
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "listener_limit_reached",
+            ));
+        }
+        Ok(counter)
+    }
+
+    /// Checks and takes one open-connection slot of `client_addr` (ADR 0007
+    /// §Three Limits), with `max_listener_connections_per_client`.
+    ///
+    /// A refused attempt takes no slot. This is the half of
+    /// [`RelayState::try_acquire_client_slot`] that a Socket.IO namespace
+    /// connect also uses on its own, because its Engine.IO handshake already
+    /// checked the connect rate
+    /// ([`RelayState::try_acquire_socketio_handshake_rate`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `429 listener_limit_reached`.
+    fn try_acquire_client_open_slot(
+        &self,
+        client_addr: IpAddr,
+    ) -> Result<Arc<ClientCounter>, ApiError> {
+        let counter = self.client_counter(client_addr);
+        let limit = self.inner.config.max_listener_connections_per_client;
+        let previous = counter.open.fetch_add(1, Ordering::AcqRel);
+        if limit != 0 && previous >= limit {
+            counter.open.fetch_sub(1, Ordering::AcqRel);
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "listener_limit_reached",
+            ));
+        }
+        Ok(counter)
+    }
+
+    /// Checks and takes one slot of `counter`'s new-connections-per-second
+    /// window (ADR 0007 §Three Limits), with
+    /// `max_listener_connects_per_client_per_sec`.
+    ///
+    /// This is the other half of [`RelayState::try_acquire_client_slot`].
+    /// [`RelayState::try_acquire_socketio_handshake_rate`] also calls it, for
+    /// an Engine.IO handshake that has not joined any namespace yet and so
+    /// has no [`ClientCounter`] of its own to roll back.
+    fn try_acquire_client_connect_rate(&self, counter: &ClientCounter) -> bool {
+        let now = self.now();
+        try_acquire_window_slot(
+            &counter.connect_window,
+            now,
+            self.inner.config.max_listener_connects_per_client_per_sec,
+        )
+    }
+
+    /// Checks and takes one connect-rate slot of `client_addr` for an
+    /// Engine.IO handshake (ADR 0007 §A Socket.IO Session With No
+    /// Namespace).
+    ///
+    /// A handshake takes no open-connection slot: only a later namespace
+    /// connect, through [`RelayState::try_acquire_client_open_slot`], takes
+    /// one. This keeps the handshake and the namespace connect from
+    /// counting the same connection twice against the connect rate.
+    fn try_acquire_socketio_handshake_rate(&self, client_addr: IpAddr) -> bool {
+        let counter = self.client_counter(client_addr);
+        self.try_acquire_client_connect_rate(&counter)
+    }
+
+    /// Checks and takes one of the `max_socketio_connections` slots of the
+    /// full relay (ADR 0007 §Three Limits).
+    ///
+    /// A refused attempt takes no slot. The caller releases an acquired slot
+    /// with [`RelayState::release_socketio_slot`] on every kind of
+    /// disconnect.
+    fn try_acquire_socketio_slot(&self) -> bool {
+        let previous = self
+            .inner
+            .socketio_connections
+            .fetch_add(1, Ordering::AcqRel);
+        if previous >= self.inner.config.max_socketio_connections {
+            self.inner
+                .socketio_connections
+                .fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// Releases one of the `max_socketio_connections` slots of the full
+    /// relay (ADR 0007).
+    fn release_socketio_slot(&self) {
+        self.inner
+            .socketio_connections
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Releases one listener-connection slot of `client_addr` (ADR 0007).
+    ///
+    /// Removes the counter of `client_addr` when it then has no open
+    /// connection and no connect in the current second. This is an
+    /// opportunistic prune only: an address whose one connection opens and
+    /// closes inside the same second leaves no later release to run this
+    /// check. [`RelayState::client_counter`] and
+    /// [`RelayState::sweep_client_limits`] are the two sweeps that bound
+    /// the map for that case.
+    fn release_client_slot(&self, client_addr: IpAddr, counter: &Arc<ClientCounter>) {
+        counter.open.fetch_sub(1, Ordering::AcqRel);
+        if counter.open.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        // The window of the last connect packs into the high 32 bits of
+        // `connect_window`, the same encoding as `try_acquire_window_slot`.
+        let now_window = self.now() & 0xFFFF_FFFF;
+        let last_window = counter.connect_window.load(Ordering::Acquire) >> 32;
+        if last_window == now_window {
+            return;
+        }
+        let mut limits = self
+            .inner
+            .client_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if limits
+            .counters
+            .get(&client_addr)
+            .is_some_and(|entry| entry.open.load(Ordering::Acquire) == 0)
+        {
+            limits.counters.remove(&client_addr);
+        }
+    }
+
+    /// Removes the counter of each client address that has no open
+    /// connection and no connect in the current second (ADR 0007 §Three
+    /// Limits).
+    ///
+    /// [`RelayState::release_client_slot`] prunes an address
+    /// opportunistically when its last connection closes, and
+    /// [`RelayState::client_counter`] sweeps the map, amortized, when a
+    /// new address makes it grow. An address whose one connection opens
+    /// and closes inside one second, with no later insertion to trigger
+    /// the amortized sweep, can still wait for this sweep. The TTL reaper
+    /// calls it on an hourly schedule by default, so it is a second
+    /// safety net, not the only bound on the map (AGENTS.md §5).
+    fn sweep_client_limits(&self) {
+        let now_window = self.now() & 0xFFFF_FFFF;
+        let mut limits = self
+            .inner
+            .client_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        sweep_stale_client_limits(&mut limits.counters, now_window);
+        // A flood can leave a high threshold. Reset it to the size after
+        // the sweep, as the sweep in `client_counter` does.
+        limits.sweep_at = std::cmp::max(limits.floor, 2 * limits.counters.len());
+    }
+
+    /// Test-only: sets the amortized-sweep floor and threshold of the ADR
+    /// 0007 client-limiter map, so a test can reach the amortized sweep of
+    /// [`RelayState::client_counter`] without opening
+    /// `CLIENT_LIMITS_SWEEP_FLOOR` connections. Production always starts
+    /// at `CLIENT_LIMITS_SWEEP_FLOOR`.
+    #[cfg(test)]
+    fn set_client_limits_sweep_floor(&self, floor: usize) {
+        let mut limits = self
+            .inner
+            .client_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        limits.floor = floor;
+        limits.sweep_at = floor;
+    }
+
+    /// Test-only: reads the Socket.IO `connect_timeout` that `app(state)`
+    /// gave the attached `SocketIo` (ADR 0007 §A Socket.IO Session With No
+    /// Namespace), so a test can check the builder value of the production
+    /// path without a real 10-second wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no `SocketIo` is attached yet, that is, before `app` runs.
+    #[cfg(test)]
+    fn socketio_connect_timeout(&self) -> Duration {
+        self.inner
+            .socket_io
+            .get()
+            .expect("socket_io attached by app(state)")
+            .config()
+            .connect_timeout
+    }
+
+    /// Subscribes to the display stream of a reserved event (ADR 0003),
+    /// behind the listener-connection limits of `client_addr` (ADR 0007).
+    ///
+    /// The client-connection slot is acquired before the global SSE slot,
+    /// so a refused connection never takes the global slot either (ADR
+    /// 0007 §Three Limits).
+    ///
+    /// # Errors
+    ///
+    /// Returns `429 listener_limit_reached` above a limit of `client_addr`,
+    /// `503 max_sse_connections_reached` above the global limit, or the
+    /// error of [`RelayState::get_reserved_entry`].
     async fn subscribe_display(
         &self,
         event_id: &str,
         last_event_id: Option<u64>,
+        client_addr: IpAddr,
     ) -> Result<DisplaySubscription, ApiError> {
+        let client_counter = self.try_acquire_client_slot(client_addr)?;
+
         let previous = self.inner.sse_connections.fetch_add(1, Ordering::AcqRel);
         if previous >= self.inner.config.max_sse_connections {
             self.inner.sse_connections.fetch_sub(1, Ordering::AcqRel);
+            self.release_client_slot(client_addr, &client_counter);
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "max_sse_connections_reached",
@@ -1049,6 +1440,7 @@ impl RelayState {
             Ok((_, event)) => event,
             Err(err) => {
                 self.inner.sse_connections.fetch_sub(1, Ordering::AcqRel);
+                self.release_client_slot(client_addr, &client_counter);
                 return Err(err);
             }
         };
@@ -1085,17 +1477,35 @@ impl RelayState {
             subscribed_seq,
             receiver,
             closed,
+            client_addr,
+            client_counter,
         })
     }
 
+    /// Subscribes to the live value stream of an event (ADR 0004), behind
+    /// the listener-connection limits of `client_addr` (ADR 0007).
+    ///
+    /// The client-connection slot is acquired before the global SSE slot,
+    /// so a refused connection never takes the global slot either (ADR
+    /// 0007 §Three Limits).
+    ///
+    /// # Errors
+    ///
+    /// Returns `429 listener_limit_reached` above a limit of `client_addr`,
+    /// `503 max_sse_connections_reached` above the global limit, or
+    /// `404 event_not_found`.
     async fn subscribe(
         &self,
         event_id: &str,
         last_event_id: Option<u64>,
+        client_addr: IpAddr,
     ) -> Result<EventSubscription, ApiError> {
+        let client_counter = self.try_acquire_client_slot(client_addr)?;
+
         let previous = self.inner.sse_connections.fetch_add(1, Ordering::AcqRel);
         if previous >= self.inner.config.max_sse_connections {
             self.inner.sse_connections.fetch_sub(1, Ordering::AcqRel);
+            self.release_client_slot(client_addr, &client_counter);
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "max_sse_connections_reached",
@@ -1106,6 +1516,7 @@ impl RelayState {
             Ok(event) => event,
             Err(err) => {
                 self.inner.sse_connections.fetch_sub(1, Ordering::AcqRel);
+                self.release_client_slot(client_addr, &client_counter);
                 return Err(err);
             }
         };
@@ -1132,19 +1543,26 @@ impl RelayState {
             replay,
             receiver,
             closed,
+            client_addr,
+            client_counter,
         })
     }
 
     /// Removes each ephemeral event whose last activity is older than the
-    /// idle TTL.
+    /// idle TTL, and sweeps the client-limiter map of ADR 0007.
     ///
     /// The reaper never removes a reserved item (ADR 0001). It reads the
     /// class from the store under the table lock, and it takes no event lock.
     /// Because it keeps each reserved item, it never deletes a row of the
     /// state file.
     ///
+    /// [`RelayState::sweep_client_limits`] runs first, and unconditionally,
+    /// so a client-limiter entry still leaves the map on this reaper's
+    /// schedule even when the event table holds nothing to expire.
+    ///
     /// Returns the count of removed events.
     pub async fn cleanup_expired(&self) -> usize {
+        self.sweep_client_limits();
         let cutoff = self.now().saturating_sub(self.inner.config.ttl.as_secs());
         let mut events = self.inner.events.write().await;
         let EventTable { store, live } = &mut *events;
@@ -1409,6 +1827,67 @@ fn try_acquire_window_slot(window: &AtomicU64, now: u64, limit: u32) -> bool {
             return true;
         }
     }
+}
+
+/// Counts the open and the new listener connections of one client address
+/// (ADR 0007). The relay keeps one of these for each client address that
+/// has a recent listener connection.
+struct ClientCounter {
+    open: AtomicUsize,
+    /// The window and the count of a `try_acquire_window_slot` limiter, in
+    /// the same packed encoding as that function uses.
+    connect_window: AtomicU64,
+}
+
+impl ClientCounter {
+    fn new() -> Self {
+        Self {
+            open: AtomicUsize::new(0),
+            connect_window: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The client counters of ADR 0007, and the amortized-sweep threshold that
+/// bounds the map (AGENTS.md §5).
+struct ClientLimits {
+    counters: HashMap<IpAddr, Arc<ClientCounter>>,
+    /// [`RelayState::client_counter`] sweeps the map, with
+    /// [`sweep_stale_client_limits`], once its length reaches this value.
+    /// Starts at `floor`. After a sweep, this becomes `max(floor, 2 *` the
+    /// length right after that sweep`)`, so the next sweep is amortized
+    /// over roughly as many insertions as the map held live entries.
+    sweep_at: usize,
+    /// The lowest value `sweep_at` can take. `CLIENT_LIMITS_SWEEP_FLOOR`
+    /// in production. A test lowers it with
+    /// [`RelayState::set_client_limits_sweep_floor`] to reach the
+    /// amortized sweep without opening thousands of connections.
+    floor: usize,
+}
+
+impl ClientLimits {
+    fn new() -> Self {
+        Self {
+            counters: HashMap::new(),
+            sweep_at: CLIENT_LIMITS_SWEEP_FLOOR,
+            floor: CLIENT_LIMITS_SWEEP_FLOOR,
+        }
+    }
+}
+
+/// Removes every counter of `counters` that has no open connection and no
+/// connect in `now_window` (ADR 0007 §Three Limits).
+///
+/// [`RelayState::client_counter`] (amortized, on growth) and
+/// [`RelayState::sweep_client_limits`] (the TTL reaper's schedule) share
+/// this one rule, so the condition that bounds the client-limiter map
+/// exists in one place.
+fn sweep_stale_client_limits(counters: &mut HashMap<IpAddr, Arc<ClientCounter>>, now_window: u64) {
+    counters.retain(|_, counter| {
+        let open = counter.open.load(Ordering::Acquire) != 0;
+        let last_window = counter.connect_window.load(Ordering::Acquire) >> 32;
+        open || last_window == now_window
+    });
 }
 
 fn unique_event_id(store: &dyn EventStore) -> String {
@@ -1803,6 +2282,9 @@ struct EventSubscription {
     replay: Vec<MetadataSnapshot>,
     receiver: broadcast::Receiver<MetadataSnapshot>,
     closed: watch::Receiver<bool>,
+    /// The client address this subscription counts against (ADR 0007).
+    client_addr: IpAddr,
+    client_counter: Arc<ClientCounter>,
 }
 
 impl Drop for EventSubscription {
@@ -1811,11 +2293,14 @@ impl Drop for EventSubscription {
             .inner
             .sse_connections
             .fetch_sub(1, Ordering::AcqRel);
+        self.state
+            .release_client_slot(self.client_addr, &self.client_counter);
     }
 }
 
 /// A subscriber of `/display/events`. It counts against the same SSE
-/// connection limit as `/events`.
+/// connection limit as `/events`, and the same listener-connection limits
+/// of its client address (ADR 0007).
 struct DisplaySubscription {
     state: RelayState,
     event: Arc<LiveEventState>,
@@ -1826,6 +2311,9 @@ struct DisplaySubscription {
     subscribed_seq: u64,
     receiver: broadcast::Receiver<DisplayUpdate>,
     closed: watch::Receiver<bool>,
+    /// The client address this subscription counts against (ADR 0007).
+    client_addr: IpAddr,
+    client_counter: Arc<ClientCounter>,
 }
 
 impl Drop for DisplaySubscription {
@@ -1834,6 +2322,8 @@ impl Drop for DisplaySubscription {
             .inner
             .sse_connections
             .fetch_sub(1, Ordering::AcqRel);
+        self.state
+            .release_client_slot(self.client_addr, &self.client_counter);
     }
 }
 
@@ -2160,10 +2650,19 @@ impl IntoResponse for ApiError {
 
 pub fn app(state: RelayState) -> Router {
     let artwork_max_bytes = state.inner.config.artwork_max_bytes;
-    let (socket_layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
+    let (socket_layer, io) = SocketIo::builder()
+        .connect_timeout(SOCKETIO_CONNECT_TIMEOUT)
+        .with_state(state.clone())
+        .build_layer();
 
     register_socket_namespaces(io.clone());
     state.attach_socket_io(io);
+
+    // The handshake-rate middleware wraps the whole router, including the
+    // Socket.IO layer below: an Engine.IO request is dispatched to
+    // socketioxide by path, before it would ever reach a route (ADR 0007 §A
+    // Socket.IO Session With No Namespace).
+    let handshake_rate_limit_state = state.clone();
 
     Router::new()
         .route("/health", get(health))
@@ -2205,8 +2704,67 @@ pub fn app(state: RelayState) -> Router {
         .layer(CorsLayer::permissive())
         .with_state(state)
         .layer(socket_layer)
+        .layer(middleware::from_fn_with_state(
+            handshake_rate_limit_state,
+            limit_socketio_handshake_rate,
+        ))
 }
 
+/// Checks the connect-rate limit of ADR 0007 on an Engine.IO handshake,
+/// before the request reaches socketioxide.
+///
+/// This middleware wraps every request to `app(state)`, because a Socket.IO
+/// request never reaches an axum route: the Socket.IO layer dispatches it
+/// by path first. A request that is not a handshake
+/// ([`is_socketio_handshake`]) passes through unchanged.
+///
+/// A handshake above the limit gets `429 listener_limit_reached` here and
+/// never reaches socketioxide, so no Engine.IO session is created for it.
+/// This handshake-level check takes no open-connection slot: only a later
+/// namespace connect, in [`register_socket_namespaces`], takes one. That
+/// keeps the handshake and the namespace connect from counting the same
+/// connection twice against the connect rate (ADR 0007 §A Socket.IO
+/// Session With No Namespace).
+async fn limit_socketio_handshake_rate(
+    AxumState(state): AxumState<RelayState>,
+    ClientPeerAddr(peer): ClientPeerAddr,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if is_socketio_handshake(&request) {
+        let client_addr =
+            client_address(request.headers(), peer, &state.inner.config.trusted_proxies);
+        if !state.try_acquire_socketio_handshake_rate(client_addr) {
+            return ApiError::new(StatusCode::TOO_MANY_REQUESTS, "listener_limit_reached")
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// True for a request that engineioxide treats as a new Engine.IO session: a
+/// request to `SOCKET_IO_REQ_PATH` with no `sid` query parameter (ADR 0007
+/// §A Socket.IO Session With No Namespace). A request with a `sid`
+/// continues an existing session (a poll or a post), and does not open a
+/// new one.
+fn is_socketio_handshake(request: &axum::extract::Request) -> bool {
+    if !request.uri().path().starts_with(SOCKET_IO_REQ_PATH) {
+        return false;
+    }
+    let query = request.uri().query().unwrap_or("");
+    !query.split('&').any(|part| part.starts_with("sid="))
+}
+
+/// Spawns the background task that expires inactive ephemeral events and
+/// sweeps the client-limiter map of ADR 0007, on a tick between one minute
+/// and one hour.
+///
+/// The tick is `EVENT_TTL_SECS / 4`, clamped to that range. With the
+/// default TTL of 24 hours, the tick is one hour. [`RelayState::client_counter`]
+/// also sweeps the map, amortized over insertions, each time it grows
+/// enough to matter; see [`RelayState::sweep_client_limits`]. This task's
+/// tick is the backstop: the longest a stale address can stay in the map
+/// when the map never grows enough to trigger that amortized sweep.
 pub fn spawn_cleanup_task(state: RelayState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::cmp::min(state.inner.config.ttl / 4, Duration::from_secs(60 * 60));
@@ -2418,13 +2976,17 @@ async fn display_events(
     AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
     headers: HeaderMap,
+    ClientPeerAddr(peer): ClientPeerAddr,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
+    let client_addr = client_address(&headers, peer, &state.inner.config.trusted_proxies);
 
-    let subscription = state.subscribe_display(&event_id, last_event_id).await?;
+    let subscription = state
+        .subscribe_display(&event_id, last_event_id, client_addr)
+        .await?;
 
     let stream = async_stream::stream! {
         let mut subscription = subscription;
@@ -2483,17 +3045,26 @@ async fn remote_value(
     Ok(Json(state.listener_value(&event_id).await?))
 }
 
+/// Handles `GET /v1/liveitems/{event_id}/events`.
+///
+/// It is an SSE stream of `remoteValue` events on the instant timeline
+/// (ADR 0004). The client-connection limits of ADR 0007 apply to it, the
+/// same as to `/display/events`.
 async fn events(
     AxumState(state): AxumState<RelayState>,
     Path(event_id): Path<String>,
     headers: HeaderMap,
+    ClientPeerAddr(peer): ClientPeerAddr,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
+    let client_addr = client_address(&headers, peer, &state.inner.config.trusted_proxies);
 
-    let subscription = state.subscribe(&event_id, last_event_id).await?;
+    let subscription = state
+        .subscribe(&event_id, last_event_id, client_addr)
+        .await?;
 
     let stream = async_stream::stream! {
         let mut subscription = subscription;
@@ -2525,13 +3096,145 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+/// Releases the two Socket.IO slots of ADR 0007 (the global slot and the
+/// client-address open-connection slot) exactly once, however many times
+/// [`SocketioSlotRelease::release`] runs on this guard or on a clone of it.
+///
+/// `register_socket_namespaces` gives a clone of the same guard to the
+/// registered `on_disconnect` handler and to its own check of
+/// `SocketRef::connected()` right after registering it. Both can try the
+/// release for the same connection, because socketioxide spawns the
+/// connect handler as its own task
+/// (`socketioxide::handler::connect::ConnectHandler::call`,
+/// `tokio::spawn(fut)`) after it has already added the socket to its
+/// namespace (`socketioxide::ns::Namespace::connect`): a disconnect can
+/// close that socket before the spawned task ever runs, so the
+/// `connected()` check is what catches a release the handler missed. The
+/// `AtomicBool` makes the first caller of either path the only one that
+/// runs the release.
+#[derive(Clone)]
+struct SocketioSlotRelease {
+    state: RelayState,
+    client_addr: IpAddr,
+    client_counter: Arc<ClientCounter>,
+    released: Arc<AtomicBool>,
+}
+
+impl SocketioSlotRelease {
+    fn new(state: RelayState, client_addr: IpAddr, client_counter: Arc<ClientCounter>) -> Self {
+        Self {
+            state,
+            client_addr,
+            client_counter,
+            released: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Releases the slots, unless an earlier call on this guard or a clone
+    /// of it already did.
+    fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.state.release_socketio_slot();
+        self.state
+            .release_client_slot(self.client_addr, &self.client_counter);
+    }
+}
+
+/// Registers the `/event` namespace, behind the Socket.IO limits of ADR
+/// 0007.
+///
+/// The handler checks the limits in this order (ADR 0007 §Three Limits):
+/// the global Socket.IO limit
+/// ([`RelayState::try_acquire_socketio_slot`]), then the open count of the
+/// client address ([`RelayState::try_acquire_client_open_slot`]), then the
+/// event. A refused connection gets `{}` on `remoteValue` and a disconnect,
+/// as for an unknown event, and takes no slot: each check rolls back the
+/// slots an earlier check took before it refuses.
+///
+/// [`SocketRef::on_disconnect`] releases both slots through a
+/// [`SocketioSlotRelease`], and it is registered right after both are
+/// acquired, before the event check and before any `.await`.
+/// `socketioxide::ns::Namespace::connect` already added this socket to its
+/// namespace before calling this handler, so a disconnect from outside
+/// this handler (ADR 0007's own `disconnect_socket_clients`, a lost
+/// transport, and so on) can reach and close this socket while this
+/// handler still runs, or even before this handler's task is scheduled to
+/// run at all. Registering the release before any later check or `.await`
+/// closes the first of those gaps: with no handler registered yet, such a
+/// close would otherwise remove the socket with no release, leaking both
+/// slots forever (`socketioxide::socket::Socket::close`).
+///
+/// The second gap, a disconnect that beats this handler's own task to the
+/// scheduler, needs the `connected()` check right after registering the
+/// handler: see [`SocketioSlotRelease`]. Once past that check, every later
+/// refusal only calls `refuse`, which emits `{}` and disconnects; the
+/// registered handler is what then releases the slots.
+///
+/// This handler takes no part in the connect-rate limit
+/// (`MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC`): the Engine.IO handshake
+/// middleware ([`limit_socketio_handshake_rate`]) already checked it, so
+/// counting it again here would count one connection twice.
 fn register_socket_namespaces(io: SocketIo) {
     io.ns(
         "/event",
         async |socket: SocketRef, SocketState(state): SocketState<RelayState>| {
-            let Some(event_id) = socket_event_id(&socket) else {
+            let refuse = |socket: &SocketRef| {
                 let _ = socket.emit("remoteValue", &json!({}));
-                socket.disconnect().ok();
+                socket.clone().disconnect().ok();
+            };
+
+            if !state.try_acquire_socketio_slot() {
+                refuse(&socket);
+                return;
+            }
+
+            let peer = socket_peer_addr(&socket);
+            let client_addr = client_address(
+                &socket.req_parts().headers,
+                peer,
+                &state.inner.config.trusted_proxies,
+            );
+            // Only the global slot is held so far: a refusal here rolls it
+            // back directly, because no disconnect handler exists yet to
+            // roll it back for this call.
+            let client_counter = match state.try_acquire_client_open_slot(client_addr) {
+                Ok(counter) => counter,
+                Err(_) => {
+                    state.release_socketio_slot();
+                    refuse(&socket);
+                    return;
+                }
+            };
+
+            // Both slots are held now. Register their release before the
+            // event check and before the `.await` below, so a disconnect
+            // concurrent with either one still releases them (see the
+            // function doc comment).
+            let release = SocketioSlotRelease::new(state.clone(), client_addr, client_counter);
+
+            let on_disconnect_release = release.clone();
+            socket.on_disconnect(move || async move {
+                on_disconnect_release.release();
+            });
+
+            // `Socket::close` sets `connected` to `false` before it takes
+            // the registered handler (see `SocketioSlotRelease`'s doc
+            // comment). A disconnect that beat the registration above, and
+            // so found no handler to call, has already made this `false`
+            // by the time this reads it, and this call is then the only
+            // release that ever runs for this connection. A disconnect
+            // that instead found the handler calls it, which releases the
+            // slots on its own; the guard's `AtomicBool` keeps the two
+            // paths from both releasing.
+            if !socket.connected() {
+                release.release();
+                return;
+            }
+
+            let Some(event_id) = socket_event_id(&socket) else {
+                refuse(&socket);
                 return;
             };
 
@@ -2542,8 +3245,7 @@ fn register_socket_namespaces(io: SocketIo) {
             let current = match state.listener_value(&event_id).await {
                 Ok(current) => current,
                 Err(_) => {
-                    let _ = socket.emit("remoteValue", &json!({}));
-                    socket.disconnect().ok();
+                    refuse(&socket);
                     return;
                 }
             };
@@ -2630,6 +3332,108 @@ fn parse_listener_delay_header(
     Ok(delay)
 }
 
+/// Logged once, the first time a request carries no `ConnectInfo` (ADR
+/// 0007 §The Client Address).
+static MISSING_CONNECT_INFO_LOGGED: Once = Once::new();
+
+/// Reads the TCP peer address from the extensions of a request: the real
+/// `ConnectInfo<SocketAddr>` that `axum::serve`'s
+/// `into_make_service_with_connect_info` inserts, or the
+/// `MockConnectInfo<SocketAddr>` a test layers in its place (ADR 0007 §The
+/// Client Address). `None` with neither extension present.
+///
+/// [`ClientPeerAddr`] (an HTTP route) and [`socket_peer_addr`] (the
+/// Socket.IO `/event` handler) both call this, so the one rule that picks
+/// the peer address out of a request's extensions lives here. A
+/// `socketioxide::SocketRef::req_parts()` gives only `&http::request::Parts`,
+/// not `&mut`, so neither caller can run the `ConnectInfo` extractor's own
+/// async `FromRequestParts` implementation; this function reads the same
+/// two extension types it does, synchronously.
+fn connect_info_peer_addr(extensions: &http::Extensions) -> Option<IpAddr> {
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+        .or_else(|| {
+            extensions
+                .get::<axum::extract::connect_info::MockConnectInfo<SocketAddr>>()
+                .map(|axum::extract::connect_info::MockConnectInfo(addr)| addr.ip())
+        })
+}
+
+/// The TCP peer address of an HTTP request, from
+/// [`connect_info_peer_addr`].
+///
+/// With no `ConnectInfo` in the request extensions, the address is
+/// `0.0.0.0`, and the relay logs this once. This keeps a test that gives
+/// no peer address working, and keeps `axum::serve` the only production
+/// path that can give a real peer address.
+struct ClientPeerAddr(IpAddr);
+
+impl<S> FromRequestParts<S> for ClientPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match connect_info_peer_addr(&parts.extensions) {
+            Some(addr) => Ok(Self(addr)),
+            None => {
+                MISSING_CONNECT_INFO_LOGGED.call_once(|| {
+                    tracing::warn!(
+                        client_addr = %NO_CONNECT_INFO_ADDR,
+                        "no ConnectInfo in the request; using the default client address"
+                    );
+                });
+                Ok(Self(NO_CONNECT_INFO_ADDR))
+            }
+        }
+    }
+}
+
+/// The TCP peer address of a Socket.IO handshake, from
+/// [`connect_info_peer_addr`] applied to `socket.req_parts()` (ADR 0007 §The
+/// Client Address), with the same default as [`ClientPeerAddr`] when the
+/// handshake request carried no `ConnectInfo`.
+fn socket_peer_addr(socket: &SocketRef) -> IpAddr {
+    connect_info_peer_addr(&socket.req_parts().extensions).unwrap_or_else(|| {
+        MISSING_CONNECT_INFO_LOGGED.call_once(|| {
+            tracing::warn!(
+                client_addr = %NO_CONNECT_INFO_ADDR,
+                "no ConnectInfo in the Socket.IO handshake; using the default client address"
+            );
+        });
+        NO_CONNECT_INFO_ADDR
+    })
+}
+
+/// Finds the client address of a request (ADR 0007 §The Client Address).
+///
+/// `peer` is the TCP peer address. The client address is `peer`, unless
+/// `peer` is in `trusted_proxies` and the request has exactly one
+/// `X-Real-IP` header that holds exactly one correct IP address. The relay
+/// never reads `X-Forwarded-For`.
+fn client_address(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[IpAddr]) -> IpAddr {
+    if !trusted_proxies.contains(&peer) {
+        return peer;
+    }
+    let mut values = headers.get_all(X_REAL_IP_HEADER).iter();
+    let Some(value) = values.next() else {
+        return peer;
+    };
+    if values.next().is_some() {
+        return peer;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|text| text.parse::<IpAddr>().ok())
+        .unwrap_or(peer)
+}
+
 fn hash_token(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
@@ -2690,6 +3494,17 @@ mod tests {
             },
         );
         (state, clock)
+    }
+
+    /// The count of client addresses the limiter of ADR 0007 is tracking.
+    fn client_limit_entries(state: &RelayState) -> usize {
+        state
+            .inner
+            .client_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .counters
+            .len()
     }
 
     #[tokio::test]
@@ -2823,7 +3638,7 @@ mod tests {
 
         clock.store(108, Ordering::SeqCst);
         let _subscription = state
-            .subscribe(&created.event_id, None)
+            .subscribe(&created.event_id, None, NO_CONNECT_INFO_ADDR)
             .await
             .expect("subscribe");
 
@@ -2972,11 +3787,14 @@ mod tests {
         let created = state.create_event().await.expect("create");
 
         let sub = state
-            .subscribe(&created.event_id, None)
+            .subscribe(&created.event_id, None, NO_CONNECT_INFO_ADDR)
             .await
             .expect("first subscribe");
 
-        let err = match state.subscribe(&created.event_id, None).await {
+        let err = match state
+            .subscribe(&created.event_id, None, NO_CONNECT_INFO_ADDR)
+            .await
+        {
             Ok(_) => panic!("second subscribe should be rejected"),
             Err(err) => err,
         };
@@ -2985,7 +3803,7 @@ mod tests {
 
         drop(sub);
         state
-            .subscribe(&created.event_id, None)
+            .subscribe(&created.event_id, None, NO_CONNECT_INFO_ADDR)
             .await
             .map(|_| ())
             .expect("post-drop subscribe");
@@ -3004,6 +3822,140 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_sweeps_client_limiter_entries_with_no_open_connection() {
+        let (state, clock) = test_state(1);
+        let created = state.create_event().await.expect("create event");
+
+        // Five client addresses each open and close one stream inside the
+        // same second (ADR 0007). The opportunistic prune in
+        // `release_client_slot` cannot remove any of them: a connect this
+        // same second is still a recent connect.
+        for low_byte in 0..5u8 {
+            let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, low_byte));
+            let sub = state
+                .subscribe(&created.event_id, None, addr)
+                .await
+                .expect("subscribe");
+            drop(sub);
+        }
+        assert_eq!(client_limit_entries(&state), 5);
+
+        // A later second: the sweep of `cleanup_expired` removes every
+        // entry that has no open connection and no connect in the current
+        // second.
+        clock.store(2, Ordering::SeqCst);
+        state.cleanup_expired().await;
+        assert_eq!(client_limit_entries(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_keeps_an_address_with_an_open_connection_and_still_releases_it() {
+        let (state, clock) = test_state(1);
+        let created = state.create_event().await.expect("create event");
+        let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50));
+
+        let sub = state
+            .subscribe(&created.event_id, None, addr)
+            .await
+            .expect("subscribe");
+
+        // The sweep never removes an address with an open connection, even
+        // on a later second.
+        clock.store(2, Ordering::SeqCst);
+        state.cleanup_expired().await;
+        assert_eq!(client_limit_entries(&state), 1);
+
+        // The slot still releases correctly once the stream closes.
+        drop(sub);
+        assert_eq!(client_limit_entries(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn the_amortized_sweep_bounds_the_client_limiter_map_with_no_ttl_reaper_call() {
+        let (state, clock) = test_state(1);
+        let created = state.create_event().await.expect("create event");
+        // Lower the amortized-sweep floor so the test does not need
+        // `CLIENT_LIMITS_SWEEP_FLOOR` (1024) connections to reach it.
+        // Production always starts at that constant.
+        let floor = 5;
+        state.set_client_limits_sweep_floor(floor);
+
+        // Two addresses keep one open connection through the whole test.
+        // The sweep, opportunistic or amortized, must never remove an
+        // address with an open connection.
+        let kept_a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200));
+        let kept_b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 201));
+        let sub_a = state
+            .subscribe(&created.event_id, None, kept_a)
+            .await
+            .expect("subscribe kept_a");
+        let sub_b = state
+            .subscribe(&created.event_id, None, kept_b)
+            .await
+            .expect("subscribe kept_b");
+
+        // Each second, one new, distinct address opens and closes one
+        // stream. No call to `cleanup_expired` runs in this test: the
+        // amortized sweep inside `RelayState::client_counter` is the only
+        // thing that can bound the map here.
+        for low_byte in 0..40u8 {
+            clock.store(u64::from(low_byte) + 2, Ordering::SeqCst);
+            let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, low_byte));
+            let sub = state
+                .subscribe(&created.event_id, None, addr)
+                .await
+                .expect("subscribe");
+            drop(sub);
+
+            // At most one address connected in the current second, and
+            // the two kept addresses are always open. The amortized sweep
+            // keeps the map from ever growing close to 40 entries.
+            let entries = client_limit_entries(&state);
+            assert!(
+                entries <= 2 * floor + 2,
+                "iteration {low_byte}: {entries} entries in the map"
+            );
+        }
+
+        drop(sub_a);
+        drop(sub_b);
+    }
+
+    /// A deterministic test of the race itself (a disconnect that beats
+    /// the connect handler's spawned task to the scheduler, before
+    /// `on_disconnect` is registered) is not practical through `oneshot`:
+    /// nothing in the public API of `tower`, `axum`, or `socketioxide`
+    /// lets a test control the relative scheduling of two independently
+    /// spawned tokio tasks. This test instead proves the guard itself:
+    /// [`SocketioSlotRelease::release`] runs the release once, however
+    /// many times it is called, on the guard or on a clone of it (ADR
+    /// 0007 §A Socket.IO Session With No Namespace).
+    #[tokio::test]
+    async fn socketio_slot_release_runs_the_release_at_most_once() {
+        let (state, _) = test_state(1);
+        let client_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 210));
+
+        assert!(state.try_acquire_socketio_slot());
+        let client_counter = state
+            .try_acquire_client_open_slot(client_addr)
+            .expect("acquire client open slot");
+        assert_eq!(state.inner.socketio_connections.load(Ordering::Acquire), 1);
+        assert_eq!(client_counter.open.load(Ordering::Acquire), 1);
+
+        let release = SocketioSlotRelease::new(state.clone(), client_addr, client_counter.clone());
+
+        // Two release calls, through two clones of the guard, the same as
+        // the registered `on_disconnect` handler and the post-
+        // registration `connected()` check in `register_socket_namespaces`
+        // can each attempt for the same connection.
+        release.clone().release();
+        release.release();
+
+        assert_eq!(state.inner.socketio_connections.load(Ordering::Acquire), 0);
+        assert_eq!(client_counter.open.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -3097,7 +4049,7 @@ mod tests {
         assert_eq!(state.expire_leases().await, 1);
 
         let subscription = state
-            .subscribe(&created.event_id, Some(published.seq))
+            .subscribe(&created.event_id, Some(published.seq), NO_CONNECT_INFO_ADDR)
             .await
             .expect("subscribe with last-event-id before the expiry");
 
@@ -3213,6 +4165,74 @@ mod tests {
 
         let err = result.expect_err("a lease below the minimum is rejected");
         assert!(err.to_string().contains("LEASE_SECS"));
+    }
+
+    #[test]
+    fn trusted_proxies_that_does_not_parse_is_a_configuration_error() {
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("TRUSTED_PROXIES", "127.0.0.1,not-an-ip-address");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("TRUSTED_PROXIES");
+        }
+
+        let err = result.expect_err("an entry that is not an IP address is rejected");
+        assert!(err.to_string().contains("TRUSTED_PROXIES"));
+    }
+
+    #[test]
+    fn trusted_proxies_defaults_to_loopback() {
+        assert_eq!(
+            AppConfig::for_tests().trusted_proxies,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ]
+        );
+    }
+
+    #[test]
+    fn max_socketio_connections_has_a_default_and_reads_the_environment() {
+        assert_eq!(DEFAULT_MAX_SOCKETIO_CONNECTIONS, 20_000);
+        assert_eq!(
+            AppConfig::for_tests().max_socketio_connections,
+            DEFAULT_MAX_SOCKETIO_CONNECTIONS
+        );
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("MAX_SOCKETIO_CONNECTIONS", "2");
+        }
+        let config = AppConfig::from_env().expect("valid config");
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("MAX_SOCKETIO_CONNECTIONS");
+        }
+        assert_eq!(config.max_socketio_connections, 2);
+    }
+
+    /// Acceptance criterion of listener limits task 002: the connect
+    /// timeout is 10 seconds in the builder. `SocketIo::builder()`'s
+    /// `connect_timeout` closes an Engine.IO session with no namespace
+    /// connect (ADR 0007 §A Socket.IO Session With No Namespace), through a
+    /// real `tokio::time::timeout` inside socketioxide. This checks the
+    /// builder value `app(state)` gives it, instead of waiting 10 real
+    /// seconds for that timer (AGENTS.md §7).
+    #[tokio::test]
+    async fn the_socketio_builder_sets_the_adr_0007_connect_timeout() {
+        let state = RelayState::new(AppConfig::for_tests());
+        let _router = app(state.clone());
+        assert_eq!(state.socketio_connect_timeout(), Duration::from_secs(10));
     }
 
     #[test]

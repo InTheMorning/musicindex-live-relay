@@ -5054,3 +5054,849 @@ mod reserved {
         }
     }
 }
+
+/// Tests for ADR 0007 task 001: the client address, and the listener-
+/// connection limits of `/events` and `/display/events`.
+mod listener_limits {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use axum::extract::connect_info::MockConnectInfo;
+    use musicindex_live_relay::{AdminToken, ReserveEventResponse};
+
+    use super::*;
+
+    fn events_uri(event_id: &str) -> String {
+        format!("/v1/liveitems/{event_id}/events")
+    }
+
+    fn display_events_uri(event_id: &str) -> String {
+        format!("/v1/liveitems/{event_id}/display/events")
+    }
+
+    async fn error_code(response: axum::response::Response) -> String {
+        let body: Value = read_json(response).await;
+        body["error"].as_str().expect("error code").to_string()
+    }
+
+    /// A TCP peer address in `203.0.113.0/24` (RFC 5737, reserved for
+    /// documentation), so a test can make a fresh, untrusted peer address
+    /// with one argument.
+    fn untrusted_peer(low_byte: u8) -> SocketAddr {
+        SocketAddr::from((IpAddr::V4(Ipv4Addr::new(203, 0, 113, low_byte)), 1))
+    }
+
+    /// Opens a stream from `peer`, with `headers` added to the request.
+    /// `MockConnectInfo` gives `peer` as the `ConnectInfo<SocketAddr>` of
+    /// the request, the same as `axum::serve`
+    /// `.into_make_service_with_connect_info::<SocketAddr>()` does in
+    /// production (ADR 0007).
+    async fn open_stream_from(
+        router: axum::Router,
+        uri: String,
+        peer: SocketAddr,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        router
+            .layer(MockConnectInfo(peer))
+            .oneshot(builder.body(Body::empty()).expect("stream request"))
+            .await
+            .expect("stream response")
+    }
+
+    #[tokio::test]
+    async fn the_51st_open_connection_from_one_address_is_refused_and_the_50th_succeeds() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 50,
+            // Isolate the open-connections limit from the connect-rate
+            // limit, which defaults to 10 per second.
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(1);
+
+        let mut open = Vec::new();
+        for _ in 0..50 {
+            let response =
+                open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            open.push(response);
+        }
+
+        let refused =
+            open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(refused).await, "listener_limit_reached");
+    }
+
+    #[tokio::test]
+    async fn closing_a_stream_frees_its_open_connection_slot() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(2);
+
+        let first =
+            open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second =
+            open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(second).await, "listener_limit_reached");
+
+        // Dropping the response drops its SSE body, so the subscription
+        // guard runs and frees the open-connection slot.
+        drop(first);
+        let third = open_stream_from(router, events_uri(&created.event_id), peer, &[]).await;
+        assert_eq!(third.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_second_address_is_not_affected_by_the_limit_of_the_first() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+
+        let first = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            untrusted_peer(3),
+            &[],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let blocked = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            untrusted_peer(3),
+            &[],
+        )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let second_address = open_stream_from(
+            router,
+            events_uri(&created.event_id),
+            untrusted_peer(4),
+            &[],
+        )
+        .await;
+        assert_eq!(second_address.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn connects_over_the_per_second_limit_are_refused_until_the_next_second() {
+        let (router, _state, clock) = test_app_with(AppConfig {
+            // Isolate the connect-rate limit from the open-connections
+            // limit.
+            max_listener_connections_per_client: 0,
+            max_listener_connects_per_client_per_sec: 10,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(5);
+
+        let mut open = Vec::new();
+        for _ in 0..10 {
+            let response =
+                open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            open.push(response);
+        }
+
+        let eleventh =
+            open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+        assert_eq!(eleventh.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(eleventh).await, "listener_limit_reached");
+
+        // The clock of `test_app_with` starts at 1. A new value moves the
+        // relay to a new one-second window (ADR 0007), with the time
+        // source of the relay, not a sleep (AGENTS.md §7).
+        clock.store(2, Ordering::SeqCst);
+        let after_the_second =
+            open_stream_from(router, events_uri(&created.event_id), peer, &[]).await;
+        assert_eq!(after_the_second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn two_x_real_ip_values_from_a_trusted_peer_count_as_two_clients() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        // The default `TRUSTED_PROXIES` trusts loopback.
+        let trusted_peer = SocketAddr::from(([127, 0, 0, 1], 9000));
+
+        let first = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            trusted_peer,
+            &[("X-Real-IP", "203.0.113.21")],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The same trusted peer, a different `X-Real-IP`: a different
+        // client, so the limit of the first client does not apply.
+        let second = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            trusted_peer,
+            &[("X-Real-IP", "203.0.113.22")],
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+
+        // A third connection with the first client's `X-Real-IP` meets
+        // that client's own limit.
+        let third = open_stream_from(
+            router,
+            events_uri(&created.event_id),
+            trusted_peer,
+            &[("X-Real-IP", "203.0.113.21")],
+        )
+        .await;
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(third).await, "listener_limit_reached");
+    }
+
+    #[tokio::test]
+    async fn x_real_ip_from_an_untrusted_peer_has_no_effect() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(6);
+
+        let first = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.31")],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The same untrusted peer, a different `X-Real-IP`: still the same
+        // client, because the relay reads `X-Real-IP` only from a trusted
+        // peer (ADR 0007 §The Client Address).
+        let second = open_stream_from(
+            router,
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.32")],
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(second).await, "listener_limit_reached");
+    }
+
+    #[tokio::test]
+    async fn x_forwarded_for_has_no_effect() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        // The default `TRUSTED_PROXIES` trusts loopback, so this proves
+        // `X-Forwarded-For` has no effect even from a trusted peer.
+        let trusted_peer = SocketAddr::from(([127, 0, 0, 1], 9100));
+
+        let first = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            trusted_peer,
+            &[("X-Forwarded-For", "203.0.113.41")],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = open_stream_from(
+            router,
+            events_uri(&created.event_id),
+            trusted_peer,
+            &[("X-Forwarded-For", "203.0.113.42")],
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(second).await, "listener_limit_reached");
+    }
+
+    #[tokio::test]
+    async fn a_limit_of_zero_turns_both_limits_off() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 0,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(7);
+
+        // More than the default of each limit, all in the same second,
+        // from the same address.
+        let mut open = Vec::new();
+        for _ in 0..60 {
+            let response =
+                open_stream_from(router.clone(), events_uri(&created.event_id), peer, &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            open.push(response);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_events_and_display_events_routes_share_one_open_connection_count() {
+        const ADMIN_TOKEN: &str = "listener-limits-admin-token-0123456789";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = RelayState::try_new(AppConfig {
+            admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
+            state_file: dir.path().join("reserved-items.sqlite3"),
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        })
+        .expect("open state");
+        let router = app(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/liveitems/reserved")
+                    .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("reserve request"),
+            )
+            .await
+            .expect("reserve response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let reserved: ReserveEventResponse = read_json(response).await;
+
+        let peer = untrusted_peer(8);
+        let first =
+            open_stream_from(router.clone(), events_uri(&reserved.event_id), peer, &[]).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second =
+            open_stream_from(router, display_events_uri(&reserved.event_id), peer, &[]).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(second).await, "listener_limit_reached");
+    }
+}
+
+/// Tests for ADR 0007 task 002: the Socket.IO limits, the global
+/// Socket.IO limit, and the Engine.IO handshake connect-rate check.
+///
+/// These tests drive Socket.IO through the raw Engine.IO polling
+/// transport with `tower::ServiceExt::oneshot`, following the wire
+/// sequence of `docs/research/curiohoster-livevalue-socketio-examples.md`
+/// §Source: a GET handshake, a POST connect (or disconnect), then a GET
+/// poll for the buffered packets.
+mod socketio_limits {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use axum::extract::connect_info::MockConnectInfo;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// A TCP peer address in `203.0.113.0/24` (RFC 5737, reserved for
+    /// documentation), so a test can make a fresh, untrusted peer address
+    /// with one argument.
+    fn untrusted_peer(low_byte: u8) -> SocketAddr {
+        SocketAddr::from((IpAddr::V4(Ipv4Addr::new(203, 0, 113, low_byte)), 1))
+    }
+
+    async fn error_code(response: axum::response::Response) -> String {
+        let body: Value = read_json(response).await;
+        body["error"].as_str().expect("error code").to_string()
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    /// The Engine.IO `sid` of an open packet body (`0{"sid":...}`, the
+    /// research note's §Source sequence).
+    fn handshake_sid(body: &str) -> String {
+        let json_part = body.strip_prefix('0').expect("engine.io open packet");
+        let open: Value = serde_json::from_str(json_part).expect("open packet is json");
+        open["sid"]
+            .as_str()
+            .expect("open packet has a sid")
+            .to_string()
+    }
+
+    fn handshake_uri(query: &str) -> String {
+        format!("/socket.io/?{query}&EIO=4&transport=polling")
+    }
+
+    fn session_uri(query: &str, sid: &str) -> String {
+        format!("/socket.io/?{query}&EIO=4&transport=polling&sid={sid}")
+    }
+
+    /// Opens a new Engine.IO handshake from `peer`. The research note's
+    /// §Source requires `event_id` to already be in `query` on this first
+    /// request.
+    async fn handshake(
+        router: axum::Router,
+        peer: SocketAddr,
+        query: &str,
+    ) -> axum::response::Response {
+        router
+            .layer(MockConnectInfo(peer))
+            .oneshot(
+                Request::builder()
+                    .uri(handshake_uri(query))
+                    .body(Body::empty())
+                    .expect("handshake request"),
+            )
+            .await
+            .expect("handshake response")
+    }
+
+    /// Sends one packet body over an existing Engine.IO session, the same
+    /// shape as the research note's §Source `POST` of a polling packet.
+    async fn post_packet(
+        router: axum::Router,
+        peer: SocketAddr,
+        query: &str,
+        sid: &str,
+        packet: &str,
+    ) -> axum::response::Response {
+        router
+            .layer(MockConnectInfo(peer))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(session_uri(query, sid))
+                    .body(Body::from(packet.to_string()))
+                    .expect("post request"),
+            )
+            .await
+            .expect("post response")
+    }
+
+    /// Sends the Socket.IO `CONNECT` packet for the `/event` namespace
+    /// (`40/event,`).
+    async fn connect_namespace(
+        router: axum::Router,
+        peer: SocketAddr,
+        query: &str,
+        sid: &str,
+    ) -> axum::response::Response {
+        post_packet(router, peer, query, sid, "40/event,").await
+    }
+
+    /// Sends the Socket.IO `DISCONNECT` packet for the `/event` namespace
+    /// (`41/event,`), the packet a real client sends from
+    /// `socket.disconnect()`. The relay's `on_disconnect` handler sees the
+    /// reason `ClientNSDisconnect` for this packet (ADR 0007: "a disconnect
+    /// by the client").
+    async fn disconnect_namespace(
+        router: axum::Router,
+        peer: SocketAddr,
+        query: &str,
+        sid: &str,
+    ) -> axum::response::Response {
+        post_packet(router, peer, query, sid, "41/event,").await
+    }
+
+    /// One GET poll of the Engine.IO session, bounded so a response with
+    /// nothing new to send cannot hang the test indefinitely. The bound
+    /// guards the test harness only: it is not the relay's time source
+    /// (AGENTS.md §7), and it is not how the ADR 0007 connect timeout is
+    /// tested (see `the_socketio_builder_sets_the_adr_0007_connect_timeout`
+    /// in `src/lib.rs`, a unit test of the builder value).
+    async fn try_poll(
+        router: axum::Router,
+        peer: SocketAddr,
+        query: &str,
+        sid: &str,
+    ) -> Option<String> {
+        let request = Request::builder()
+            .uri(session_uri(query, sid))
+            .body(Body::empty())
+            .expect("poll request");
+        match timeout(
+            Duration::from_millis(200),
+            router.layer(MockConnectInfo(peer)).oneshot(request),
+        )
+        .await
+        {
+            Ok(response) => Some(body_text(response.expect("poll response")).await),
+            Err(_) => None,
+        }
+    }
+
+    /// Polls until the packets collected so far contain `needle`, or panics
+    /// after a bounded count of polls. Never an indefinite wait: each
+    /// attempt is itself bounded by `try_poll`.
+    async fn poll_until_contains(
+        router: axum::Router,
+        peer: SocketAddr,
+        query: &str,
+        sid: &str,
+        needle: &str,
+    ) -> String {
+        let mut collected = String::new();
+        for _ in 0..10 {
+            match try_poll(router.clone(), peer, query, sid).await {
+                Some(body) => {
+                    // Each poll is its own Engine.IO payload, already
+                    // separated internally. Two separate polls need the
+                    // same record separator between them, or a packet at
+                    // the end of one and a packet at the start of the next
+                    // would read as one joined, unparseable packet.
+                    if !collected.is_empty() && !body.is_empty() {
+                        collected.push('\u{1e}');
+                    }
+                    collected.push_str(&body);
+                    if collected.contains(needle) {
+                        return collected;
+                    }
+                }
+                None => break,
+            }
+        }
+        panic!("expected {needle:?} in the polled Socket.IO packets, got {collected:?}");
+    }
+
+    /// The JSON payload of the first `remoteValue` event in a raw Engine.IO
+    /// packet stream (ADR 0004; the payload shape of
+    /// `docs/research/curiohoster-livevalue-socketio-examples.md`).
+    fn remote_value_payload(packets: &str) -> Value {
+        for packet in packets.split('\u{1e}') {
+            if let Some(rest) = packet.strip_prefix("42/event,") {
+                let array: Value = serde_json::from_str(rest).expect("remoteValue packet is json");
+                if array[0] == "remoteValue" {
+                    return array[1].clone();
+                }
+            }
+        }
+        panic!("no remoteValue packet in {packets:?}");
+    }
+
+    /// True when a Socket.IO `DISCONNECT` packet for `/event` (`41/event`)
+    /// is present in a raw Engine.IO packet stream.
+    fn has_disconnect_packet(packets: &str) -> bool {
+        packets
+            .split('\u{1e}')
+            .any(|packet| packet.starts_with("41/event"))
+    }
+
+    /// Opens an SSE stream, the same request task 001's `listener_limits`
+    /// tests make, so a Socket.IO test can prove the two kinds of
+    /// connection share one open-connection count (ADR 0007 §Three
+    /// Limits).
+    async fn open_sse_stream(
+        router: axum::Router,
+        peer: SocketAddr,
+        event_id: &str,
+    ) -> axum::response::Response {
+        router
+            .layer(MockConnectInfo(peer))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{event_id}/events"))
+                    .body(Body::empty())
+                    .expect("sse request"),
+            )
+            .await
+            .expect("sse response")
+    }
+
+    /// Gives the tokio scheduler a few cooperative turns, so a task spawned
+    /// just before this call (such as the release task behind
+    /// `SocketRef::on_disconnect`, which socketioxide itself spawns) gets
+    /// to run before the next assertion. Not a sleep: no real time passes,
+    /// and nothing here depends on wall-clock time (AGENTS.md §7).
+    async fn let_spawned_tasks_run() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_51st_socketio_connection_from_one_address_gets_empty_object_and_a_disconnect() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 50,
+            // Isolate the open-connections limit from the connect-rate
+            // limit, which defaults to 10 per second.
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let published = publish(
+            router.clone(),
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "live"}),
+        )
+        .await;
+        assert_eq!(published.status(), StatusCode::OK);
+
+        let query = format!("event_id={}", created.event_id);
+        let peer = untrusted_peer(1);
+
+        let mut last_sid = String::new();
+        for _ in 0..50 {
+            let opened = handshake(router.clone(), peer, &query).await;
+            assert_eq!(opened.status(), StatusCode::OK);
+            last_sid = handshake_sid(&body_text(opened).await);
+            let connected = connect_namespace(router.clone(), peer, &query, &last_sid).await;
+            assert_eq!(connected.status(), StatusCode::OK);
+        }
+
+        // The 50th accepted connection gets the current, published value,
+        // with no disconnect.
+        let accepted =
+            poll_until_contains(router.clone(), peer, &query, &last_sid, "remoteValue").await;
+        assert_eq!(remote_value_payload(&accepted)["title"], "live");
+        assert!(!has_disconnect_packet(&accepted));
+
+        // Connection 51 gets `{}` and a disconnect, as for an unknown
+        // event (ADR 0007).
+        let opened = handshake(router.clone(), peer, &query).await;
+        let refused_sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), peer, &query, &refused_sid).await;
+
+        let refused =
+            poll_until_contains(router.clone(), peer, &query, &refused_sid, "41/event").await;
+        assert_eq!(remote_value_payload(&refused), json!({}));
+        assert!(has_disconnect_packet(&refused));
+    }
+
+    #[tokio::test]
+    async fn sse_and_socketio_connections_of_one_address_share_one_open_count() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(20);
+
+        let sse = open_sse_stream(router.clone(), peer, &created.event_id).await;
+        assert_eq!(sse.status(), StatusCode::OK);
+
+        let query = format!("event_id={}", created.event_id);
+        let opened = handshake(router.clone(), peer, &query).await;
+        let sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), peer, &query, &sid).await;
+
+        let refused = poll_until_contains(router.clone(), peer, &query, &sid, "41/event").await;
+        assert_eq!(remote_value_payload(&refused), json!({}));
+        assert!(has_disconnect_packet(&refused));
+
+        drop(sse);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_by_the_client_frees_its_socketio_slot() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let peer = untrusted_peer(30);
+        let query = format!("event_id={}", created.event_id);
+
+        let opened = handshake(router.clone(), peer, &query).await;
+        let sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), peer, &query, &sid).await;
+        let accepted = poll_until_contains(router.clone(), peer, &query, &sid, "remoteValue").await;
+        assert!(!has_disconnect_packet(&accepted));
+
+        // The client disconnects from the namespace (`41/event,`), the
+        // packet a real client sends from `socket.disconnect()`.
+        disconnect_namespace(router.clone(), peer, &query, &sid).await;
+        let_spawned_tasks_run().await;
+
+        // The slot is free again: a second connection from the same
+        // address succeeds. At a limit of 1, it would be refused otherwise.
+        let reopened = handshake(router.clone(), peer, &query).await;
+        let second_sid = handshake_sid(&body_text(reopened).await);
+        connect_namespace(router.clone(), peer, &query, &second_sid).await;
+        let second =
+            poll_until_contains(router.clone(), peer, &query, &second_sid, "remoteValue").await;
+        assert!(!has_disconnect_packet(&second));
+    }
+
+    #[tokio::test]
+    async fn the_third_address_is_refused_when_the_global_limit_is_two_and_freed_on_disconnect() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_socketio_connections: 2,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let query = format!("event_id={}", created.event_id);
+
+        let first_peer = untrusted_peer(10);
+        let opened = handshake(router.clone(), first_peer, &query).await;
+        let first_sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), first_peer, &query, &first_sid).await;
+        let first_accepted = poll_until_contains(
+            router.clone(),
+            first_peer,
+            &query,
+            &first_sid,
+            "remoteValue",
+        )
+        .await;
+        assert!(!has_disconnect_packet(&first_accepted));
+
+        let second_peer = untrusted_peer(11);
+        let opened = handshake(router.clone(), second_peer, &query).await;
+        let second_sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), second_peer, &query, &second_sid).await;
+        let second_accepted = poll_until_contains(
+            router.clone(),
+            second_peer,
+            &query,
+            &second_sid,
+            "remoteValue",
+        )
+        .await;
+        assert!(!has_disconnect_packet(&second_accepted));
+
+        // A third address, with its own open count of zero: the global
+        // limit, not the client limit, refuses it (ADR 0007 §Three
+        // Limits).
+        let third_peer = untrusted_peer(12);
+        let opened = handshake(router.clone(), third_peer, &query).await;
+        let third_sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), third_peer, &query, &third_sid).await;
+        let refused =
+            poll_until_contains(router.clone(), third_peer, &query, &third_sid, "41/event").await;
+        assert_eq!(remote_value_payload(&refused), json!({}));
+        assert!(has_disconnect_packet(&refused));
+
+        // The global count goes back down on disconnect: once the first
+        // address leaves, the third address can connect.
+        disconnect_namespace(router.clone(), first_peer, &query, &first_sid).await;
+        let_spawned_tasks_run().await;
+
+        let opened = handshake(router.clone(), third_peer, &query).await;
+        let retry_sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), third_peer, &query, &retry_sid).await;
+        let retried = poll_until_contains(
+            router.clone(),
+            third_peer,
+            &query,
+            &retry_sid,
+            "remoteValue",
+        )
+        .await;
+        assert!(!has_disconnect_packet(&retried));
+    }
+
+    #[tokio::test]
+    async fn the_11th_handshake_from_one_address_in_one_second_gets_429() {
+        let (router, _state, clock) = test_app_with(AppConfig {
+            max_listener_connects_per_client_per_sec: 10,
+            max_listener_connections_per_client: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let query = format!("event_id={}", created.event_id);
+        let peer = untrusted_peer(40);
+
+        for _ in 0..10 {
+            let response = handshake(router.clone(), peer, &query).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let eleventh = handshake(router.clone(), peer, &query).await;
+        assert_eq!(eleventh.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(eleventh).await, "listener_limit_reached");
+
+        // The clock of `test_app_with` starts at 1. A new value moves the
+        // relay to a new one-second window (ADR 0007), with the time
+        // source of the relay, not a sleep (AGENTS.md §7).
+        clock.store(2, Ordering::SeqCst);
+        let after_the_second = handshake(router, peer, &query).await;
+        assert_eq!(after_the_second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_handshake_takes_no_open_connection_slot() {
+        // A handshake that never connects to a namespace must not use up
+        // the open-connections limit: only a later namespace connect does
+        // (ADR 0007 §A Socket.IO Session With No Namespace). Ten handshakes
+        // with no connect, at an open-connections limit of one, leave the
+        // one open-connection slot free for an actual connect.
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        let query = format!("event_id={}", created.event_id);
+        let peer = untrusted_peer(45);
+
+        for _ in 0..10 {
+            let response = handshake(router.clone(), peer, &query).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let opened = handshake(router.clone(), peer, &query).await;
+        let sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), peer, &query, &sid).await;
+        let accepted = poll_until_contains(router.clone(), peer, &query, &sid, "remoteValue").await;
+        assert!(!has_disconnect_packet(&accepted));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_event_gets_empty_object_and_a_disconnect_and_takes_no_slot() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let peer = untrusted_peer(50);
+        let query = "event_id=does-not-exist";
+
+        let opened = handshake(router.clone(), peer, query).await;
+        let sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), peer, query, &sid).await;
+
+        let refused = poll_until_contains(router.clone(), peer, query, &sid, "41/event").await;
+        assert_eq!(remote_value_payload(&refused), json!({}));
+        assert!(has_disconnect_packet(&refused));
+
+        // The unknown-event attempt took no slot: a connection to a real
+        // event from the same address, at a limit of 1, still succeeds.
+        let created = create_event(router.clone()).await;
+        let real_query = format!("event_id={}", created.event_id);
+        let opened = handshake(router.clone(), peer, &real_query).await;
+        let real_sid = handshake_sid(&body_text(opened).await);
+        connect_namespace(router.clone(), peer, &real_query, &real_sid).await;
+        let accepted =
+            poll_until_contains(router.clone(), peer, &real_query, &real_sid, "remoteValue").await;
+        assert!(!has_disconnect_packet(&accepted));
+    }
+}

@@ -475,6 +475,20 @@ The relay immediately emits the current `remoteValue` payload after a successful
 
 The Socket.IO server uses namespace `/event` and the standard Engine.IO request path `/socket.io`.
 
+Above the listener-connection limit of one client address, the relay
+refuses the connection (ADR 0007). It sends `{}` on `remoteValue`, then
+disconnects the client, as for an unknown event. See "The Client Address"
+below. Above `MAX_SOCKETIO_CONNECTIONS`, the global limit of open
+Socket.IO connections, the relay does the same.
+
+Each Engine.IO handshake counts against the connect rate of its client
+address. A handshake is a request to `/socket.io/` with no `sid` query
+parameter. Above the rate, the relay answers `429` with the error code
+`listener_limit_reached` to that request.
+
+The Socket.IO server closes a session with no namespace connect after 10
+seconds.
+
 ### Subscribe With SSE
 
 ```http
@@ -498,6 +512,11 @@ The stream also sends periodic keepalive comments.
 
 SSE always follows the instant timeline (ADR 0004). It never waits for
 the delay of a publish. See "The Listener Timeline" above.
+
+Above the listener-connection limit of one client address, the relay
+answers `429` with the error code `listener_limit_reached` (ADR 0007). See
+"The Client Address" below. Above the global limit, the relay answers
+`503` with the error code `max_sse_connections_reached`.
 
 ### Display State
 
@@ -667,6 +686,10 @@ Status codes:
 - `200` with the stream.
 - `404` with error code `event_not_found` when the item does not exist.
 - `409` with error code `event_not_reserved` when the item is ephemeral.
+- `429` with error code `listener_limit_reached` above the listener-
+  connection limit of one client address (ADR 0007). See "The Client
+  Address" below. The display streams and the `/events` streams share
+  this limit.
 - `503` with error code `max_sse_connections_reached` when the relay has
   `MAX_SSE_CONNECTIONS` streams open. The display streams and the `/events`
   streams share this limit.
@@ -961,6 +984,10 @@ Configuration is read from environment variables.
 | `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. A reserved item holds two images at most. See "Image Retention" above. |
 | `MAX_LISTENER_DELAY_SECS` | `300` | The highest value of the `Listener-Delay-Secs` header that a publish can send (ADR 0004). See "Publish Metadata" above. |
 | `MAX_PENDING_LISTENER_UPDATES` | `64` | The highest count of pending listener updates that the relay keeps for each event (ADR 0004). Must be 1 or more. See "The Listener Timeline" above. |
+| `TRUSTED_PROXIES` | `127.0.0.1,::1` | A comma-separated list of TCP peer addresses that the relay trusts to set `X-Real-IP` (ADR 0007). See "The Client Address" below. |
+| `MAX_LISTENER_CONNECTIONS_PER_CLIENT` | `50` | The highest count of open `/events` and `/display/events` streams, and open Socket.IO connections, of one client address (ADR 0007). A value of 0 turns this limit off. See "The Client Address" below. |
+| `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC` | `10` | The highest count of new `/events` and `/display/events` streams, and new Socket.IO connections, of one client address in one second (ADR 0007). A value of 0 turns this limit off. See "The Client Address" below. |
+| `MAX_SOCKETIO_CONNECTIONS` | `20000` | The highest count of open Socket.IO connections of the full relay (ADR 0007). See "Subscribe With Socket.IO" above. |
 
 The included systemd unit sets `ProtectSystem=strict`,
 `StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. systemd
@@ -970,7 +997,40 @@ the state file, it stops at startup and the error names the path.
 
 Metadata request bodies are limited to 64 KiB. Reserve request bodies are limited to 4 KiB. Display request bodies are limited to 8 KiB. Image uploads are limited to `ARTWORK_MAX_BYTES`. Other routes are unconstrained.
 
-Per-IP rate limiting is the responsibility of the front-end proxy (e.g. nginx). The relay's `MAX_CREATES_PER_SEC` is a global safety bound, not a per-client limit.
+ADR 0007 gives the listener-connection limits of one client address. See "The Client Address" below. The front-end proxy (for example, nginx) keeps the responsibility for the per-IP rate limits of publish and create requests. The relay's `MAX_CREATES_PER_SEC` is a global safety bound, not a per-client limit.
+
+### The Client Address
+
+The relay finds the client address of a request this way (ADR 0007):
+
+- The TCP peer address can be in `TRUSTED_PROXIES`. The request can also
+  have one `X-Real-IP` header with one correct IP address. Then the client
+  address is that address.
+- In every other condition, the client address is the TCP peer address.
+- The relay never reads `X-Forwarded-For`. A client can set it to any
+  value, so it carries no trust.
+
+The default `TRUSTED_PROXIES` trusts loopback only, because the default
+`BIND` sits behind a local proxy. On `api.musicindex.org`, nginx sets
+`X-Real-IP $remote_addr` on every request, so a client cannot set it itself.
+
+`MAX_LISTENER_CONNECTIONS_PER_CLIENT` and
+`MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC` apply to the client address of
+`/events`, `/display/events`, and a Socket.IO connection to `/event`,
+together. These three share one open-connection count and one connect-rate
+count for each client address.
+
+Above the open-connection limit, or above the connect-rate limit, the
+relay answers `429` with the error code `listener_limit_reached` for SSE.
+For Socket.IO, it sends `{}` on `remoteValue` and disconnects the client.
+A connection meets this check before the global `503
+max_sse_connections_reached` check, or the global `MAX_SOCKETIO_CONNECTIONS`
+check. See "Subscribe With SSE", "Subscribe With Socket.IO", and "Subscribe
+To The Display State" above.
+
+An Engine.IO handshake counts against `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC`
+by itself. The namespace connect, after the handshake, does not count
+again. See "Subscribe With Socket.IO" above.
 
 CORS is enabled with a permissive policy (any origin, method, and header) so browser-side podcast apps can consume the SSE and HTTP fallback endpoints directly. Lock this down at the proxy if you need stricter origin policy.
 

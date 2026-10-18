@@ -52,7 +52,7 @@ station runs continuously.
 - [Display album phase plan](plans/adr-0006-display-album-phase-plan.md)
   — Ready. One packet
 - [Listener limits phase plan](plans/adr-0007-listener-limits-phase-plan.md)
-  — Ready. Two packets
+  — Packets done. Deployment checks open
 
 ## Tasks
 
@@ -100,9 +100,9 @@ Packet for the display album plan. ADR 0006 governs it. Ready - 2026-10-06.
 Packets for the listener limits plan. ADR 0007 governs them. Ready - 2026-10-18.
 
 - [001 — The client address and the SSE limits](tasks/listener-limits-task-001-client-address-and-sse.md)
-  — Ready - 2026-10-18
+  — Implemented - 2026-10-18
 - [002 — The Socket.IO limits](tasks/listener-limits-task-002-socket-io.md)
-  — Ready - 2026-10-18
+  — Implemented - 2026-10-18
 
 ## Runbooks
 

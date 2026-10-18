@@ -111,9 +111,9 @@ The reserve response holds the fields of the create response, and `label`.
 
 ### A client has listener limits
 
-ADR 0007 is accepted. It is not implemented. After the implementation, these
-limits apply to the listener connections of one client address: Socket.IO
-connections, `/events` streams and `/display/events` streams.
+ADR 0007 gives these limits. They apply to the listener connections of one
+client address: Socket.IO connections, `/events` streams and
+`/display/events` streams. The deployment to `api.musicindex.org` is open.
 
 | Limit | Default | Result at the limit |
 |---|---|---|

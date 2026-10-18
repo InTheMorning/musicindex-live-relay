@@ -64,9 +64,10 @@ packet.
 - ADR 0006, the optional display track key `album`, has the status
   `Implemented`. A display track can also have `album`.
 - ADR 0007, listener connection limits for each client, has the status
-  `Accepted`. Its plan is `docs/plans/adr-0007-listener-limits-phase-plan.md`. It adds a limit for each client address on listener
-  connections, a global Socket.IO limit, and trust of `X-Real-IP` from a
-  proxy. Until it is implemented, Socket.IO has no connection limit.
+  `Accepted`. Its two packets are done. The relay limits the listener
+  connections of each client address, and the open Socket.IO connections of
+  the full relay. It trusts `X-Real-IP` only from `TRUSTED_PROXIES`. The two
+  deployment checks of `docs/reviews/adr-0007-review-checklist.md` are open.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
@@ -148,6 +149,8 @@ This service carries payment routing to listener apps.
 
 - Every limit is configurable and has a default: active events, SSE
   connections, event TTL, publish rate, and create rate.
+- ADR 0007 adds three more: listener connections and listener connects for
+  each client, and Socket.IO connections for the full relay.
 - `POST /v1/liveitems` is public. Any new route that consumes durable storage
   must need a credential, or it is an unbounded growth surface.
 - The replay buffer holds a fixed number of updates for each event. Keep the
