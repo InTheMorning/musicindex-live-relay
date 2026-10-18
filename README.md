@@ -984,7 +984,7 @@ Configuration is read from environment variables.
 | `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. A reserved item holds two images at most. See "Image Retention" above. |
 | `MAX_LISTENER_DELAY_SECS` | `300` | The highest value of the `Listener-Delay-Secs` header that a publish can send (ADR 0004). See "Publish Metadata" above. |
 | `MAX_PENDING_LISTENER_UPDATES` | `64` | The highest count of pending listener updates that the relay keeps for each event (ADR 0004). Must be 1 or more. See "The Listener Timeline" above. |
-| `TRUSTED_PROXIES` | `127.0.0.1,::1` | A comma-separated list of TCP peer addresses that the relay trusts to set `X-Real-IP` (ADR 0007). See "The Client Address" below. |
+| `TRUSTED_PROXIES` | `127.0.0.1,::1` | A comma-separated list of addresses and CIDR ranges that the relay trusts to set `X-Real-IP` (ADR 0007). See "The Client Address" below. |
 | `MAX_LISTENER_CONNECTIONS_PER_CLIENT` | `50` | The highest count of open `/events` and `/display/events` streams, and open Socket.IO connections, of one client address (ADR 0007). A value of 0 turns this limit off. See "The Client Address" below. |
 | `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC` | `10` | The highest count of new `/events` and `/display/events` streams, and new Socket.IO connections, of one client address in one second (ADR 0007). A value of 0 turns this limit off. See "The Client Address" below. |
 | `MAX_SOCKETIO_CONNECTIONS` | `20000` | The highest count of open Socket.IO connections of the full relay (ADR 0007). See "Subscribe With Socket.IO" above. |
@@ -1001,14 +1001,31 @@ ADR 0007 gives the listener-connection limits of one client address. See "The Cl
 
 ### The Client Address
 
-The relay finds the client address of a request this way (ADR 0007):
+The relay finds the client address of a request this way (ADR 0007, amended
+2026-10-18):
 
-- The TCP peer address can be in `TRUSTED_PROXIES`. The request can also
-  have one `X-Real-IP` header with one correct IP address. Then the client
-  address is that address.
-- In every other condition, the client address is the TCP peer address.
+- The relay changes the TCP peer address to its canonical form. An
+  IPv4-mapped IPv6 peer, for example `::ffff:127.0.0.1`, becomes the IPv4
+  address `127.0.0.1`.
+- The canonical peer address can be in `TRUSTED_PROXIES`. The request can
+  also have one `X-Real-IP` header with one correct IP address. Then the
+  client address is that address.
+- In every other condition, the client address is the canonical peer
+  address.
 - The relay never reads `X-Forwarded-For`. A client can set it to any
   value, so it carries no trust.
+
+Each entry of `TRUSTED_PROXIES` is an address, or a CIDR range such as
+`172.16.0.0/12`. An entry with no prefix length is an address: `/32` for
+IPv4, `/128` for IPv6. A prefix length above these values is a
+configuration error. A range with a bit set after its prefix length, for
+example `172.18.0.1/16`, is also a configuration error.
+
+A request can have `X-Real-IP` from a peer that `TRUSTED_PROXIES` does not
+trust. The relay then uses the peer address, and ignores the header. The
+first such request after a start writes one warning line to the log. The
+line names the peer address and `TRUSTED_PROXIES`. It does not give the
+value of `X-Real-IP`.
 
 The default `TRUSTED_PROXIES` trusts loopback only, because the default
 `BIND` sits behind a local proxy. On `api.musicindex.org`, nginx sets
@@ -1017,16 +1034,21 @@ The default `TRUSTED_PROXIES` trusts loopback only, because the default
 A relay in a container sees a different TCP peer. With a Docker bridge
 network and a published port, the peer is the gateway of that network, for
 example `172.18.0.1`, not `127.0.0.1`. Add that gateway to
-`TRUSTED_PROXIES`. If you do not, the relay uses the gateway as the client
-address of each listener, and the limit for each client becomes a limit for
-the full relay. Show the gateway with this command:
+`TRUSTED_PROXIES`, or add a CIDR range that holds it. If you do not, the
+relay uses the gateway as the client address of each listener, and the
+limit for each client becomes a limit for the full relay. Show the gateway
+with this command:
 
 ```bash
 docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' CONTAINER
 ```
 
-The gateway belongs to the network. If the network is made again with a
-different subnet, change `TRUSTED_PROXIES` too.
+The gateway belongs to the network. If the network is made again, Docker
+can assign a new subnet, and the gateway changes with it. Use a range that
+holds the address pool of the Docker daemon. The default pool of a bridge
+network is `172.17.0.0/16` to `172.31.0.0/16`, and `172.16.0.0/12` holds
+it. When that pool is full, Docker uses `192.168.0.0/16`. Each container in
+the trusted range can set `X-Real-IP`.
 
 `MAX_LISTENER_CONNECTIONS_PER_CLIENT` and
 `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC` apply to the client address of

@@ -7,6 +7,16 @@ Implemented - 2026-10-18.
 Implemented 2026-10-18. The named artifact is
 `docs/reviews/adr-0007-review-checklist.md`, which has no open gates.
 
+Amended 2026-10-18: an entry of `TRUSTED_PROXIES` can be a CIDR range. The
+relay compares the canonical form of the TCP peer address. The relay logs one
+warning when it ignores `X-Real-IP` from a peer that is not trusted. The
+deployment check found the cause: in a container the peer is the bridge
+gateway, and the gateway changes when the network is made again. The
+amendment adds to the address rule and reverses no decision. The
+implementation is
+`docs/tasks/listener-limits-task-003-trusted-ranges-and-warning.md`, done on
+2026-10-18.
+
 Accepted 2026-10-18 by the operator. The operator confirmed the defaults 50,
 10 and 20000, and the scope that includes SSE. `docs/interoperability.md`
 records the limits. The plan is
@@ -58,8 +68,15 @@ no connection limit and makes a room for each new identifier. The note is in
 
 ### The Client Address
 
-- `TRUSTED_PROXIES` is a list of IP addresses. The default is
-  `127.0.0.1,::1`.
+- `TRUSTED_PROXIES` is a comma-separated list. Each entry is an IP address
+  or a CIDR range, for example `172.16.0.0/12`. An address is a range with
+  the full prefix length. The default is `127.0.0.1,::1`.
+- An entry that does not parse is a startup error that names the setting. A
+  prefix length above 32 for IPv4 or above 128 for IPv6 does not parse. A
+  range with bits set after its prefix does not parse.
+- The relay compares the canonical form of the TCP peer address. An
+  IPv4-mapped IPv6 peer, for example `::ffff:127.0.0.1`, matches the IPv4
+  entry `127.0.0.1`.
 - A request can come from a TCP peer in `TRUSTED_PROXIES`, with `X-Real-IP`
   that holds one correct IP address. Then the client address is that address.
 - In all other conditions, the client address is the TCP peer address.
@@ -68,6 +85,17 @@ no connection limit and makes a room for each new identifier. The note is in
 The default trusts loopback because the default `BIND` is `127.0.0.1:8018`
 behind a proxy. With no trust, a limit for each client would be a limit for
 the full relay.
+
+### A Warning For An Ignored Header
+
+A request can have `X-Real-IP` from a TCP peer that is not in
+`TRUSTED_PROXIES`. The relay then uses the peer address, as above. The first
+such request after a start causes one `warn` log line. The line names the
+peer address and `TRUSTED_PROXIES`. It does not give the header value. After
+that, requests cause no log line, so a client cannot fill the log.
+
+A proxy that the relay does not trust makes all listeners one client. The
+warning shows this at the first listener.
 
 ### Three Limits
 
@@ -103,6 +131,7 @@ relay closes such a session after 10 seconds. The handshake counts against
 
 - Each listener connection counts against one client address.
 - The relay reads `X-Real-IP` only from a peer in `TRUSTED_PROXIES`.
+- A relay that ignores `X-Real-IP` logs it one time after each start.
 - A connection over a limit gets `{}` and a disconnect on Socket.IO, or `429`
   on SSE. It never gets a stale value.
 - Each limit is configurable and has a default.
@@ -132,6 +161,11 @@ relay closes such a session after 10 seconds. The handshake counts against
 - A test shows that a session with no namespace closes after 10 seconds,
   with an injected time source.
 - `README.md` documents each setting and the `429`.
+- Amendment 2026-10-18: a test shows that a peer in a CIDR entry is
+  trusted, and that a peer out of it is not. A test shows that an
+  IPv4-mapped peer matches an IPv4 entry. A test shows that each incorrect
+  entry is a configuration error. A unit test shows that the warning goes
+  out one time.
 
 ## Alternatives Considered
 
@@ -144,6 +178,12 @@ include an nginx limit. A deployment with no proxy would have no limit.
 
 Rejected. It cannot keep a popular event available and also stop one
 client.
+
+### Trust Each Address Of A Private Network
+
+Rejected. A default of `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` would trust
+each container and each host on a private network. Each of them could then
+set `X-Real-IP`. The operator names the range of the deployment.
 
 ### `X-Forwarded-For`
 

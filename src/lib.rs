@@ -192,9 +192,9 @@ pub struct AppConfig {
     /// The pending listener updates that the relay keeps for each event
     /// (ADR 0004).
     pub max_pending_listener_updates: usize,
-    /// The TCP peers the relay trusts to set `X-Real-IP` (ADR 0007 §The
-    /// Client Address).
-    pub trusted_proxies: Vec<IpAddr>,
+    /// The addresses and the ranges the relay trusts to set `X-Real-IP`
+    /// (ADR 0007 §The Client Address, amended 2026-10-18).
+    pub trusted_proxies: Vec<TrustedProxy>,
     /// The highest count of open listener connections from one client
     /// address, Socket.IO and SSE together (ADR 0007 §Three Limits). A
     /// value of 0 turns this limit off.
@@ -321,14 +321,129 @@ fn parse_max_pending_listener_updates() -> Result<usize, ConfigError> {
     Ok(count)
 }
 
-/// Reads `TRUSTED_PROXIES`, the TCP peers the relay trusts to set
-/// `X-Real-IP` (ADR 0007 §The Client Address).
+/// One entry of `TRUSTED_PROXIES`: an address, or a CIDR range such as
+/// `172.16.0.0/12` (ADR 0007 §The Client Address, amended 2026-10-18).
+///
+/// An entry with no `/` in `TRUSTED_PROXIES` is an address with the full
+/// prefix length: 32 for an IPv4 network, 128 for an IPv6 network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedProxy {
+    /// The network address of the entry.
+    pub network: IpAddr,
+    /// The prefix length of the entry, in bits.
+    pub prefix_len: u8,
+}
+
+impl TrustedProxy {
+    /// True when `addr` is in this entry's range.
+    ///
+    /// An IPv4 entry never holds an IPv6 address, and an IPv6 entry never
+    /// holds an IPv4 address. Pass `addr` in canonical form
+    /// ([`IpAddr::to_canonical`]), so an IPv4-mapped IPv6 address matches an
+    /// IPv4 entry.
+    fn contains(&self, addr: IpAddr) -> bool {
+        match (self.network, addr) {
+            (IpAddr::V4(network), IpAddr::V4(addr)) => {
+                (u32::from(network) ^ u32::from(addr)) & ipv4_prefix_mask(self.prefix_len) == 0
+            }
+            (IpAddr::V6(network), IpAddr::V6(addr)) => {
+                (u128::from(network) ^ u128::from(addr)) & ipv6_prefix_mask(self.prefix_len) == 0
+            }
+            _ => false,
+        }
+    }
+
+    /// True when no bit of `self.network` sits after `self.prefix_len`.
+    ///
+    /// `172.18.0.1/16` fails this check, because `0.0.0.1` sits after the
+    /// first 16 bits. `172.16.0.0/12` passes it.
+    fn has_no_bits_after_prefix(&self) -> bool {
+        match self.network {
+            IpAddr::V4(network) => u32::from(network) & !ipv4_prefix_mask(self.prefix_len) == 0,
+            IpAddr::V6(network) => u128::from(network) & !ipv6_prefix_mask(self.prefix_len) == 0,
+        }
+    }
+}
+
+impl std::fmt::Display for TrustedProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+/// The IPv4 network mask of a prefix length: the top `prefix_len` bits set,
+/// the rest clear.
+fn ipv4_prefix_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    }
+}
+
+/// The IPv6 network mask of a prefix length: the top `prefix_len` bits set,
+/// the rest clear.
+fn ipv6_prefix_mask(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix_len))
+    }
+}
+
+/// Parses one entry of `TRUSTED_PROXIES`: an address, or a CIDR range.
+///
+/// # Errors
+///
+/// Returns an error message for an address or a prefix length that does not
+/// parse, for a prefix length above 32 for an IPv4 network or above 128 for
+/// an IPv6 network, or for a range with a bit set after its prefix.
+fn parse_trusted_proxy(entry: &str) -> Result<TrustedProxy, String> {
+    let (network_text, prefix_text) = match entry.split_once('/') {
+        Some((network, prefix)) => (network, Some(prefix)),
+        None => (entry, None),
+    };
+    let network: IpAddr = network_text
+        .parse()
+        .map_err(|err: std::net::AddrParseError| {
+            format!("{network_text:?} is not an IP address: {err}")
+        })?;
+    let max_prefix_len: u8 = match network {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix_len = match prefix_text {
+        Some(text) => {
+            let prefix_len: u8 = text
+                .parse()
+                .map_err(|_| format!("{text:?} is not a prefix length"))?;
+            if prefix_len > max_prefix_len {
+                return Err(format!(
+                    "the prefix length {prefix_len} is above {max_prefix_len}"
+                ));
+            }
+            prefix_len
+        }
+        None => max_prefix_len,
+    };
+    let proxy = TrustedProxy {
+        network,
+        prefix_len,
+    };
+    if !proxy.has_no_bits_after_prefix() {
+        return Err(format!("{entry:?} has a bit set after its prefix length"));
+    }
+    Ok(proxy)
+}
+
+/// Reads `TRUSTED_PROXIES`, the addresses and the ranges the relay trusts to
+/// set `X-Real-IP` (ADR 0007 §The Client Address, amended 2026-10-18).
 ///
 /// # Errors
 ///
 /// Returns a `ConfigError` for a value that is not valid unicode, or that
-/// holds an entry that is not a correct IP address.
-fn parse_trusted_proxies() -> Result<Vec<IpAddr>, ConfigError> {
+/// holds an entry [`parse_trusted_proxy`] rejects.
+fn parse_trusted_proxies() -> Result<Vec<TrustedProxy>, ConfigError> {
     let value = match std::env::var("TRUSTED_PROXIES") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(default_trusted_proxies()),
@@ -343,20 +458,20 @@ fn parse_trusted_proxies() -> Result<Vec<IpAddr>, ConfigError> {
     value
         .split(',')
         .map(|part| {
-            part.trim().parse::<IpAddr>().map_err(|err| ConfigError {
+            parse_trusted_proxy(part.trim()).map_err(|message| ConfigError {
                 key: "TRUSTED_PROXIES",
                 value: value.clone(),
-                message: err.to_string(),
+                message,
             })
         })
         .collect()
 }
 
 /// The parsed value of `DEFAULT_TRUSTED_PROXIES`.
-fn default_trusted_proxies() -> Vec<IpAddr> {
+fn default_trusted_proxies() -> Vec<TrustedProxy> {
     DEFAULT_TRUSTED_PROXIES
         .split(',')
-        .map(|part| part.parse().expect("default trusted proxies are valid"))
+        .map(|part| parse_trusted_proxy(part).expect("default trusted proxies are valid"))
         .collect()
 }
 
@@ -3410,14 +3525,55 @@ fn socket_peer_addr(socket: &SocketRef) -> IpAddr {
     })
 }
 
-/// Finds the client address of a request (ADR 0007 §The Client Address).
+/// Set after the relay logs the warning of ADR 0007 §A Warning For An
+/// Ignored Header, amended 2026-10-18. [`should_warn_about_ignored_x_real_ip`]
+/// reads and sets it.
+static WARNED_ABOUT_IGNORED_X_REAL_IP: AtomicBool = AtomicBool::new(false);
+
+/// True the first time this runs with `flag`, and false every later time.
 ///
-/// `peer` is the TCP peer address. The client address is `peer`, unless
-/// `peer` is in `trusted_proxies` and the request has exactly one
-/// `X-Real-IP` header that holds exactly one correct IP address. The relay
-/// never reads `X-Forwarded-For`.
-fn client_address(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[IpAddr]) -> IpAddr {
-    if !trusted_proxies.contains(&peer) {
+/// [`client_address`] calls this with [`WARNED_ABOUT_IGNORED_X_REAL_IP`]
+/// before it logs the warning of ADR 0007 §A Warning For An Ignored Header,
+/// so the warning goes out once for each process. A unit test calls this
+/// function with its own flag, so another test that logs the warning cannot
+/// change the result.
+fn should_warn_about_ignored_x_real_ip(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::SeqCst)
+}
+
+/// Finds the client address of a request (ADR 0007 §The Client Address,
+/// amended 2026-10-18).
+///
+/// `peer` is the TCP peer address, in its canonical form
+/// ([`IpAddr::to_canonical`]): an IPv4-mapped IPv6 peer, for example
+/// `::ffff:127.0.0.1`, becomes the IPv4 address `127.0.0.1`. The client
+/// address is the canonical peer, unless the canonical peer is in
+/// `trusted_proxies` and the request has exactly one `X-Real-IP` header
+/// that holds exactly one correct IP address. In that case the client
+/// address is the `X-Real-IP` address. The relay never reads
+/// `X-Forwarded-For`.
+///
+/// When the canonical peer is not in `trusted_proxies` and the request
+/// carries an `X-Real-IP` header, this logs one warning for the whole
+/// process, through [`should_warn_about_ignored_x_real_ip`]. The warning
+/// never gives the value of `X-Real-IP`.
+fn client_address(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[TrustedProxy]) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !trusted_proxies.iter().any(|proxy| proxy.contains(peer)) {
+        if headers.contains_key(X_REAL_IP_HEADER)
+            && should_warn_about_ignored_x_real_ip(&WARNED_ABOUT_IGNORED_X_REAL_IP)
+        {
+            let proxies_text = trusted_proxies
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::warn!(
+                peer = %peer,
+                trusted_proxies = %proxies_text,
+                "ignoring X-Real-IP from a peer that TRUSTED_PROXIES does not trust"
+            );
+        }
         return peer;
     }
     let mut values = headers.get_all(X_REAL_IP_HEADER).iter();
@@ -4192,10 +4348,86 @@ mod tests {
         assert_eq!(
             AppConfig::for_tests().trusted_proxies,
             vec![
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                TrustedProxy {
+                    network: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    prefix_len: 32,
+                },
+                TrustedProxy {
+                    network: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    prefix_len: 128,
+                },
             ]
         );
+    }
+
+    /// Amendment 2026-10-18: each of these `TRUSTED_PROXIES` entries is a
+    /// configuration error that names `TRUSTED_PROXIES`.
+    #[test]
+    fn trusted_proxies_rejects_each_incorrect_cidr_entry() {
+        for entry in [
+            "10.0.0.0/33",
+            "::/129",
+            "172.18.0.1/16",
+            "10.0.0.0/x",
+            "10.0.0.0/",
+        ] {
+            // SAFETY: `ENV_LOCK` is held for the whole body, so no other
+            // test races this mutation of the process environment.
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unsafe {
+                std::env::set_var("TRUSTED_PROXIES", entry);
+            }
+            let result = AppConfig::from_env();
+            // SAFETY: see above.
+            unsafe {
+                std::env::remove_var("TRUSTED_PROXIES");
+            }
+
+            let err = result.expect_err(&format!("{entry:?} is rejected"));
+            assert!(err.to_string().contains("TRUSTED_PROXIES"));
+        }
+    }
+
+    /// Amendment 2026-10-18: a CIDR range holds the addresses of its
+    /// prefix, and no other address of its family.
+    #[test]
+    fn a_cidr_range_holds_only_the_addresses_of_its_prefix() {
+        let ipv6_range = parse_trusted_proxy("fd00::/8").expect("valid range");
+        assert!(ipv6_range.contains("fd00::1".parse().expect("valid address")));
+        assert!(!ipv6_range.contains("fe80::1".parse().expect("valid address")));
+
+        let every_ipv4_address = parse_trusted_proxy("0.0.0.0/0").expect("valid range");
+        assert!(every_ipv4_address.contains(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        assert!(!every_ipv4_address.contains("::1".parse().expect("valid address")));
+    }
+
+    /// Amendment 2026-10-18: the relay compares the canonical form of the
+    /// peer address, so an IPv4-mapped IPv6 peer matches an IPv4 entry.
+    #[test]
+    fn an_ipv4_mapped_peer_matches_the_default_trusted_proxies() {
+        let peer: IpAddr = "::ffff:127.0.0.1".parse().expect("valid address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_REAL_IP_HEADER,
+            axum::http::HeaderValue::from_static("203.0.113.7"),
+        );
+        assert_eq!(
+            client_address(&headers, peer, &default_trusted_proxies()),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+    }
+
+    /// Amendment 2026-10-18: the warning for an ignored `X-Real-IP` goes
+    /// out once for each process.
+    #[test]
+    fn should_warn_about_ignored_x_real_ip_is_true_only_on_the_first_call() {
+        let flag = AtomicBool::new(false);
+        assert!(should_warn_about_ignored_x_real_ip(&flag));
+        for _ in 0..3 {
+            assert!(!should_warn_about_ignored_x_real_ip(&flag));
+        }
     }
 
     #[test]

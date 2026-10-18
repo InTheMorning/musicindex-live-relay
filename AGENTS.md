@@ -69,6 +69,9 @@ packet.
   open Socket.IO connections of the full relay. It trusts `X-Real-IP` only
   from `TRUSTED_PROXIES`. On `api.musicindex.org` the relay runs in Docker
   Compose, and `TRUSTED_PROXIES` includes the bridge gateway.
+  - An entry of `TRUSTED_PROXIES` can be a CIDR range. The relay logs one
+    warning after each start when it ignores `X-Real-IP` (amendment of
+    2026-10-18).
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

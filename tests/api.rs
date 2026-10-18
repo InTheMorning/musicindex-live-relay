@@ -5061,7 +5061,7 @@ mod listener_limits {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use axum::extract::connect_info::MockConnectInfo;
-    use musicindex_live_relay::{AdminToken, ReserveEventResponse};
+    use musicindex_live_relay::{AdminToken, ReserveEventResponse, TrustedProxy};
 
     use super::*;
 
@@ -5333,6 +5333,101 @@ mod listener_limits {
             events_uri(&created.event_id),
             trusted_peer,
             &[("X-Forwarded-For", "203.0.113.42")],
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(second).await, "listener_limit_reached");
+    }
+
+    /// A `TRUSTED_PROXIES` config with the loopback address and the CIDR
+    /// range `172.16.0.0/12`, for the amendment of 2026-10-18.
+    fn trusted_proxies_with_a_cidr_range() -> Vec<TrustedProxy> {
+        vec![
+            TrustedProxy {
+                network: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                prefix_len: 32,
+            },
+            TrustedProxy {
+                network: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)),
+                prefix_len: 12,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn x_real_ip_from_a_peer_in_a_trusted_cidr_range_counts_against_that_address() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            trusted_proxies: trusted_proxies_with_a_cidr_range(),
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        // `172.18.0.1` is in the trusted range `172.16.0.0/12`.
+        let peer = SocketAddr::from((IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)), 1));
+
+        let first = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.51")],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The same peer, a different `X-Real-IP`: a different client,
+        // because the peer is trusted and the relay reads `X-Real-IP` from
+        // it.
+        let second = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.52")],
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+
+        // The same peer, the first `X-Real-IP` again: that client's own
+        // limit applies.
+        let third = open_stream_from(
+            router,
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.51")],
+        )
+        .await;
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code(third).await, "listener_limit_reached");
+    }
+
+    #[tokio::test]
+    async fn x_real_ip_from_a_peer_outside_a_trusted_cidr_range_has_no_effect() {
+        let (router, _state, _clock) = test_app_with(AppConfig {
+            trusted_proxies: trusted_proxies_with_a_cidr_range(),
+            max_listener_connections_per_client: 1,
+            max_listener_connects_per_client_per_sec: 0,
+            ..AppConfig::for_tests()
+        });
+        let created = create_event(router.clone()).await;
+        // `192.168.1.1` is outside both trusted entries.
+        let peer = SocketAddr::from((IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 1));
+
+        let first = open_stream_from(
+            router.clone(),
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.61")],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The same untrusted peer, a different `X-Real-IP`: still the same
+        // client, because `192.168.1.1` is not in `TRUSTED_PROXIES`.
+        let second = open_stream_from(
+            router,
+            events_uri(&created.event_id),
+            peer,
+            &[("X-Real-IP", "203.0.113.62")],
         )
         .await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);

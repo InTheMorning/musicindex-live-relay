@@ -103,6 +103,8 @@ Packets for the listener limits plan. ADR 0007 governs them. Ready - 2026-10-18.
   — Implemented - 2026-10-18
 - [002 — The Socket.IO limits](tasks/listener-limits-task-002-socket-io.md)
   — Implemented - 2026-10-18
+- [003 — Trusted ranges and the ignored-header warning](tasks/listener-limits-task-003-trusted-ranges-and-warning.md)
+  — Implemented - 2026-10-18. The amendment of ADR 0007 on 2026-10-18
 
 ## Runbooks
 
