@@ -844,11 +844,27 @@ GET /v1/liveitems/<event_id>/events       SSE stream of remoteValue events
 ```
 
 The relay sends the current payload immediately on Socket.IO connect. The HTTP
-snapshot endpoints are still useful for debugging, startup checks, and mobile
-background modes where the app may choose to poll instead of keeping a live
-connection open. If Socket.IO disconnects, the Socket.IO client handles
-reconnection. Apps can also poll `/remoteValue` or `/metadata` as a conservative
-fallback.
+snapshot endpoints are useful for debugging and startup checks. They are also
+useful in a mobile background mode, where an app can poll and close the live
+connection. Apps can also poll `/remoteValue` or `/metadata` as a
+conservative fallback.
+
+A Socket.IO disconnect has two causes. The app must do a different thing for
+each cause:
+
+- **The connection stops**, for example during a relay restart. The
+  Socket.IO client reconnects automatically. On the reconnect, the relay sends
+  the current payload again.
+- **The relay disconnects the client.** This occurs when the event is unknown
+  or was deleted. The relay sends `{}` first. The disconnect reason is
+  `io server disconnect`. The Socket.IO client does not reconnect
+  automatically.
+
+  The event is dead. The app must use the static `<podcast:value>` of the
+  live item.
+
+Do not use `socket.connect()` in a loop after `io server disconnect`. The
+relay answers each new connect for a dead event with `{}` and a disconnect.
 
 The direct SSE URL form is also possible:
 
