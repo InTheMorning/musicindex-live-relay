@@ -75,7 +75,7 @@ packet.
 - ADR 0008, read timeouts for each connection, has the status `Proposed`.
   The relay sets no header timeout, no idle timeout and no body deadline.
   A client with no credential can keep a connection open with a slow
-  request. The acceptance needs the operator's defaults and a hyper spike.
+  request. The acceptance needs the operator's defaults.
 - ADR 0009, a private state file, has the status `Proposed`. The relay makes
   the state file with the process umask, and the mode is `0644` with the
   umask `022`. Only the systemd `StateDirectoryMode=0700` protects it.

@@ -107,8 +107,11 @@ deadline for the full body.
 
 - The operator confirms the defaults: 10 and 30 seconds.
 - A spike confirms that the hyper 1.9.0 header read timeout also measures the
-  idle time between two requests on one keep-alive connection. If it does
-  not, this record gets a separate idle setting before acceptance.
+  idle time between two requests on one keep-alive connection. Done on
+  2026-10-21: with `http1::Builder`, `TokioTimer` and a timeout of 3 seconds,
+  an idle keep-alive connection closed after 3.0 seconds. A connection that
+  sent part of a second request head also closed after 3.0 seconds. One
+  setting is sufficient.
 - The operator decides if `docs/interoperability.md` gets the new `408` now
   or in the commit that implements this record. The publisher sends request
   bodies, so it can see the `408`.
