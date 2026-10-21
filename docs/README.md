@@ -37,6 +37,12 @@ station runs continuously.
   — Implemented. A limit for each client address on open listener connections
   and on new connects, a global Socket.IO limit, and trust of `X-Real-IP`
   from a proxy
+- [ADR 0008: Read timeouts for each connection](adr/0008-connection-read-timeouts.md)
+  — Proposed. A timeout for the request headers and an idle connection, and
+  one deadline for the request body
+- [ADR 0009: The state file is private to the relay user](adr/0009-state-file-mode.md)
+  — Proposed. The relay makes the state file with the mode `0600` and
+  corrects a mode that is too wide at each start
 
 ## Plans
 
