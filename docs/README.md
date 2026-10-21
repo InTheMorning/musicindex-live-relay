@@ -38,7 +38,7 @@ station runs continuously.
   and on new connects, a global Socket.IO limit, and trust of `X-Real-IP`
   from a proxy
 - [ADR 0008: Read timeouts for each connection](adr/0008-connection-read-timeouts.md)
-  — Accepted. A timeout for the request headers and an idle connection, and
+  — Implemented. A timeout for the request headers and an idle connection, and
   one deadline for the request body
 - [ADR 0009: The state file is private to the relay user](adr/0009-state-file-mode.md)
   — Implemented. The relay makes the state file with the mode `0600` and
@@ -60,7 +60,7 @@ station runs continuously.
 - [Listener limits phase plan](plans/adr-0007-listener-limits-phase-plan.md)
   — Packets done. Deployment checks open
 - [Read timeouts phase plan](plans/adr-0008-read-timeouts-phase-plan.md)
-  — Packets done. Deployment checks open
+  — Done
 - [State file mode phase plan](plans/adr-0009-state-file-mode-phase-plan.md)
   — Done
 
@@ -153,9 +153,8 @@ Packet for the state file mode plan. ADR 0009 governs it. Ready -
   named artifact for the `Implemented` status of ADR 0006
 - [ADR 0007 review checklist](reviews/adr-0007-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0007
-- [ADR 0008 review checklist](reviews/adr-0008-review-checklist.md) — open.
-  The deployment checks remain. The named artifact for the `Implemented`
-  status of ADR 0008
+- [ADR 0008 review checklist](reviews/adr-0008-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0008
 - [ADR 0009 review checklist](reviews/adr-0009-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0009
 

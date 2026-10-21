@@ -72,17 +72,17 @@ packet.
   - An entry of `TRUSTED_PROXIES` can be a CIDR range. The relay logs one
     warning after each start when it ignores `X-Real-IP` (amendment of
     2026-10-18).
-- ADR 0008, read timeouts for each connection, has the status `Accepted`.
-  Its two task packets are done. ADR 0008 becomes `Implemented` when the
-  deployment checks of `docs/reviews/adr-0008-review-checklist.md` pass.
+- ADR 0008, read timeouts for each connection, has the status
+  `Implemented`. The artifact is `docs/reviews/adr-0008-review-checklist.md`.
   - `src/server.rs` replaces `axum::serve`. The relay serves HTTP/1.1 only.
   - `HEADER_READ_TIMEOUT_SECS` (default 10) closes a connection with no full
     request head, and an idle keep-alive connection.
   - `BODY_READ_TIMEOUT_SECS` (default 30) gives `408 request_body_timeout`
     to a body that is not complete in time.
 - ADR 0009, a private state file, has the status `Implemented`. The
-  artifact is `docs/reviews/adr-0009-review-checklist.md`. The relay makes the state file with the mode `0600`, and it corrects a
-  wider mode at each start with one warning.
+  artifact is `docs/reviews/adr-0009-review-checklist.md`. The relay makes
+  the state file with the mode `0600`, and it corrects a wider mode at each
+  start with one warning.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

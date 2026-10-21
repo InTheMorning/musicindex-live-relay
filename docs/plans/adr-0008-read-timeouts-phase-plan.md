@@ -1,6 +1,6 @@
 # ADR 0008 Read Timeouts: Phase Plan
 
-Status: Packets done 2026-10-21. The deployment checks are open. This plan does not make rules. ADR 0008 owns them.
+Status: Done 2026-10-21. The packets and the deployment checks pass. This plan does not make rules. ADR 0008 owns them.
 
 ## Goal
 

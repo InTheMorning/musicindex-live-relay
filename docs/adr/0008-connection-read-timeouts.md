@@ -2,6 +2,11 @@
 
 ## Status
 
+Implemented - 2026-10-21.
+
+Implemented 2026-10-21. The named artifact is
+`docs/reviews/adr-0008-review-checklist.md`, which has no open gates.
+
 Amended 2026-10-21: the relay serves HTTP/1.1 only. `axum::serve` also
 accepts HTTP/2 with prior knowledge, and the hyper header read timeout
 applies to HTTP/1 only. A slow client could use HTTP/2, and then the
