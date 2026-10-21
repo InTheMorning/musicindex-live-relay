@@ -105,7 +105,11 @@ deadline for the full body.
 
 ## Before Acceptance
 
-- The operator confirms the defaults: 10 and 30 seconds.
+- The operator confirms the defaults: 10 and 30 seconds. Done on
+  2026-10-21.
+- The operator runs the three probes of §Context against
+  `api.musicindex.org` and this record gets the result. The result shows
+  what nginx stops before a slow client gets to the relay.
 - A spike confirms that the hyper 1.9.0 header read timeout also measures the
   idle time between two requests on one keep-alive connection. Done on
   2026-10-21: with `http1::Builder`, `TokioTimer` and a timeout of 3 seconds,
@@ -138,6 +142,8 @@ configuration and a real TCP listener:
 Visual. The operator checks each item after the deployment on
 `api.musicindex.org`:
 
+- The three probes of §Context against the relay port on the host show
+  that each connection closes after its timeout.
 - The publisher publishes metadata and uploads artwork with no `408`.
 - A Socket.IO app stays connected for 10 minutes.
 
