@@ -2,6 +2,11 @@
 
 ## Status
 
+Accepted 2026-10-21 by the operator. The operator confirmed the defaults 10
+and 30 seconds. The probes against `api.musicindex.org` are recorded in
+§Before Acceptance. `docs/interoperability.md` gets the `408` in the commit
+that implements this record.
+
 Proposed 2026-10-21.
 
 Class: durable. AGENTS.md §5 requires a configurable limit with a default for
@@ -109,7 +114,18 @@ deadline for the full body.
   2026-10-21.
 - The operator runs the three probes of §Context against
   `api.musicindex.org` and this record gets the result. The result shows
-  what nginx stops before a slow client gets to the relay.
+  what nginx stops before a slow client gets to the relay. Done on
+  2026-10-21:
+  - nginx closed the slow header after 60 seconds.
+  - nginx closed the slow body with no token after 60 seconds.
+  - nginx closed the idle keep-alive connection after 65 seconds.
+
+  These values agree with `client_header_timeout`, `client_body_timeout`
+  and `keepalive_timeout` of nginx. nginx measures `client_body_timeout`
+  between two reads, not for the full body. The nginx example in `README.md`
+  keeps request buffering on, so nginx holds a slow body and the relay gets
+  only a complete body. On `api.musicindex.org` this record is thus a second
+  layer. A relay with no proxy has no other layer.
 - A spike confirms that the hyper 1.9.0 header read timeout also measures the
   idle time between two requests on one keep-alive connection. Done on
   2026-10-21: with `http1::Builder`, `TokioTimer` and a timeout of 3 seconds,
@@ -118,7 +134,9 @@ deadline for the full body.
   setting is sufficient.
 - The operator decides if `docs/interoperability.md` gets the new `408` now
   or in the commit that implements this record. The publisher sends request
-  bodies, so it can see the `408`.
+  bodies, so it can see the `408`. Done on 2026-10-21: the commit that
+  implements this record adds it. Before that commit, the relay sends no
+  `408`.
 
 ## Verification After Implementation
 
@@ -138,6 +156,8 @@ configuration and a real TCP listener:
 - A value of `0` and a value that does not parse are configuration errors
   that name the setting.
 - `README.md` documents each setting and the `408`.
+- `docs/interoperability.md` documents the body deadline and the `408`, in
+  the commit that implements this record.
 
 Visual. The operator checks each item after the deployment on
 `api.musicindex.org`:
