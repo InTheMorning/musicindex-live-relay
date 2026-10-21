@@ -41,7 +41,7 @@ station runs continuously.
   — Accepted. A timeout for the request headers and an idle connection, and
   one deadline for the request body
 - [ADR 0009: The state file is private to the relay user](adr/0009-state-file-mode.md)
-  — Accepted. The relay makes the state file with the mode `0600` and
+  — Implemented. The relay makes the state file with the mode `0600` and
   corrects a mode that is too wide at each start
 
 ## Plans
@@ -62,7 +62,7 @@ station runs continuously.
 - [Read timeouts phase plan](plans/adr-0008-read-timeouts-phase-plan.md)
   — Packets done. Deployment checks open
 - [State file mode phase plan](plans/adr-0009-state-file-mode-phase-plan.md)
-  — Packet done. Deployment check open
+  — Done
 
 ## Tasks
 
@@ -156,9 +156,8 @@ Packet for the state file mode plan. ADR 0009 governs it. Ready -
 - [ADR 0008 review checklist](reviews/adr-0008-review-checklist.md) — open.
   The deployment checks remain. The named artifact for the `Implemented`
   status of ADR 0008
-- [ADR 0009 review checklist](reviews/adr-0009-review-checklist.md) — open.
-  The deployment check remains. The named artifact for the `Implemented`
-  status of ADR 0009
+- [ADR 0009 review checklist](reviews/adr-0009-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0009
 
 ## Research
 

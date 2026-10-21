@@ -1,6 +1,6 @@
 # ADR 0009 State File Mode: Phase Plan
 
-Status: Packet done 2026-10-21. The deployment check is open. This plan does not make rules. ADR 0009 owns them.
+Status: Done 2026-10-21. The packet and the deployment check pass. This plan does not make rules. ADR 0009 owns them.
 
 ## Goal
 

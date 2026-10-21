@@ -2,6 +2,11 @@
 
 ## Status
 
+Implemented - 2026-10-21.
+
+Implemented 2026-10-21. The named artifact is
+`docs/reviews/adr-0009-review-checklist.md`, which has no open gates.
+
 Accepted 2026-10-21 by the operator. The mode of the state file on
 `api.musicindex.org` is recorded in §Before Acceptance.
 

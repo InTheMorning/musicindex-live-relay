@@ -80,10 +80,8 @@ packet.
     request head, and an idle keep-alive connection.
   - `BODY_READ_TIMEOUT_SECS` (default 30) gives `408 request_body_timeout`
     to a body that is not complete in time.
-- ADR 0009, a private state file, has the status `Accepted`. Its plan has
-  one task packet, and it is done. ADR 0009 becomes `Implemented` when the
-  deployment check of `docs/reviews/adr-0009-review-checklist.md` passes.
-  The relay makes the state file with the mode `0600`, and it corrects a
+- ADR 0009, a private state file, has the status `Implemented`. The
+  artifact is `docs/reviews/adr-0009-review-checklist.md`. The relay makes the state file with the mode `0600`, and it corrects a
   wider mode at each start with one warning.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
