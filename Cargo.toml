@@ -10,6 +10,8 @@ axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 http = "1"
 futures-core = "0.3"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 rand = "0.9"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +21,7 @@ socketioxide = { version = "0.18", features = ["state", "tracing", "v4"] }
 subtle = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -26,4 +29,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["test-util"] }

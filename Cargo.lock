@@ -702,6 +702,8 @@ dependencies = [
  "futures-core",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "rand 0.9.4",
  "rusqlite",
  "serde",

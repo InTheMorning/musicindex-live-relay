@@ -73,15 +73,18 @@ packet.
     warning after each start when it ignores `X-Real-IP` (amendment of
     2026-10-18).
 - ADR 0008, read timeouts for each connection, has the status `Accepted`.
-  It has no plan and no task packet yet. The relay sets no header timeout,
-  no idle timeout and no body deadline. A client with no credential can
-  keep a connection open with a slow request. On `api.musicindex.org`,
-  nginx closes such a connection after 60 seconds.
-- ADR 0009, a private state file, has the status `Accepted`. It has no plan
-  and no task packet yet. The relay makes the state file with the process
-  umask, and the mode is `0644` with the umask `022`. Only a directory with
-  the mode `0700` protects it: the systemd `StateDirectoryMode`, or the
-  Docker volume directory on `api.musicindex.org`.
+  Its two task packets are done. ADR 0008 becomes `Implemented` when the
+  deployment checks of `docs/reviews/adr-0008-review-checklist.md` pass.
+  - `src/server.rs` replaces `axum::serve`. The relay serves HTTP/1.1 only.
+  - `HEADER_READ_TIMEOUT_SECS` (default 10) closes a connection with no full
+    request head, and an idle keep-alive connection.
+  - `BODY_READ_TIMEOUT_SECS` (default 30) gives `408 request_body_timeout`
+    to a body that is not complete in time.
+- ADR 0009, a private state file, has the status `Accepted`. Its plan has
+  one task packet, and it is done. ADR 0009 becomes `Implemented` when the
+  deployment check of `docs/reviews/adr-0009-review-checklist.md` passes.
+  The relay makes the state file with the mode `0600`, and it corrects a
+  wider mode at each start with one warning.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
@@ -165,6 +168,8 @@ This service carries payment routing to listener apps.
   connections, event TTL, publish rate, and create rate.
 - ADR 0007 adds three more: listener connections and listener connects for
   each client, and Socket.IO connections for the full relay.
+- ADR 0008 adds two timeouts: one for the request head and an idle
+  connection, and one deadline for the request body.
 - `POST /v1/liveitems` is public. Any new route that consumes durable storage
   must need a credential, or it is an unbounded growth surface.
 - The replay buffer holds a fixed number of updates for each event. Keep the

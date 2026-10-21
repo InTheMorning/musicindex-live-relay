@@ -128,6 +128,22 @@ client address: Socket.IO connections, `/events` streams and
 - `v4vmm` and the publisher open no listener connection, so the limits do not
   apply to them.
 
+### A request body has a deadline
+
+ADR 0008 gives this deadline. A request body has `BODY_READ_TIMEOUT_SECS`
+seconds to complete, after its head arrives. The default is 30 seconds. A
+body that does not complete in time gets `408` with the error code
+`request_body_timeout`.
+
+- The publisher sends request bodies: metadata publishes, display
+  publishes, and image uploads. A publisher on a slow uplink raises
+  `BODY_READ_TIMEOUT_SECS`.
+- The nginx example in `README.md` keeps request buffering on. With that
+  setting, nginx holds a slow body itself, and the relay never sees it. A
+  publisher behind such a proxy does not get this `408`. The probes of
+  2026-10-21 show that nginx on `api.musicindex.org` closes a slow body
+  after 60 seconds (ADR 0008 §Before Acceptance).
+
 ### An idle event expires
 
 The reaper removes an ephemeral event when its last activity is older than the

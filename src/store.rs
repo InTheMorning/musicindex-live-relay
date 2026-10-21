@@ -13,8 +13,14 @@
 
 use std::{
     collections::HashMap,
+    io,
     path::{Path, PathBuf},
     sync::Mutex,
+};
+#[cfg(unix)]
+use std::{
+    fs::{self, OpenOptions},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -122,6 +128,14 @@ pub enum StoreError {
         /// The cause.
         source: rusqlite::Error,
     },
+    /// The store cannot set the mode of the state file at `path` to `0600`
+    /// (ADR 0009).
+    Permissions {
+        /// The path of the state file.
+        path: PathBuf,
+        /// The cause.
+        source: io::Error,
+    },
     /// The state file at `path` has a schema version that this build does not
     /// know.
     UnsupportedSchema {
@@ -156,6 +170,11 @@ impl std::fmt::Display for StoreError {
             Self::Open { path, source } => {
                 write!(f, "cannot open state file {}: {source}", path.display())
             }
+            Self::Permissions { path, source } => write!(
+                f,
+                "cannot set the mode of state file {} to 0600: {source}",
+                path.display()
+            ),
             Self::UnsupportedSchema { path, found } => write!(
                 f,
                 "state file {} has schema version {found:?}, expected {SCHEMA_VERSION}",
@@ -176,6 +195,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Open { source, .. } | Self::Database(source) => Some(source),
+            Self::Permissions { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -185,6 +205,54 @@ impl From<rusqlite::Error> for StoreError {
     fn from(source: rusqlite::Error) -> Self {
         Self::Database(source)
     }
+}
+
+/// Makes the state file at `path` private to its owner (ADR 0009).
+///
+/// When the file does not exist, this makes it with the mode `0600`. It
+/// then returns `None`. When the file exists and its mode gives a
+/// permission to the group or to other users, this sets the mode `0600`.
+/// It then returns the mode before the change. When the file exists with
+/// no such permission, this changes nothing and returns `None`.
+///
+/// # Errors
+///
+/// Returns `Permissions` when the file cannot be made, or its mode cannot be
+/// read or set. The error names the path.
+#[cfg(unix)]
+fn make_private(path: &Path) -> Result<Option<u32>, StoreError> {
+    let permission_error = |source| StoreError::Permissions {
+        path: path.to_path_buf(),
+        source,
+    };
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            let mode = fs::metadata(path)
+                .map_err(permission_error)?
+                .permissions()
+                .mode();
+            if mode & 0o077 == 0 {
+                return Ok(None);
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(permission_error)?;
+            Ok(Some(mode & 0o777))
+        }
+        Err(source) => Err(permission_error(source)),
+    }
+}
+
+/// The relay is built for Linux. On another target, this makes no change to
+/// the state file, and the caller gets no previous mode (ADR 0009).
+#[cfg(not(unix))]
+fn make_private(_path: &Path) -> Result<Option<u32>, StoreError> {
+    Ok(None)
 }
 
 /// The boundary for each read and write of a live item identity.
@@ -296,10 +364,18 @@ pub struct SqliteEventStore {
     // has `&mut self` and uses `Mutex::get_mut`, so the mutex never blocks.
     connection: Mutex<Connection>,
     max_reserved: usize,
+    // The mode of the state file before `open` corrected it, read one time
+    // by the caller of `open` (ADR 0009).
+    previous_mode: Option<u32>,
 }
 
 impl SqliteEventStore {
     /// Opens the state file at `path`, or makes it when it does not exist.
+    ///
+    /// A new file gets the mode `0600`. An existing file that gives a
+    /// permission to the group or to other users gets the mode `0600` too
+    /// (ADR 0009). Call [`SqliteEventStore::previous_mode`] to get the
+    /// mode from before this change, if any.
     ///
     /// A new file gets the schema and the schema version in one transaction.
     /// The parent directory must exist. The store does not load the reserved
@@ -307,10 +383,12 @@ impl SqliteEventStore {
     ///
     /// # Errors
     ///
-    /// Returns `Open` when SQLite cannot open or prepare the file, and
-    /// `UnsupportedSchema` when the file holds a schema version that this
-    /// build does not know.
+    /// Returns `Permissions` when the file cannot be made private, `Open`
+    /// when SQLite cannot open or prepare the file, and `UnsupportedSchema`
+    /// when the file holds a schema version that this build does not know.
     pub fn open(path: &Path, max_reserved: usize) -> Result<Self, StoreError> {
+        let previous_mode = make_private(path)?;
+
         let open_error = |source| StoreError::Open {
             path: path.to_path_buf(),
             source,
@@ -355,7 +433,17 @@ impl SqliteEventStore {
             events: HashMap::new(),
             connection: Mutex::new(connection),
             max_reserved,
+            previous_mode,
         })
+    }
+
+    /// Returns the mode of the state file before [`SqliteEventStore::open`]
+    /// corrected it, in bits.
+    ///
+    /// Returns `None` when `open` made the file, or found no permission for
+    /// the group or for other users (ADR 0009).
+    pub fn previous_mode(&self) -> Option<u32> {
+        self.previous_mode
     }
 
     /// Reads each reserved row of the state file into memory, and returns
@@ -627,6 +715,66 @@ mod tests {
         let path = dir.path().join("state.sqlite3");
         let store = SqliteEventStore::open(&path, max_reserved).expect("open");
         (dir, path, store)
+    }
+
+    /// Makes an empty file at a fresh path and sets its mode. This does not
+    /// read or change the umask (ADR 0009).
+    #[cfg(unix)]
+    fn file_with_mode(mode: u32) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite3");
+        std::fs::File::create(&path).expect("create state file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("set mode");
+        (dir, path)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlite_open_makes_a_new_file_with_mode_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite3");
+
+        let store = SqliteEventStore::open(&path, 10).expect("open");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(store.previous_mode(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlite_open_corrects_a_mode_that_is_readable_by_the_group() {
+        let (_dir, path) = file_with_mode(0o644);
+
+        let store = SqliteEventStore::open(&path, 10).expect("open");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(store.previous_mode(), Some(0o644));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlite_open_of_a_private_file_changes_nothing_and_gives_no_previous_mode() {
+        let (_dir, path) = file_with_mode(0o600);
+
+        let store = SqliteEventStore::open(&path, 10).expect("open");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(store.previous_mode(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlite_open_corrects_either_a_group_bit_or_an_other_bit() {
+        let (_group_dir, group_path) = file_with_mode(0o640);
+        let group_store = SqliteEventStore::open(&group_path, 10).expect("open");
+        assert_eq!(group_store.previous_mode(), Some(0o640));
+
+        let (_other_dir, other_path) = file_with_mode(0o604);
+        let other_store = SqliteEventStore::open(&other_path, 10).expect("open");
+        assert_eq!(other_store.previous_mode(), Some(0o604));
     }
 
     #[test]

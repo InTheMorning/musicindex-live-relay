@@ -59,6 +59,10 @@ station runs continuously.
   — Ready. One packet
 - [Listener limits phase plan](plans/adr-0007-listener-limits-phase-plan.md)
   — Packets done. Deployment checks open
+- [Read timeouts phase plan](plans/adr-0008-read-timeouts-phase-plan.md)
+  — Packets done. Deployment checks open
+- [State file mode phase plan](plans/adr-0009-state-file-mode-phase-plan.md)
+  — Packet done. Deployment check open
 
 ## Tasks
 
@@ -112,6 +116,20 @@ Packets for the listener limits plan. ADR 0007 governs them. Ready - 2026-10-18.
 - [003 — Trusted ranges and the ignored-header warning](tasks/listener-limits-task-003-trusted-ranges-and-warning.md)
   — Implemented - 2026-10-18. The amendment of ADR 0007 on 2026-10-18
 
+Packets for the read timeouts plan. ADR 0008 governs them. Task 002 needs
+task 001. Ready - 2026-10-21.
+
+- [001 — The server loop and the header timeout](tasks/read-timeouts-task-001-server-loop-and-header-timeout.md)
+  — Implemented - 2026-10-21
+- [002 — The body deadline](tasks/read-timeouts-task-002-body-deadline.md)
+  — Implemented - 2026-10-21
+
+Packet for the state file mode plan. ADR 0009 governs it. Ready -
+2026-10-21.
+
+- [001 — The private state file](tasks/state-file-mode-task-001-private-state-file.md)
+  — Implemented - 2026-10-21
+
 ## Runbooks
 
 - [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
@@ -135,6 +153,12 @@ Packets for the listener limits plan. ADR 0007 governs them. Ready - 2026-10-18.
   named artifact for the `Implemented` status of ADR 0006
 - [ADR 0007 review checklist](reviews/adr-0007-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0007
+- [ADR 0008 review checklist](reviews/adr-0008-review-checklist.md) — open.
+  The deployment checks remain. The named artifact for the `Implemented`
+  status of ADR 0008
+- [ADR 0009 review checklist](reviews/adr-0009-review-checklist.md) — open.
+  The deployment check remains. The named artifact for the `Implemented`
+  status of ADR 0009
 
 ## Research
 

@@ -169,6 +169,7 @@ Status codes:
 - `401` when the admin token is missing or malformed.
 - `403` with error code `invalid_admin_token` when the admin token is wrong.
 - `404` with error code `reserved_items_disabled` when no admin token is configured. The feature is off.
+- `408` with error code `request_body_timeout` when the body does not complete in `BODY_READ_TIMEOUT_SECS` seconds (ADR 0008). See "Deployment" below.
 - `409` with error code `label_already_reserved` when a reserved item has the label.
 - `413` when the request body is larger than 4 KiB.
 - `500` with error code `store_unavailable` when the state file write failed. The body holds no other detail.
@@ -362,6 +363,7 @@ Status codes:
 - `401` when the bearer token is missing or malformed.
 - `403` when the bearer token is wrong.
 - `404` when the event does not exist.
+- `408` with error code `request_body_timeout` when the body does not complete in `BODY_READ_TIMEOUT_SECS` seconds (ADR 0008). See "Deployment" below.
 - `413` when the request body exceeds 64 KiB.
 - `429` when per-event publish rate limit is exceeded. A bad `Listener-Delay-Secs` header does not use a slot of this limit.
 
@@ -617,6 +619,9 @@ Status codes:
 - `409` with error code `artwork_missing` when the relay does not hold the
   image of `artwork.sha256` for the item. Upload the image, then publish
   again.
+- `408` with error code `request_body_timeout` when the body does not
+  complete in `BODY_READ_TIMEOUT_SECS` seconds (ADR 0008). See
+  "Deployment" below.
 - `413` when the body is larger than 8 KiB. The error code is
   `payload_too_large`. A request with a `Content-Length` header over the
   limit gets `413` with a plain text body.
@@ -738,6 +743,9 @@ Status codes:
 - `403` with error code `invalid_token` when the bearer token is wrong.
 - `404` with error code `event_not_found` when the item does not exist.
 - `409` with error code `event_not_reserved` when the item is ephemeral.
+- `408` with error code `request_body_timeout` when the body does not
+  complete in `BODY_READ_TIMEOUT_SECS` seconds (ADR 0008). See
+  "Deployment" below.
 - `413` when the body is larger than `ARTWORK_MAX_BYTES`. The error code is
   `payload_too_large`. A request with a `Content-Length` header over the
   limit gets `413` with a plain text body.
@@ -988,12 +996,17 @@ Configuration is read from environment variables.
 | `MAX_LISTENER_CONNECTIONS_PER_CLIENT` | `50` | The highest count of open `/events` and `/display/events` streams, and open Socket.IO connections, of one client address (ADR 0007). A value of 0 turns this limit off. See "The Client Address" below. |
 | `MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC` | `10` | The highest count of new `/events` and `/display/events` streams, and new Socket.IO connections, of one client address in one second (ADR 0007). A value of 0 turns this limit off. See "The Client Address" below. |
 | `MAX_SOCKETIO_CONNECTIONS` | `20000` | The highest count of open Socket.IO connections of the full relay (ADR 0007). See "Subscribe With Socket.IO" above. |
+| `HEADER_READ_TIMEOUT_SECS` | `10` | The time the relay waits for the full header of a request, and for an idle keep-alive connection, before it closes the connection (ADR 0008). Must be 1 or more. See "Deployment" below. |
+| `BODY_READ_TIMEOUT_SECS` | `30` | The time a request body has to complete after its head arrives (ADR 0008). Must be 1 or more. See "Deployment" below. |
 
 The included systemd unit sets `ProtectSystem=strict`,
 `StateDirectory=musicindex-live-relay` and `StateDirectoryMode=0700`. systemd
 makes `/var/lib/musicindex-live-relay/` with the correct owner and mode 0700,
 and the relay can write the state file there. If the relay cannot open or read
 the state file, it stops at startup and the error names the path.
+
+The relay makes the state file with the mode `0600`. At each start, it also
+corrects an existing state file to the mode `0600` (ADR 0009).
 
 Metadata request bodies are limited to 64 KiB. Reserve request bodies are limited to 4 KiB. Display request bodies are limited to 8 KiB. Image uploads are limited to `ARTWORK_MAX_BYTES`. Other routes are unconstrained.
 
@@ -1100,6 +1113,12 @@ systemd/musicindex-live-relay.service
 ```
 
 The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, gives the relay the state directory `/var/lib/musicindex-live-relay/`, and restarts on failure. Five failed starts in 300 seconds stop the restart loop, and systemd marks the unit `failed`. A corrupt state file causes this. `docs/runbooks/reserved-live-items.md` gives the recovery.
+
+The relay serves HTTP/1.1 only (ADR 0008). It closes a connection that does not send a full set of request headers in `HEADER_READ_TIMEOUT_SECS` seconds. The same timeout closes an idle keep-alive connection, one that waits with no new request after a response.
+
+A route that reads a request body can answer `408` with the error code `request_body_timeout` (ADR 0008). The relay sends it when the body does not complete in `BODY_READ_TIMEOUT_SECS` seconds after its head. The relay then closes the connection. A slow flow of bytes does not extend this deadline. A route that reads no body is not affected. A broadcaster on a slow uplink raises `BODY_READ_TIMEOUT_SECS`.
+
+Behind nginx with request buffering on, as in the example above, nginx holds a slow body. The relay then never sees it, so the broadcaster does not get this `408`.
 
 The relay can be exposed directly or behind any reverse proxy that preserves the service routes. MusicIndex currently deploys it behind nginx at `api.musicindex.org`; that deployment uses:
 

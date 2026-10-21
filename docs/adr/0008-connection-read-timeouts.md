@@ -2,6 +2,12 @@
 
 ## Status
 
+Amended 2026-10-21: the relay serves HTTP/1.1 only. `axum::serve` also
+accepts HTTP/2 with prior knowledge, and the hyper header read timeout
+applies to HTTP/1 only. A slow client could use HTTP/2, and then the
+timeout would not stop it. nginx sends HTTP/1.1 to the relay, so no consumer uses HTTP/2. The
+amendment adds to §Two Timeouts and reverses no decision.
+
 Accepted 2026-10-21 by the operator. The operator confirmed the defaults 10
 and 30 seconds. The probes against `api.musicindex.org` are recorded in
 §Before Acceptance. `docs/interoperability.md` gets the `408` in the commit
@@ -65,6 +71,8 @@ deadline for the full body.
   covers the two conditions, because each is a connection with no request.
 - The body timeout is one deadline for the full body. The arrival of data
   does not start it again.
+- The relay serves HTTP/1.1 only, so each connection has the header timeout
+  (amendment of 2026-10-21).
 - With the default of 30 seconds, an artwork body of the default
   `ARTWORK_MAX_BYTES` (524,288 bytes) needs about 17.5 KB each second. A
   broadcaster on a slower uplink increases the setting.

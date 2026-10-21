@@ -1,6 +1,8 @@
 use std::{net::SocketAddr, process::ExitCode};
 
-use musicindex_live_relay::{AppConfig, RelayState, app, spawn_cleanup_task, spawn_lease_task};
+use musicindex_live_relay::{
+    AppConfig, RelayState, app, server, spawn_cleanup_task, spawn_lease_task,
+};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -27,6 +29,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let bind: SocketAddr = config.bind;
+    let header_read_timeout = config.header_read_timeout;
     // With an admin token, `try_new` restores the reserved items and logs the
     // state file path and the restored count. A corrupt or unreadable state
     // file stops the startup, and the error names the path.
@@ -38,16 +41,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "listening");
 
-    // Serve with the TCP peer address in `ConnectInfo<SocketAddr>`, so a
-    // handler can find the client address of a request (ADR 0007 §The
-    // Client Address).
-    axum::serve(
+    // Serve HTTP/1.1 only, with the header read timeout of ADR 0008 and
+    // the TCP peer address in `ConnectInfo<SocketAddr>` on each request,
+    // so a handler can find the client address of a request (ADR 0007
+    // §The Client Address).
+    server::serve(
         listener,
-        app(state)
-            .layer(TraceLayer::new_for_http())
-            .into_make_service_with_connect_info::<SocketAddr>(),
+        app(state).layer(TraceLayer::new_for_http()),
+        header_read_timeout,
+        shutdown_signal(),
     )
-    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
     Ok(())

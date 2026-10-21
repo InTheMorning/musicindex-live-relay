@@ -1,15 +1,19 @@
+pub mod server;
 pub mod store;
 
 use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     fmt::Write as _,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc, Mutex, Once, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -17,9 +21,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{ConnectInfo, FromRequestParts, Path, State as AxumState, rejection::BytesRejection},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -27,6 +31,7 @@ use axum::{
     },
     routing::{delete, get, post},
 };
+use hyper::body::{Frame, SizeHint};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,7 +42,10 @@ use socketioxide::{
 };
 use subtle::ConstantTimeEq;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{RwLock, broadcast, watch};
+use tokio::{
+    sync::{RwLock, broadcast, watch},
+    time::Sleep,
+};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 
 use crate::store::{
@@ -52,6 +60,19 @@ const DEFAULT_MAX_PUBLISHES_PER_EVENT_PER_SEC: u32 = 20;
 const DEFAULT_MAX_CREATES_PER_SEC: u32 = 50;
 const DEFAULT_LEASE_SECS: u64 = 90;
 const MIN_LEASE_SECS: u64 = 10;
+/// The default of `HEADER_READ_TIMEOUT_SECS`, the time hyper waits for a
+/// request's full header, and for an idle keep-alive connection, before
+/// it closes the connection (ADR 0008 §Two Timeouts).
+const DEFAULT_HEADER_READ_TIMEOUT_SECS: u64 = 10;
+/// The lowest accepted value of `HEADER_READ_TIMEOUT_SECS`. A value of 0
+/// would give hyper no header read timeout, the gap ADR 0008 closes.
+const MIN_HEADER_READ_TIMEOUT_SECS: u64 = 1;
+/// The default of `BODY_READ_TIMEOUT_SECS`, the time a request body has to
+/// complete after its head arrives (ADR 0008 §Two Timeouts).
+const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 30;
+/// The lowest accepted value of `BODY_READ_TIMEOUT_SECS`. A value of 0
+/// would give a request body no deadline.
+const MIN_BODY_READ_TIMEOUT_SECS: u64 = 1;
 const METADATA_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const REPLAY_CAPACITY: usize = 100;
 const BROADCAST_CAPACITY: usize = 128;
@@ -206,6 +227,15 @@ pub struct AppConfig {
     /// The highest count of open Socket.IO connections of the full relay
     /// (ADR 0007 §Three Limits).
     pub max_socketio_connections: usize,
+    /// The time hyper waits for a request's full header, and for an idle
+    /// keep-alive connection, before it closes the connection (ADR 0008
+    /// §Two Timeouts).
+    pub header_read_timeout: Duration,
+    /// The time a request body has to complete after its head arrives
+    /// (ADR 0008 §Two Timeouts). [`enforce_body_read_timeout`] answers
+    /// `408 request_body_timeout` when this time ends before the body
+    /// does.
+    pub body_read_timeout: Duration,
 }
 
 impl AppConfig {
@@ -243,6 +273,8 @@ impl AppConfig {
                 "MAX_SOCKETIO_CONNECTIONS",
                 DEFAULT_MAX_SOCKETIO_CONNECTIONS,
             )?,
+            header_read_timeout: Duration::from_secs(parse_header_read_timeout_secs()?),
+            body_read_timeout: Duration::from_secs(parse_body_read_timeout_secs()?),
         })
     }
 
@@ -266,6 +298,8 @@ impl AppConfig {
             max_listener_connects_per_client_per_sec:
                 DEFAULT_MAX_LISTENER_CONNECTS_PER_CLIENT_PER_SEC,
             max_socketio_connections: DEFAULT_MAX_SOCKETIO_CONNECTIONS,
+            header_read_timeout: Duration::from_secs(DEFAULT_HEADER_READ_TIMEOUT_SECS),
+            body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS),
         }
     }
 }
@@ -299,6 +333,32 @@ fn parse_lease_secs() -> Result<u64, ConfigError> {
             key: "LEASE_SECS",
             value: secs.to_string(),
             message: format!("must be {MIN_LEASE_SECS} or more"),
+        });
+    }
+    Ok(secs)
+}
+
+/// Reads `HEADER_READ_TIMEOUT_SECS` (ADR 0008 §Two Timeouts).
+fn parse_header_read_timeout_secs() -> Result<u64, ConfigError> {
+    let secs = env_parse("HEADER_READ_TIMEOUT_SECS", DEFAULT_HEADER_READ_TIMEOUT_SECS)?;
+    if secs < MIN_HEADER_READ_TIMEOUT_SECS {
+        return Err(ConfigError {
+            key: "HEADER_READ_TIMEOUT_SECS",
+            value: secs.to_string(),
+            message: format!("must be {MIN_HEADER_READ_TIMEOUT_SECS} or more"),
+        });
+    }
+    Ok(secs)
+}
+
+/// Reads `BODY_READ_TIMEOUT_SECS` (ADR 0008 §Two Timeouts).
+fn parse_body_read_timeout_secs() -> Result<u64, ConfigError> {
+    let secs = env_parse("BODY_READ_TIMEOUT_SECS", DEFAULT_BODY_READ_TIMEOUT_SECS)?;
+    if secs < MIN_BODY_READ_TIMEOUT_SECS {
+        return Err(ConfigError {
+            key: "BODY_READ_TIMEOUT_SECS",
+            value: secs.to_string(),
+            message: format!("must be {MIN_BODY_READ_TIMEOUT_SECS} or more"),
         });
     }
     Ok(secs)
@@ -605,6 +665,15 @@ impl RelayState {
         let mut live = HashMap::new();
         let store: Box<dyn EventStore> = if config.admin_token.is_some() {
             let mut store = SqliteEventStore::open(&config.state_file, config.max_reserved_items)?;
+            if let Some(previous_mode) = store.previous_mode() {
+                // The state file held a secret with a wider mode than
+                // `0600`. The store already set the correct mode (ADR 0009).
+                tracing::warn!(
+                    state_file = %config.state_file.display(),
+                    previous_mode = format!("{previous_mode:o}"),
+                    "corrected the mode of the state file"
+                );
+            }
             let restored = store.load()?;
             let now = clock();
             for event in &restored {
@@ -2763,6 +2832,127 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The error [`DeadlineBody::poll_frame`] gives when
+/// `BODY_READ_TIMEOUT_SECS` ends before the body does (ADR 0008 §Two
+/// Timeouts).
+#[derive(Debug)]
+struct BodyReadTimeoutElapsed;
+
+impl std::fmt::Display for BodyReadTimeoutElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request body read timeout elapsed")
+    }
+}
+
+impl std::error::Error for BodyReadTimeoutElapsed {}
+
+/// Wraps a request body with one deadline for the whole body (ADR 0008
+/// §Two Timeouts).
+///
+/// [`DeadlineBody::poll_frame`] polls the deadline before it polls the
+/// inner body, on every call, so a slow flow of bytes cannot extend the
+/// deadline. `tower_http`'s `RequestBodyTimeoutLayer` restarts its timer
+/// after each frame instead, which this record does not copy
+/// (`docs/adr/0008-connection-read-timeouts.md` §Context).
+///
+/// `inner` (`axum::body::Body`) and `deadline` (a `Sleep` pinned in a
+/// `Box`) are both `Unpin`, so this type needs no manual pin projection.
+struct DeadlineBody {
+    inner: Body,
+    deadline: Pin<Box<Sleep>>,
+    timed_out: Arc<AtomicBool>,
+}
+
+impl DeadlineBody {
+    /// Wraps `inner` with a deadline of `timeout` starting now. Sets
+    /// `timed_out` the first time [`DeadlineBody::poll_frame`] finds the
+    /// deadline has ended before the body does.
+    fn new(inner: Body, timeout: Duration, timed_out: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            timed_out,
+        }
+    }
+}
+
+impl hyper::body::Body for DeadlineBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    /// Polls the deadline first. When it has ended, sets `timed_out` and
+    /// gives an error, with no further poll of the inner body. Else polls
+    /// the inner body and gives its result. A body that ends first is not
+    /// affected, however long the deadline is.
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        // A body that is complete gives no error, also when a caller polls
+        // it again after the deadline.
+        if this.inner.is_end_stream() {
+            return Poll::Ready(None);
+        }
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.timed_out.store(true, Ordering::SeqCst);
+            return Poll::Ready(Some(Err(Box::new(BodyReadTimeoutElapsed))));
+        }
+        Pin::new(&mut this.inner)
+            .poll_frame(cx)
+            .map(|frame| frame.map(|result| result.map_err(Into::into)))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
+/// Gives `408 request_body_timeout` when a request body is not complete
+/// `BODY_READ_TIMEOUT_SECS` after its head (ADR 0008 §Two Timeouts, §What A
+/// Client Gets At A Timeout).
+///
+/// Wraps the request body in [`DeadlineBody`], with a deadline that starts
+/// now and a shared flag. [`DeadlineBody::poll_frame`] sets the flag when
+/// the deadline ends before a handler finishes reading the body. This
+/// middleware then replaces the response of the next service with the
+/// timeout response, and sets `Connection: close`. A handler that reads no
+/// body, or that finishes reading it before the deadline, is not affected.
+///
+/// `app()` applies this middleware as the outermost layer, so it also
+/// wraps the Socket.IO layer. The handlers and their own error codes are
+/// unchanged: this middleware replaces a response only when the deadline
+/// ends.
+async fn enforce_body_read_timeout(
+    AxumState(state): AxumState<RelayState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let timeout = state.inner.config.body_read_timeout;
+    let timed_out = Arc::new(AtomicBool::new(false));
+
+    let (parts, body) = request.into_parts();
+    let body = Body::new(DeadlineBody::new(body, timeout, Arc::clone(&timed_out)));
+    let request = axum::extract::Request::from_parts(parts, body);
+
+    let response = next.run(request).await;
+
+    if timed_out.load(Ordering::SeqCst) {
+        let mut response =
+            ApiError::new(StatusCode::REQUEST_TIMEOUT, "request_body_timeout").into_response();
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        return response;
+    }
+
+    response
+}
+
 pub fn app(state: RelayState) -> Router {
     let artwork_max_bytes = state.inner.config.artwork_max_bytes;
     let (socket_layer, io) = SocketIo::builder()
@@ -2778,6 +2968,10 @@ pub fn app(state: RelayState) -> Router {
     // socketioxide by path, before it would ever reach a route (ADR 0007 §A
     // Socket.IO Session With No Namespace).
     let handshake_rate_limit_state = state.clone();
+    // The body deadline middleware wraps every layer below it, including
+    // the handshake-rate middleware and the Socket.IO layer, so it is the
+    // outermost layer added below (ADR 0008 §Two Timeouts).
+    let body_read_timeout_state = state.clone();
 
     Router::new()
         .route("/health", get(health))
@@ -2822,6 +3016,10 @@ pub fn app(state: RelayState) -> Router {
         .layer(middleware::from_fn_with_state(
             handshake_rate_limit_state,
             limit_socketio_handshake_rate,
+        ))
+        .layer(middleware::from_fn_with_state(
+            body_read_timeout_state,
+            enforce_body_read_timeout,
         ))
 }
 
@@ -3452,8 +3650,7 @@ fn parse_listener_delay_header(
 static MISSING_CONNECT_INFO_LOGGED: Once = Once::new();
 
 /// Reads the TCP peer address from the extensions of a request: the real
-/// `ConnectInfo<SocketAddr>` that `axum::serve`'s
-/// `into_make_service_with_connect_info` inserts, or the
+/// `ConnectInfo<SocketAddr>` that [`crate::server::serve`] inserts, or the
 /// `MockConnectInfo<SocketAddr>` a test layers in its place (ADR 0007 §The
 /// Client Address). `None` with neither extension present.
 ///
@@ -3480,8 +3677,8 @@ fn connect_info_peer_addr(extensions: &http::Extensions) -> Option<IpAddr> {
 ///
 /// With no `ConnectInfo` in the request extensions, the address is
 /// `0.0.0.0`, and the relay logs this once. This keeps a test that gives
-/// no peer address working, and keeps `axum::serve` the only production
-/// path that can give a real peer address.
+/// no peer address working, and keeps [`crate::server::serve`] the only
+/// production path that can give a real peer address.
 struct ClientPeerAddr(IpAddr);
 
 impl<S> FromRequestParts<S> for ClientPeerAddr
@@ -4321,6 +4518,137 @@ mod tests {
 
         let err = result.expect_err("a lease below the minimum is rejected");
         assert!(err.to_string().contains("LEASE_SECS"));
+    }
+
+    /// Acceptance criterion of read timeouts task 001: `0` is a
+    /// configuration error for `HEADER_READ_TIMEOUT_SECS` (ADR 0008 §Two
+    /// Timeouts).
+    #[test]
+    fn header_read_timeout_secs_of_zero_is_a_configuration_error() {
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("HEADER_READ_TIMEOUT_SECS", "0");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HEADER_READ_TIMEOUT_SECS");
+        }
+
+        let err = result.expect_err("a value of 0 is rejected");
+        assert!(err.to_string().contains("HEADER_READ_TIMEOUT_SECS"));
+    }
+
+    /// Acceptance criterion of read timeouts task 001: a value that does
+    /// not parse is a configuration error for `HEADER_READ_TIMEOUT_SECS`.
+    #[test]
+    fn header_read_timeout_secs_that_does_not_parse_is_a_configuration_error() {
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("HEADER_READ_TIMEOUT_SECS", "x");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HEADER_READ_TIMEOUT_SECS");
+        }
+
+        let err = result.expect_err("a non-numeric value is rejected");
+        assert!(err.to_string().contains("HEADER_READ_TIMEOUT_SECS"));
+    }
+
+    #[test]
+    fn header_read_timeout_secs_has_a_default_of_ten() {
+        assert_eq!(DEFAULT_HEADER_READ_TIMEOUT_SECS, 10);
+        assert_eq!(
+            AppConfig::for_tests().header_read_timeout,
+            Duration::from_secs(DEFAULT_HEADER_READ_TIMEOUT_SECS)
+        );
+    }
+
+    /// Review of read timeouts task 002: a body that is complete gives no
+    /// timeout error, also when a caller polls it again after the deadline
+    /// (ADR 0008 §Two Timeouts).
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_body_polled_after_the_deadline_gives_no_error() {
+        use http_body_util::BodyExt as _;
+
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let mut body = DeadlineBody::new(
+            Body::from("complete"),
+            Duration::from_secs(30),
+            Arc::clone(&timed_out),
+        );
+
+        let frame = body.frame().await.expect("one frame").expect("no error");
+        assert_eq!(frame.into_data().expect("data"), Bytes::from("complete"));
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        assert!(body.frame().await.is_none(), "a complete body has no frame");
+        assert!(!timed_out.load(Ordering::SeqCst));
+    }
+
+    /// Acceptance criterion of read timeouts task 002: `0` is a
+    /// configuration error for `BODY_READ_TIMEOUT_SECS` (ADR 0008 §Two
+    /// Timeouts).
+    #[test]
+    fn body_read_timeout_secs_of_zero_is_a_configuration_error() {
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("BODY_READ_TIMEOUT_SECS", "0");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("BODY_READ_TIMEOUT_SECS");
+        }
+
+        let err = result.expect_err("a value of 0 is rejected");
+        assert!(err.to_string().contains("BODY_READ_TIMEOUT_SECS"));
+    }
+
+    /// Acceptance criterion of read timeouts task 002: a value that does
+    /// not parse is a configuration error for `BODY_READ_TIMEOUT_SECS`.
+    #[test]
+    fn body_read_timeout_secs_that_does_not_parse_is_a_configuration_error() {
+        // SAFETY: `ENV_LOCK` is held for the whole body, so no other test
+        // races this mutation of the process environment.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("BODY_READ_TIMEOUT_SECS", "x");
+        }
+        let result = AppConfig::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("BODY_READ_TIMEOUT_SECS");
+        }
+
+        let err = result.expect_err("a non-numeric value is rejected");
+        assert!(err.to_string().contains("BODY_READ_TIMEOUT_SECS"));
+    }
+
+    #[test]
+    fn body_read_timeout_secs_has_a_default_of_thirty() {
+        assert_eq!(DEFAULT_BODY_READ_TIMEOUT_SECS, 30);
+        assert_eq!(
+            AppConfig::for_tests().body_read_timeout,
+            Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECS)
+        );
     }
 
     #[test]

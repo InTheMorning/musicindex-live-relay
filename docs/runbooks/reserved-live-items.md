@@ -40,6 +40,11 @@ visible to other users in the process list.
 9. Read the startup line: `journalctl -u musicindex-live-relay -n 20`
 10. Make sure that the log has `restored reserved live items` with the state
     file path and a count.
+11. Read the mode of the state file:
+    `stat -c '%a %U %n' /var/lib/musicindex-live-relay/reserved-items.sqlite3`.
+    Make sure that the mode is `600` (ADR 0009). The log line
+    `corrected the mode of the state file` means that the relay found and
+    fixed a wider mode at this start.
 
 ## Reserve An Item And Store The Broadcaster Token
 
@@ -85,6 +90,9 @@ again, give each publisher a new token, and change each feed.
 
 The relay writes the file only for a reserve and a delete. Make a backup after
 each reserve and each delete.
+
+The state file has the mode `0600` (ADR 0009). Only the relay user or root
+can read it. Use the relay user or `sudo` for each command below, as shown.
 
 1. Stop the relay: `sudo systemctl stop musicindex-live-relay`
 2. Copy the file and keep its mode:

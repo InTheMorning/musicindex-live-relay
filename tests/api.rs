@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
@@ -749,6 +749,186 @@ async fn latest_metadata_includes_renewed_at_and_lease_expires_at() {
     let body: LatestMetadataResponse = read_json(response).await;
     assert!(!body.renewed_at.is_empty());
     assert!(!body.lease_expires_at.is_empty());
+}
+
+/// Tests for the body read deadline of ADR 0008 (read timeouts task 002).
+/// Each test pauses the tokio clock, so a slow or stalled body stream
+/// times out with no wall-clock wait.
+mod body_read_timeout {
+    use super::*;
+
+    /// A body that gives one chunk, then never gives another and never
+    /// ends.
+    fn stalled_body(first_chunk: &'static [u8]) -> Body {
+        Body::from_stream(async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(first_chunk));
+            yield std::future::pending::<Result<Bytes, std::io::Error>>().await;
+        })
+    }
+
+    /// A body that gives no chunk and never ends.
+    fn never_ending_body() -> Body {
+        Body::from_stream(async_stream::stream! {
+            yield std::future::pending::<Result<Bytes, std::io::Error>>().await;
+        })
+    }
+
+    /// A body that gives one chunk every `interval`, with no end.
+    fn slow_drip_body(interval: Duration) -> Body {
+        Body::from_stream(async_stream::stream! {
+            loop {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"x"));
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_publish_with_a_stalled_body_gets_408_request_body_timeout() {
+        let router = test_app();
+        let created = create_event(router.clone()).await;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", created.broadcaster_token),
+                    )
+                    .body(stalled_body(b"{"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close")
+        );
+        let body: Value = read_json(response).await;
+        assert_eq!(body["error"], "request_body_timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_flow_of_bytes_does_not_extend_the_deadline() {
+        let router = test_app();
+        let created = create_event(router.clone()).await;
+
+        let start = tokio::time::Instant::now();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/liveitems/{}/metadata", created.event_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", created.broadcaster_token),
+                    )
+                    .body(slow_drip_body(Duration::from_secs(10)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let body: Value = read_json(response).await;
+        assert_eq!(body["error"], "request_body_timeout");
+        assert!(
+            elapsed >= Duration::from_secs(30),
+            "elapsed = {elapsed:?}, must be 30 seconds or more"
+        );
+        assert!(
+            elapsed < Duration::from_secs(40),
+            "elapsed = {elapsed:?}, must be less than 40 seconds"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_artwork_upload_with_no_token_and_a_stalled_body_gets_408_request_body_timeout() {
+        let router = test_app();
+        let created = create_event(router.clone()).await;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/v1/liveitems/{}/artwork/{}",
+                        created.event_id,
+                        "0".repeat(64)
+                    ))
+                    .body(never_ending_body())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let body: Value = read_json(response).await;
+        assert_eq!(body["error"], "request_body_timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_body_publish_stays_200_after_the_clock_moves_60_seconds_forward() {
+        let router = test_app();
+        let created = create_event(router.clone()).await;
+
+        let response = publish(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "Live"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let body: PublishMetadataResponse = read_json(response).await;
+        assert!(body.accepted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_events_stream_open_across_a_60_second_clock_move_still_gets_a_publish() {
+        let router = test_app();
+        let created = create_event(router.clone()).await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/liveitems/{}/events", created.event_id))
+                    .body(Body::empty())
+                    .expect("events request"),
+            )
+            .await
+            .expect("events response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let response = publish(
+            router,
+            &created.event_id,
+            Some(&created.broadcaster_token),
+            json!({"title": "after the clock moved"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let chunk = next_sse_chunk(&mut body).await;
+        assert!(chunk.contains("after the clock moved"), "{chunk}");
+    }
 }
 
 /// Tests for the `Listener-Delay-Secs` header of ADR 0004 (task 001). No
@@ -5087,9 +5267,8 @@ mod listener_limits {
 
     /// Opens a stream from `peer`, with `headers` added to the request.
     /// `MockConnectInfo` gives `peer` as the `ConnectInfo<SocketAddr>` of
-    /// the request, the same as `axum::serve`
-    /// `.into_make_service_with_connect_info::<SocketAddr>()` does in
-    /// production (ADR 0007).
+    /// the request, the same as `musicindex_live_relay::server::serve` does
+    /// in production (ADR 0007, ADR 0008).
     async fn open_stream_from(
         router: axum::Router,
         uri: String,
