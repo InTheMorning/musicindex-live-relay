@@ -2,6 +2,9 @@
 
 ## Status
 
+Accepted 2026-10-21 by the operator. The mode of the state file on
+`api.musicindex.org` is recorded in §Before Acceptance.
+
 Proposed 2026-10-21.
 
 Class: durable. AGENTS.md §4 makes the token hashes a secret of the relay.
@@ -72,7 +75,17 @@ The store sets no journal mode, so the journal is a rollback journal and gets
 ## Before Acceptance
 
 - The operator records the mode of the Docker volume directory on
-  `api.musicindex.org`.
+  `api.musicindex.org`. Done on 2026-10-21, for the container
+  `stophammer-live-relay-1`:
+  - The volume directory
+    `/var/lib/docker/volumes/stophammer_live-relay-state/_data` has the mode
+    `700`.
+  - The state file `reserved-items.sqlite3` in it has the mode `644`.
+  - The owner is the user of the container, which has no name on the host.
+
+  The directory gives the same protection as the systemd unit. The file
+  itself is readable by each user that has access to the directory. On this
+  host, this record is thus a second layer.
 
 ## Verification After Implementation
 

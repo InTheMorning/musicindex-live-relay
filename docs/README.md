@@ -41,7 +41,7 @@ station runs continuously.
   — Accepted. A timeout for the request headers and an idle connection, and
   one deadline for the request body
 - [ADR 0009: The state file is private to the relay user](adr/0009-state-file-mode.md)
-  — Proposed. The relay makes the state file with the mode `0600` and
+  — Accepted. The relay makes the state file with the mode `0600` and
   corrects a mode that is too wide at each start
 
 ## Plans

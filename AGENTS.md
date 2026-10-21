@@ -77,9 +77,11 @@ packet.
   no idle timeout and no body deadline. A client with no credential can
   keep a connection open with a slow request. On `api.musicindex.org`,
   nginx closes such a connection after 60 seconds.
-- ADR 0009, a private state file, has the status `Proposed`. The relay makes
-  the state file with the process umask, and the mode is `0644` with the
-  umask `022`. Only the systemd `StateDirectoryMode=0700` protects it.
+- ADR 0009, a private state file, has the status `Accepted`. It has no plan
+  and no task packet yet. The relay makes the state file with the process
+  umask, and the mode is `0644` with the umask `022`. Only a directory with
+  the mode `0700` protects it: the systemd `StateDirectoryMode`, or the
+  Docker volume directory on `api.musicindex.org`.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
