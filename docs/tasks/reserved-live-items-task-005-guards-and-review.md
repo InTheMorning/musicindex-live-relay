@@ -86,7 +86,7 @@ review, and reconcile the statuses.
 ## Reconcile The Other Repositories
 
 This feature changes what a `v4vmm` operator can do, so closing it is not a
-`splitkit` matter alone.
+relay matter alone.
 
 Before this packet is complete:
 

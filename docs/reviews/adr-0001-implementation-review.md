@@ -137,7 +137,6 @@ These points have no automatic test. None of them is an ADR 0001 invariant.
   `musicindex-live-publisher` `docs/architecture/broadcast-chain-boundaries.md`
   §Known Limits. They are correct for an ephemeral item, but they do not
   name the reserved class. This review did not change them.
-- The `v4vmm` delivery order calls this repository `splitkit`.
 
 ## Reconciliation With The Other Repositories
 
