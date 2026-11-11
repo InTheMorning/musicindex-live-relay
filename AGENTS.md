@@ -32,7 +32,7 @@ packet.
   reserved events. A corrupt state file stops the relay at startup, and the
   unit stops after five failed starts.
 - The relay runs on `api.musicindex.org`, and the operator's station uses a
-  reserved event there. `v4vmm` has no packet yet to reserve an event from
+  reserved event there. HitIt has no packet yet to reserve an event from
   the app.
 - ADR 0003, display state and artwork, has the status `Implemented`. The
   review is `docs/reviews/adr-0003-implementation-review.md`.
@@ -199,6 +199,10 @@ This service carries payment routing to listener apps.
 | Repository | Relation |
 |---|---|
 | `musicindex-live-publisher` | The broadcaster. Sends the direct live value payload. |
-| `v4vmm` | Creates live items, keeps the event registry and the tokens, reads snapshots. Sends no payloads. |
+| `v4vmm` (HitIt) | Creates live items, keeps the event registry and the tokens, reads snapshots. Sends no payloads. |
+
+The app v4vmm has the name HitIt from 2026-11-11 (HitIt ADR 0096). Its
+repository and its directory keep the name `v4vmm`. In ADRs, plans, task
+packets, reviews and research notes of this repository, v4vmm means HitIt.
 
 This service has no dependency on either one and must keep none.

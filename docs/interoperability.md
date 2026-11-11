@@ -4,13 +4,13 @@ This relay is one part of a chain that four repositories build separately. This
 document says which behavior of this service other repositories depend on, and
 which limits they must work around.
 
-The full chain map lives in `v4vmm`:
+The full chain map lives in the HitIt repository, `v4vmm`:
 `docs/architecture/broadcast-chain.md`.
 
 ## The Chain
 
 ```text
-v4vmm ── writes MusicIndex tags into the audio file
+HitIt ── writes MusicIndex tags into the audio file
              │
              ▼
 a player plays the file (Mixxx, mpv, or liquidsoap)
@@ -25,10 +25,10 @@ musicindex-live-publisher sends the direct live value payload
 THIS SERVICE holds the payload and sends remoteValue
              │
              ├──▶ listener apps
-             └──▶ v4vmm, to show what listeners receive
+             └──▶ HitIt, to show what listeners receive
 ```
 
-`musicindex-live-publisher` is the only sender. `v4vmm` creates live items and
+`musicindex-live-publisher` is the only sender. HitIt creates live items and
 reads snapshots, and sends no payloads.
 
 ## What Consumers Depend On
@@ -50,12 +50,12 @@ without a change in that repository.
 ### The create response fields
 
 `POST /v1/liveitems` returns `event_id`, `broadcaster_token`, `metadata_url`,
-`remote_value_url`, `events_url`, and `socket_io_url`. `v4vmm` stores these
+`remote_value_url`, `events_url`, and `socket_io_url`. HitIt stores these
 fields in its event registry, because this service cannot list them later.
 
 ### A `404` means a dead event
 
-`v4vmm` tests a stored event with `GET /v1/liveitems/{event_id}/metadata`. A
+HitIt tests a stored event with `GET /v1/liveitems/{event_id}/metadata`. A
 `404` tells the operator that the event no longer exists. Keep that status code
 stable.
 
@@ -73,7 +73,7 @@ dies, its stored token becomes invalid, and listeners must tune to a new event
 identifier. A reserved item survives a restart. See "Two classes of live item"
 below.
 
-`v4vmm` therefore keeps its own registry of the events that it created, and
+HitIt therefore keeps its own registry of the events that it created, and
 reports a dead event to the operator instead of a silent replacement.
 
 ### Two classes of live item
@@ -105,7 +105,7 @@ included systemd unit stops the restart loop after five failed starts, and
 the unit becomes `failed`.
 
 The reserve response holds the fields of the create response, and `label`.
-`v4vmm` parses `event_id`, `broadcaster_token`, `metadata_url`, and
+HitIt parses `event_id`, `broadcaster_token`, `metadata_url`, and
 `events_url` from it. Do not rename them. The status codes `201`, `401`,
 `403`, `404`, and `409` each have one meaning. See `README.md`.
 
@@ -125,7 +125,7 @@ client address: Socket.IO connections, `/events` streams and
   app then uses the static `<podcast:value>` of the live item.
 - Behind a proxy, the client address is `X-Real-IP` from a trusted proxy.
   Listeners behind one shared address share one limit.
-- `v4vmm` and the publisher open no listener connection, so the limits do not
+- HitIt and the publisher open no listener connection, so the limits do not
   apply to them.
 
 ### A request body has a deadline
@@ -166,7 +166,7 @@ A lease expiry removes the snapshot but keeps the event. `GET
 code can tell a lease expiry from a removed event. A client that reads only
 the status code cannot.
 
-For `v4vmm`, a lease expiry means the event is off air. It does not mean
+For HitIt, a lease expiry means the event is off air. It does not mean
 the event is dead. The event identifier and the stored token do not become
 invalid. A broadcaster that resumes publishing brings the same event back
 on air with no new identifier.
@@ -272,7 +272,7 @@ Image retention keeps the memory in its limit:
 This service stores a SHA-256 hash of the broadcaster token and compares it in
 constant time. It cannot return the token again.
 
-A client that loses the token loses the event. `v4vmm` writes each token to a
+A client that loses the token loses the event. HitIt writes each token to a
 file with mode `0600` for this reason, and never puts a token in a database or
 a log.
 
@@ -296,7 +296,7 @@ The requirement, from the 2026-09-06 chain review:
 - A clear difference between a short event, for one show, and a reserved
   event, for a station.
 
-This is a decision for this repository. `v4vmm` ADR 0059 records it as
+This is a decision for this repository. HitIt ADR 0059 records it as
 follow-up work and its event registry already stores what a resume needs.
 
 ### Per-transport delay for live payloads
@@ -340,7 +340,7 @@ necessary to select a good value.
 ## References
 
 - `README.md` in this repository for the full API
-- `v4vmm`: `docs/architecture/broadcast-chain.md`
-- `v4vmm`: `docs/adr/0059-broadcast-control-surface.md`
+- HitIt (`v4vmm`): `docs/architecture/broadcast-chain.md`
+- HitIt (`v4vmm`): `docs/adr/0059-broadcast-control-surface.md`
 - `musicindex-live-publisher`: `docs/architecture/broadcast-chain-boundaries.md`
 - `musicindex-live-publisher`: `docs/adr/0002-nowplaying-drop-file-contract.md`

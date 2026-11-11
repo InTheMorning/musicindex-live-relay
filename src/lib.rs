@@ -2668,7 +2668,7 @@ pub struct CreateEventResponse {
 
 /// The response of `POST /v1/liveitems/reserved`.
 ///
-/// It holds the fields of [`CreateEventResponse`] and the label. `v4vmm`
+/// It holds the fields of [`CreateEventResponse`] and the label. HitIt
 /// parses these names. Do not rename them.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReserveEventResponse {
@@ -2686,7 +2686,7 @@ pub struct ReserveEventResponse {
 /// The response of `GET /v1/liveitems/reserved`.
 ///
 /// It is an object, not a bare array, so a later field does not change the
-/// shape that `v4vmm` parses. An empty list keeps the `reserved` key.
+/// shape that HitIt parses. An empty list keeps the `reserved` key.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReservedItemsResponse {
     /// The reserved items, oldest first.
