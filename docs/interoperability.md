@@ -4,7 +4,7 @@ This relay is one part of a chain that four repositories build separately. This
 document says which behavior of this service other repositories depend on, and
 which limits they must work around.
 
-The full chain map lives in the HitIt repository, `v4vmm`:
+The full chain map lives in the HitIt repository, `HitIt`:
 `docs/architecture/broadcast-chain.md`.
 
 ## The Chain
@@ -340,7 +340,7 @@ necessary to select a good value.
 ## References
 
 - `README.md` in this repository for the full API
-- HitIt (`v4vmm`): `docs/architecture/broadcast-chain.md`
-- HitIt (`v4vmm`): `docs/adr/0059-broadcast-control-surface.md`
+- `HitIt`: `docs/architecture/broadcast-chain.md`
+- `HitIt`: `docs/adr/0059-broadcast-control-surface.md`
 - `musicindex-live-publisher`: `docs/architecture/broadcast-chain-boundaries.md`
 - `musicindex-live-publisher`: `docs/adr/0002-nowplaying-drop-file-contract.md`

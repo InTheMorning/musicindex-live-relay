@@ -3,7 +3,7 @@
 ## Order Of Work
 
 The packets here belong to a system that spans three repositories. The
-cross-repository order lives in the HitIt repository, `v4vmm`:
+cross-repository order lives in the HitIt repository, `HitIt`:
 `docs/plans/broadcast-chain-delivery-order.md`.
 
 This repository blocks nothing and is blocked by nothing. Its urgency is a

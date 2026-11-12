@@ -9,7 +9,7 @@ The service is intentionally memory-only for v1. Clients create a live item, rec
 | Component | Repository | Relation |
 |---|---|---|
 | `musicindex-live-publisher` | `musicindex-live-publisher` | The broadcaster. Sends the direct live value payload. |
-| HitIt | `v4vmm` | Registers live items, keeps the event registry and the tokens, and reads snapshots to show what listeners receive. Sends no payloads. |
+| HitIt | `HitIt` | Registers live items, keeps the event registry and the tokens, and reads snapshots to show what listeners receive. Sends no payloads. |
 | Listener apps | external | Read `remoteValue` over Socket.IO, or the HTTP and SSE fallbacks. |
 
 Read `docs/interoperability.md` before you change a route, a body form, or the

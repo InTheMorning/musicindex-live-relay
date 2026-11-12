@@ -199,10 +199,10 @@ This service carries payment routing to listener apps.
 | Repository | Relation |
 |---|---|
 | `musicindex-live-publisher` | The broadcaster. Sends the direct live value payload. |
-| `v4vmm` (HitIt) | Creates live items, keeps the event registry and the tokens, reads snapshots. Sends no payloads. |
+| `HitIt` | Creates live items, keeps the event registry and the tokens, reads snapshots. Sends no payloads. |
 
-The app v4vmm has the name HitIt from 2026-11-11 (HitIt ADR 0096). Its
-repository and its directory keep the name `v4vmm`. In ADRs, plans, task
-packets, reviews and research notes of this repository, v4vmm means HitIt.
+The repository of HitIt is `HitIt` (HitIt ADR 0096). Its earlier name was
+`v4vmm`. In ADRs, plans, task packets, reviews and research notes of this
+repository, v4vmm means HitIt.
 
 This service has no dependency on either one and must keep none.
