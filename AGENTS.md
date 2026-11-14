@@ -97,6 +97,7 @@ cargo test --test api            # The HTTP integration tests
 cargo fmt -- --check
 cargo fmt
 cargo clippy -- -D warnings
+python3 ~/.agents/skills/project-baseline/scripts/check_adr_links.py --counts ~/build/musicindex-live-relay
 ```
 
 ## Conventions
@@ -133,6 +134,11 @@ cargo clippy -- -D warnings
   gates, or a completed task series.
 - Amend an ADR in place only when the amendment does not reverse a decision,
   and add a dated sentence that says what changed.
+- An ADR that changes an earlier ADR has the line
+  `- Changes: ADR NNNN items ...`. The changed ADR gets the line
+  `- Changed by: ADR MMMM` in the same commit. The owner is the
+  project-baseline skill, section "A Binding Rule Lives In A Decision
+  Record". `check_adr_links.py` in the command list above enforces it.
 
 ### 3. Documentation Discipline
 
