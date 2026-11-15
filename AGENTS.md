@@ -139,6 +139,10 @@ cargo clippy -- -D warnings
   project-baseline skill, section "A Binding Rule Lives In A Decision
   Record". The test `tests/adr_links.rs` runs `check_adr_links.py` in
   `cargo test` and enforces it.
+- Each current ADR from number 0010 has one `- Bar:` line. An ADR with a
+  `- Supersedes:` line needs no `- Bar:` line. The owner is the same section
+  of the project-baseline skill. The same test gives `--bar-from 0010` to the
+  script and enforces it.
 
 ### 3. Documentation Discipline
 
