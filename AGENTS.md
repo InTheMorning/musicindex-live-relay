@@ -97,7 +97,6 @@ cargo test --test api            # The HTTP integration tests
 cargo fmt -- --check
 cargo fmt
 cargo clippy -- -D warnings
-python3 ~/.agents/skills/project-baseline/scripts/check_adr_links.py --counts ~/build/musicindex-live-relay
 ```
 
 ## Conventions
@@ -138,7 +137,8 @@ python3 ~/.agents/skills/project-baseline/scripts/check_adr_links.py --counts ~/
   `- Changes: ADR NNNN items ...`. The changed ADR gets the line
   `- Changed by: ADR MMMM` in the same commit. The owner is the
   project-baseline skill, section "A Binding Rule Lives In A Decision
-  Record". `check_adr_links.py` in the command list above enforces it.
+  Record". The test `tests/adr_links.rs` runs `check_adr_links.py` in
+  `cargo test` and enforces it.
 
 ### 3. Documentation Discipline
 
