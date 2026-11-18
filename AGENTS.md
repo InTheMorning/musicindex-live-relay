@@ -106,6 +106,22 @@ packet.
     open checks until the first tag.
   - On a GitHub runner, `tests/adr_links.rs` does not run the ADR guard.
   - The deploy on `api.musicindex.org` does not use these files.
+- Open operator check: the reserved live items on the VPS must stay after a
+  restart. The relay saves only reserved items, and only when `ADMIN_TOKEN`
+  is set. The default file is
+  `/var/lib/musicindex-live-relay/reserved-items.sqlite3`. A container keeps
+  that file only on a volume. Nobody has confirmed the two facts below on
+  the VPS.
+  - On the VPS, `ADMIN_TOKEN` is set.
+  - The service `live-relay` has a volume at
+    `/var/lib/musicindex-live-relay`.
+  - The operator runs this check in the folder of the stack:
+    `docker compose config | grep -n -B2 -A2 "/var/lib/musicindex-live-relay"`
+  - An empty output means that a container recreate loses the reserved
+    items.
+  - Each report about a deploy or a release of the relay reminds the
+    operator of this check. When the operator gives the result, delete this
+    item in the commit that records the result.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.
