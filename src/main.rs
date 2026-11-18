@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, process::ExitCode};
 
 use musicindex_live_relay::{
-    AppConfig, RelayState, app, server, spawn_cleanup_task, spawn_lease_task,
+    AppConfig, BUILD_INFO, RelayState, app, server, spawn_cleanup_task, spawn_lease_task,
 };
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -9,6 +9,13 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `--version` prints one line and starts no server (musicindex ADR 0083
+    // R-VERSION-2).
+    if std::env::args().skip(1).any(|arg| arg == "--version") {
+        println!("{}", BUILD_INFO.version_line());
+        return ExitCode::SUCCESS;
+    }
+
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer())

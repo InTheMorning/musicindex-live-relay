@@ -34,6 +34,7 @@ GET  /v1/liveitems/{event_id}/display/events
 PUT  /v1/liveitems/{event_id}/artwork/{sha256}
 GET  /v1/liveitems/{event_id}/artwork/{sha256}
 GET  /socket.io/*
+GET  /v1/liveitems/info
 ```
 
 The public URLs advertised in RSS should be based on the deployment's external origin. The `api.musicindex.org` examples below show the MusicIndex deployment, not a hosting requirement.
@@ -973,6 +974,28 @@ ok
 
 `GET /v1/liveitems/health` returns the same response and is useful for checking that nginx is reaching the live relay specifically. On `api.musicindex.org`, the top-level `/health` route may belong to another API service.
 
+### Build Info
+
+```http
+GET /v1/liveitems/info
+```
+
+Returns the build values of the relay as one JSON object. The owner of this form is musicindex ADR 0083, rule R-VERSION-3.
+
+```json
+{
+  "version": "0.1.0",
+  "git_revision": "a1b2c3d",
+  "built_at": "2026-11-18T12:00:00Z"
+}
+```
+
+- `version` is the version of `Cargo.toml`.
+- `git_revision` is the short hash of the commit of the build. It has the suffix `-dirty` when the build had uncommitted changes.
+- `built_at` is the build time in UTC.
+
+An unknown value is `null`. The route needs no credential.
+
 ## Configuration
 
 Configuration is read from environment variables.
@@ -1093,6 +1116,22 @@ With explicit configuration:
 
 ```sh
 BIND=127.0.0.1:8018 MAX_ACTIVE_EVENTS=10000 cargo run
+```
+
+`--version` prints the build values in one line and starts no server (musicindex ADR 0083, rule R-VERSION-2):
+
+```sh
+cargo run -- --version
+```
+
+```text
+musicindex-live-relay 0.1.0 (a1b2c3d, 2026-11-18)
+```
+
+The build script reads the git revision from Git and the build time from the clock. The build time is the time of the last run of the build script. A release build sets `RELAY_BUILT_AT`, and a build with no `.git` folder also sets `RELAY_GIT_REVISION`:
+
+```sh
+RELAY_GIT_REVISION="$(git rev-parse --short HEAD)" RELAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" cargo build --release
 ```
 
 ## Test

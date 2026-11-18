@@ -12,6 +12,7 @@ http = "1"
 futures-core = "0.3"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
+musicindex-build-info = { git = "https://github.com/InTheMorning/musicindex-lib", rev = "e6d11118d33069c26c01368f7de71524988039c6" }
 rand = "0.9"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +26,9 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+musicindex-build-info = { git = "https://github.com/InTheMorning/musicindex-lib", rev = "e6d11118d33069c26c01368f7de71524988039c6" }
 
 [dev-dependencies]
 http-body-util = "0.1"

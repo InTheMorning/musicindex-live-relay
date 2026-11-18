@@ -466,6 +466,52 @@ async fn unknown_event_id_returns_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// musicindex ADR 0083 R-VERSION-9 item 1, for the info route.
+#[tokio::test]
+async fn info_gives_the_build_values() {
+    const FIX: &str = "musicindex ADR 0083 R-VERSION-3: `GET /v1/liveitems/info` gives one JSON \
+                       object with the fields `version`, `git_revision` and `built_at`. Keep the \
+                       route in `app` and keep `build.rs`, which gives the two build values to \
+                       the compiler.";
+
+    let response = test_app()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/liveitems/info")
+                .body(Body::empty())
+                .expect("info request"),
+        )
+        .await
+        .expect("info response");
+
+    assert_eq!(response.status(), StatusCode::OK, "{FIX}");
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("the info body is JSON");
+    let fields = body.as_object().expect("the info body is an object");
+
+    // `build.rs` gives the two build values to each target of this package,
+    // so this test reads the same values as the relay.
+    let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["built_at", "git_revision", "version"], "{FIX}");
+    assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")), "{FIX}");
+    assert_eq!(
+        body["git_revision"],
+        json!(option_env!("MUSICINDEX_BUILD_GIT_REVISION")),
+        "{FIX}"
+    );
+    // The build time is always known: the build script reads the clock when
+    // `RELAY_BUILT_AT` is not set.
+    let built_at = body["built_at"].as_str().unwrap_or_else(|| panic!("{FIX}"));
+    assert_eq!(
+        Some(built_at),
+        option_env!("MUSICINDEX_BUILD_BUILT_AT"),
+        "{FIX}"
+    );
+}
+
 #[tokio::test]
 async fn health_returns_ok() {
     for uri in ["/health", "/v1/liveitems/health"] {

@@ -693,6 +693,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "musicindex-build-info"
+version = "0.1.0"
+source = "git+https://github.com/InTheMorning/musicindex-lib?rev=e6d11118d33069c26c01368f7de71524988039c6#e6d11118d33069c26c01368f7de71524988039c6"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "musicindex-live-relay"
 version = "0.1.0"
 dependencies = [
@@ -704,6 +712,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "musicindex-build-info",
  "rand 0.9.4",
  "rusqlite",
  "serde",

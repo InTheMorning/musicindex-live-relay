@@ -83,6 +83,13 @@ packet.
   artifact is `docs/reviews/adr-0009-review-checklist.md`. The relay makes
   the state file with the mode `0600`, and it corrects a wider mode at each
   start with one warning.
+- The relay shows its build values in the form of musicindex ADR 0083, which
+  owns the rules. `GET /v1/liveitems/info` gives `version`, `git_revision`
+  and `built_at`, and `--version` prints one line. `build.rs` calls the crate
+  `musicindex-build-info` with the prefix `RELAY`, so the input variables are
+  `RELAY_GIT_REVISION` and `RELAY_BUILT_AT`. The version in `Cargo.toml` is
+  `0.1.0`. The operator selects the first release version and makes the tag
+  (R-VERSION-7).
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
   relay accepts other broadcasters.

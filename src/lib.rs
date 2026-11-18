@@ -32,6 +32,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use hyper::body::{Frame, SizeHint};
+use musicindex_build_info::BuildInfo;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -51,6 +52,11 @@ use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 use crate::store::{
     EventClass, EventStore, MemoryEventStore, SqliteEventStore, StoreError, StoredEvent,
 };
+
+/// The build values of this relay: the version, the git revision and the
+/// build time (musicindex ADR 0083 R-VERSION-1). `build.rs` gives the git
+/// revision and the build time to the compiler.
+pub const BUILD_INFO: BuildInfo = musicindex_build_info::build_info!();
 
 const DEFAULT_BIND: &str = "127.0.0.1:8018";
 const DEFAULT_MAX_ACTIVE_EVENTS: usize = 10_000;
@@ -2976,6 +2982,7 @@ pub fn app(state: RelayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/liveitems/health", get(health))
+        .route("/v1/liveitems/info", get(info))
         .route("/v1/liveitems", post(create_event))
         .route("/v1/liveitems/", post(create_event))
         .route(
@@ -3120,6 +3127,13 @@ pub fn spawn_lease_task(state: RelayState) -> tokio::task::JoinHandle<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// `GET /v1/liveitems/info`: the build values of this relay as one JSON
+/// object, with the fields `version`, `git_revision` and `built_at`. An
+/// unknown value is null (musicindex ADR 0083 R-VERSION-3).
+async fn info() -> Json<BuildInfo> {
+    Json(BUILD_INFO)
 }
 
 async fn create_event(
