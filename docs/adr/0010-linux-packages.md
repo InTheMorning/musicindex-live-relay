@@ -2,11 +2,13 @@
 
 ## Status
 
-Proposed - 2026-11-18.
+Accepted - 2026-11-18.
+
+Accepted on 2026-11-18 by the operator. The orchestrator session relayed the
+decision. The same decision adds the release workflow of §The Workflow.
 
 Proposed 2026-11-18. The orchestrator session relayed the task of
-musicindex ADR 0084, which the operator accepted on 2026-11-18. The operator
-has not accepted the selections of this record.
+musicindex ADR 0084, which the operator accepted on 2026-11-18.
 
 - Bar: difficult to change. A package puts the binary, the unit and a system
   user on each host that installs it. A subsequent change of a path or of the
@@ -41,7 +43,7 @@ The conditions on 2026-11-18:
   `../stophammer/deploy-live-relay.sh` builds a static binary and makes the
   image from `../stophammer/Dockerfile.deploy`. That deploy does not use the
   unit.
-- The repository has no CI workflow.
+- The repository had no CI workflow.
 - A restart of the relay removes each ephemeral live item and its
   broadcaster token (ADR 0001).
 
@@ -55,7 +57,8 @@ The conditions on 2026-11-18:
 | Debian | `[package.metadata.deb]` in `Cargo.toml`, the scripts in `packaging/debian/` | cargo-deb |
 | Docker | `Dockerfile`, `.dockerignore` | `docker build` |
 
-`packaging/README.md` gives the command for each package.
+`packaging/README.md` gives the local command for each package.
+`.github/workflows/release.yml` makes the three packages for a release.
 
 ### The Unit And Its User
 
@@ -90,9 +93,8 @@ The conditions on 2026-11-18:
 - `pkgver` comes from the version in `Cargo.toml`. The stophammer PKGBUILD
   had `pkgver=0.8.0` while its `Cargo.toml` had `0.21.1`. A value that the
   PKGBUILD reads from `Cargo.toml` cannot be different.
-- The PKGBUILD has no `check()` function. The gate of the repository runs
-  the tests. The test `tests/adr_links.rs` needs a skill script that is only
-  on a host of the operator.
+- The PKGBUILD has no `check()` function. The gate of the repository and
+  the release workflow run the tests.
 
 ### The Debian Package
 
@@ -117,23 +119,43 @@ The conditions on 2026-11-18:
 
 ### The Workflow
 
-The workflow is local. A person or an agent runs the three commands of
-`packaging/README.md` in a checkout. This work adds no CI workflow.
+`.github/workflows/release.yml` is the release workflow. A tag `v*` starts
+it, and a person can start it by hand. The operator makes each tag.
+
+- The job `gate` runs `cargo fmt -- --check`,
+  `cargo clippy --all-targets -- -D warnings` and `cargo test`. It stops
+  when the tag is not `v` and the version of `Cargo.toml`.
+- The job `deb` makes the `.deb` with cargo-deb on Ubuntu.
+- The job `arch` makes the Arch package with `makepkg` in the container
+  `archlinux:base-devel`.
+- The job `image` builds the image for `linux/amd64` and pushes it to
+  `ghcr.io/inthemorning/musicindex-live-relay` with the version as the tag.
+  The Docker image builds on GitHub, not on a host of the operator.
+- Each package job examines its package before the upload. The `.deb` and
+  the Arch package must contain the binary, the unit and the user file. The
+  image must print the git revision in its `--version` line.
+- The job `release` attaches the `.deb` and the Arch package to a draft
+  GitHub Release. The operator publishes the release.
+
+`.github/workflows/ci.yml` runs the gate on each push and each pull request.
+
+A GitHub runner does not have the skill script of `tests/adr_links.rs`. With
+the variable `CI`, that test prints that the guard did not run. On each
+other host, a missing script fails the test.
 
 ## Open
 
-1. A CI release workflow. The mechanical check of musicindex ADR 0084 names
-   a release workflow that makes each package. The repository has no CI, and
-   the operator does each tag, push and release. The decision needs the
-   registry for the image and the place for the two package files.
+1. The release workflow has not run. The Docker build and the job `arch`
+   are open checks until the first tag. The `.deb` build and the `makepkg`
+   build passed on a host of the operator on 2026-11-18.
 2. If the deploy on `api.musicindex.org` changes to the `Dockerfile` of this
    repository. That is a decision for stophammer, which owns the deploy.
 
 ## Checks
 
-Mechanical. The record of each run is in the commit message and in the report
-to the orchestrator session. No test runs these builds, because the builds
-need tools that the gate does not have.
+Mechanical. The release workflow makes each check at each tag. The gate of
+the repository does not run these builds, because the builds need tools that
+the gate does not have.
 
 - `makepkg` makes the Arch package. The package contains the binary, the
   unit and the user file.
@@ -149,6 +171,12 @@ For a person, on a host with systemd:
   `/var/lib/musicindex-live-relay` belongs to that user.
 
 ## Alternatives Considered
+
+### A Local Workflow Only
+
+Rejected by the operator on 2026-11-18. The first form of this record had
+three local commands and no CI workflow. A host of the operator does not
+build Docker images.
 
 ### A `.deb` From `dpkg-deb` And A `debian/` Folder
 
@@ -173,7 +201,10 @@ Rejected. Two files can differ. An install by hand copies the binary to
   the user with the file in `packaging/sysusers.d/` before the first start.
 - When the unit started as root before, systemd gives the state directory to
   the new user at the next start.
-- A release has three more commands. `packaging/README.md` gives them.
+- A tag `v*` makes the three packages. The version in `Cargo.toml` must be
+  the version of the tag before the operator makes the tag.
+- The image is public on `ghcr.io` after the first run, when the operator
+  sets the package to public.
 
 ## References
 

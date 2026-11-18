@@ -2,8 +2,12 @@
 
 ADR 0010 owns these files. musicindex ADR 0084 owns the set of packages.
 
-Run each command in a checkout of this repository. Each package gets its
-version from `Cargo.toml`.
+`.github/workflows/release.yml` makes the three packages at a tag `v*`. It
+attaches the `.deb` and the Arch package to a draft GitHub Release, and it
+pushes the image to `ghcr.io/inthemorning/musicindex-live-relay`.
+
+The commands below make a package on a local host. Run each command in a
+checkout of this repository. Each package gets its version from `Cargo.toml`.
 
 ## Arch Package
 

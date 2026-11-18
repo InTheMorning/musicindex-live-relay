@@ -1,0 +1,223 @@
+# ADR 0010 owns this workflow. A tag v* makes the three packages of musicindex
+# ADR 0084 R-PACKAGE-2: the .deb, the Arch package and the Docker image. The
+# operator makes each tag and publishes the draft release.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DEB_VERSION: 3.8.0
+
+# Each job gets a read-only token unless it states more.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Format, lint and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.values.outputs.version }}
+      revision: ${{ steps.values.outputs.revision }}
+      built_at: ${{ steps.values.outputs.built_at }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Each package job uses the same three values. build.rs reads the last
+      # two for the info route and --version (musicindex ADR 0083).
+      - name: Record the version, the commit and the build time
+        id: values
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v${version}" ]; then
+            echo "::error::musicindex ADR 0083 R-VERSION-7: the tag ${GITHUB_REF_NAME} is not v${version}. Set the version in Cargo.toml to the version of the tag, then make the tag again."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "revision=$(printf %.7s "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # No Rust cache: a release build starts from a clean tree.
+      - name: Install the stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: cargo fmt -- --check
+        run: cargo fmt -- --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      # tests/adr_links.rs needs a skill script that a runner does not have.
+      # With CI set, that test prints that the guard did not run.
+      - name: cargo test
+        run: cargo test
+
+  deb:
+    name: Build the .deb
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELAY_GIT_REVISION: ${{ needs.gate.outputs.revision }}
+      RELAY_BUILT_AT: ${{ needs.gate.outputs.built_at }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # musl-tools gives the C compiler for sqlite3.c of rusqlite "bundled".
+      - name: Install the musl target and cargo-deb
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+          cargo install --locked cargo-deb --version "$CARGO_DEB_VERSION"
+
+      - name: Build the .deb
+        run: cargo deb --locked --target x86_64-unknown-linux-musl
+
+      # musicindex ADR 0084 R-PACKAGE-2 item 2: the .deb holds the unit.
+      - name: Examine the .deb
+        run: |
+          deb="$(ls target/debian/*.deb)"
+          dpkg-deb --info "$deb"
+          contents="$(dpkg-deb --contents "$deb")"
+          echo "$contents"
+          for path in \
+            ./usr/bin/musicindex-live-relay \
+            ./usr/lib/systemd/system/musicindex-live-relay.service \
+            ./usr/lib/sysusers.d/musicindex-live-relay.conf; do
+            grep -q " ${path}\$" <<< "$contents" || { echo "::error::ADR 0010: the .deb has no ${path}. Add it to [package.metadata.deb] assets in Cargo.toml."; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Build the Arch package
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: archlinux:base-devel
+    steps:
+      # git comes before the checkout, so that the checkout is a Git clone.
+      - name: Install the build tools
+        run: pacman -Syu --noconfirm git rust systemd
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # makepkg does not run as root. The PKGBUILD builds this checkout.
+      - name: Build the package
+        env:
+          RELAY_GIT_REVISION: ${{ needs.gate.outputs.revision }}
+          RELAY_BUILT_AT: ${{ needs.gate.outputs.built_at }}
+        run: |
+          useradd --create-home builder
+          chown -R builder: .
+          cd packaging/arch
+          runuser -u builder -- env \
+            RELAY_GIT_REVISION="$RELAY_GIT_REVISION" \
+            RELAY_BUILT_AT="$RELAY_BUILT_AT" \
+            makepkg -f
+
+      # musicindex ADR 0084 R-PACKAGE-2 item 2: the package holds the unit.
+      - name: Examine the package
+        run: |
+          package="$(ls packaging/arch/*.pkg.tar.zst)"
+          contents="$(bsdtar -tf "$package")"
+          echo "$contents"
+          for path in \
+            usr/bin/musicindex-live-relay \
+            usr/lib/systemd/system/musicindex-live-relay.service \
+            usr/lib/sysusers.d/musicindex-live-relay.conf; do
+            grep -qx "${path}" <<< "$contents" || { echo "::error::ADR 0010: the Arch package has no ${path}. Add it to package() in packaging/arch/PKGBUILD."; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: arch
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  image:
+    name: Build the Docker image
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Name the image
+        id: names
+        run: echo "tag=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/musicindex-live-relay:${{ needs.gate.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+      # The image goes into the local Docker first, so that the next step
+      # can examine it before the push.
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: musicindex-live-relay
+          platforms: linux/amd64
+          build-args: |
+            RELAY_GIT_REVISION=${{ needs.gate.outputs.revision }}
+            RELAY_BUILT_AT=${{ needs.gate.outputs.built_at }}
+          provenance: false
+          sbom: false
+          load: true
+          tags: ${{ steps.names.outputs.tag }}
+
+      - name: Examine the image
+        run: |
+          line="$(docker run --rm "${{ steps.names.outputs.tag }}" musicindex-live-relay --version)"
+          echo "$line"
+          grep -q "(${{ needs.gate.outputs.revision }}, " <<< "$line" || { echo "::error::ADR 0010: --version in the image does not show the git revision. Keep the build arguments RELAY_GIT_REVISION and RELAY_BUILT_AT in Dockerfile."; exit 1; }
+
+      - name: Push the image
+        run: docker push "${{ steps.names.outputs.tag }}"
+
+  release:
+    name: Make the draft release
+    needs: [gate, deb, arch, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: packages
+          merge-multiple: true
+
+      # The release is a draft. The operator publishes it.
+      - name: Attach the .deb and the Arch package to a draft release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: v${{ needs.gate.outputs.version }}
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            packages/*.deb
+            packages/*.pkg.tar.zst

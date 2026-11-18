@@ -44,8 +44,9 @@ station runs continuously.
   — Implemented. The relay makes the state file with the mode `0600` and
   corrects a mode that is too wide at each start
 - [ADR 0010: The Linux packages of the relay](adr/0010-linux-packages.md)
-  — Proposed. An Arch PKGBUILD, a `.deb` from cargo-deb and a Docker image,
-  for musicindex ADR 0084. The unit runs as a system user
+  — Accepted. An Arch PKGBUILD, a `.deb` from cargo-deb and a Docker image,
+  for musicindex ADR 0084. The unit runs as a system user. A tag `v*` starts
+  the release workflow
 
 ## Plans
 

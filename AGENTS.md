@@ -90,7 +90,7 @@ packet.
   `RELAY_GIT_REVISION` and `RELAY_BUILT_AT`. The version in `Cargo.toml` is
   `0.1.0`. The operator selects the first release version and makes the tag
   (R-VERSION-7).
-- ADR 0010, the Linux packages of the relay, has the status `Proposed`.
+- ADR 0010, the Linux packages of the relay, has the status `Accepted`.
   musicindex ADR 0084 owns the set of packages. The files are
   `packaging/arch/PKGBUILD`, `[package.metadata.deb]` in `Cargo.toml` with
   `packaging/debian/`, and `Dockerfile`. `packaging/README.md` gives the
@@ -98,8 +98,13 @@ packet.
   - The unit runs `/usr/bin/musicindex-live-relay` as the system user
     `musicindex-live-relay`.
   - A package does not enable, start or restart the unit.
-  - The repository has no CI workflow. A release workflow is an open point
-    of ADR 0010.
+  - `.github/workflows/ci.yml` runs the gate on each push and each pull
+    request. `.github/workflows/release.yml` makes the three packages at a
+    tag `v*` and attaches the `.deb` and the Arch package to a draft
+    release. The operator makes each tag and publishes the release.
+  - The release workflow has not run. The Docker build and the Arch job are
+    open checks until the first tag.
+  - On a GitHub runner, `tests/adr_links.rs` does not run the ADR guard.
   - The deploy on `api.musicindex.org` does not use these files.
 - The broadcaster identity model is open. The options are in
   `docs/research/broadcaster-identity-options.md`. It needs an ADR before the
