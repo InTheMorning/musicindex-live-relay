@@ -1,0 +1,15 @@
+#!/bin/sh
+# ADR 0010: make the system user of the unit. Do not enable, start or restart
+# the unit. A restart removes each ephemeral live item.
+set -e
+
+if [ "$1" = "configure" ]; then
+    systemd-sysusers musicindex-live-relay.conf
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
+    if [ -n "$2" ]; then
+        echo "musicindex-live-relay: the package did not restart the service."
+        echo "A restart removes each ephemeral live item and its broadcaster token."
+    fi
+fi

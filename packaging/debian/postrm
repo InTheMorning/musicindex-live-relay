@@ -1,0 +1,8 @@
+#!/bin/sh
+# ADR 0010: the state directory and the system user stay after a removal. The
+# state file holds the reserved live items.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi

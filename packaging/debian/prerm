@@ -1,0 +1,8 @@
+#!/bin/sh
+# ADR 0010: stop and disable the unit only when the package is removed. An
+# upgrade does not stop the relay.
+set -e
+
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now musicindex-live-relay.service || true
+fi

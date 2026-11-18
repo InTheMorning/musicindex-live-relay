@@ -1,0 +1,52 @@
+# Maintainer: HeyCitizen <4637290+InTheMorning@users.noreply.github.com>
+#
+# The Arch package of musicindex-live-relay (relay ADR 0010, musicindex
+# ADR 0084 R-PACKAGE-2). makepkg builds the checkout that holds this file.
+# It downloads no source.
+
+_repo_root="${startdir}/../.."
+
+pkgname=musicindex-live-relay
+# The version comes from Cargo.toml, so the two values cannot differ. pkgver
+# permits no hyphen, thus a pre-release version gets an underscore.
+pkgver="$(sed -n 's/^version = "\(.*\)"/\1/p' "${_repo_root}/Cargo.toml" | head -n 1 | tr - _)"
+pkgrel=1
+pkgdesc='Relay of live metadata to listener apps'
+arch=('x86_64')
+url='https://github.com/InTheMorning/musicindex-live-relay'
+license=('AGPL-3.0-only')
+depends=('gcc-libs' 'glibc' 'systemd')
+makedepends=('cargo' 'git')
+install=musicindex-live-relay.install
+source=()
+sha256sums=()
+
+# The default option lto puts -flto=auto into CFLAGS. rusqlite has the feature
+# "bundled", so the cc crate compiles sqlite3.c with those CFLAGS into GCC LTO
+# bitcode. The Rust linker cannot read that bitcode, and the link fails.
+options=('!lto' '!debug')
+
+build() {
+  cd "${_repo_root}"
+
+  export CARGO_TARGET_DIR="${srcdir}/target"
+
+  cargo build --release --locked
+}
+
+package() {
+  cd "${_repo_root}"
+
+  install -Dm0755 "${srcdir}/target/release/musicindex-live-relay" \
+    -t "${pkgdir}/usr/bin/"
+
+  install -Dm0644 systemd/musicindex-live-relay.service \
+    -t "${pkgdir}/usr/lib/systemd/system/"
+  install -Dm0644 packaging/sysusers.d/musicindex-live-relay.conf \
+    -t "${pkgdir}/usr/lib/sysusers.d/"
+
+  install -Dm0644 LICENSE \
+    -t "${pkgdir}/usr/share/licenses/${pkgname}/"
+  install -Dm0644 README.md docs/runbooks/reserved-live-items.md \
+    -t "${pkgdir}/usr/share/doc/${pkgname}/"
+}

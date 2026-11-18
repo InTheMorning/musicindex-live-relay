@@ -8,8 +8,13 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+# ADR 0010: the packages install the binary in /usr/bin and make this user
+# with packaging/sysusers.d/musicindex-live-relay.conf. systemd makes the
+# state directory for this user.
+User=musicindex-live-relay
+Group=musicindex-live-relay
 Environment=BIND=127.0.0.1:8018
-ExecStart=/usr/local/bin/musicindex-live-relay
+ExecStart=/usr/bin/musicindex-live-relay
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true

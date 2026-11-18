@@ -1145,13 +1145,17 @@ cargo clippy -- -D warnings
 
 ## Deployment
 
-A systemd unit template is included at:
+The relay has three Linux packages: an Arch package, a Debian package and a Docker image (ADR 0010). `packaging/README.md` gives the command that makes each package. The Arch package and the Debian package install the systemd unit and the system user `musicindex-live-relay`. They do not enable, start or restart the unit.
+
+The systemd unit is:
 
 ```text
 systemd/musicindex-live-relay.service
 ```
 
-The unit runs `/usr/local/bin/musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, gives the relay the state directory `/var/lib/musicindex-live-relay/`, and restarts on failure. Five failed starts in 300 seconds stop the restart loop, and systemd marks the unit `failed`. A corrupt state file causes this. `docs/runbooks/reserved-live-items.md` gives the recovery.
+The unit runs `/usr/bin/musicindex-live-relay` as the user `musicindex-live-relay`, sets `BIND=127.0.0.1:8018`, gives the relay the state directory `/var/lib/musicindex-live-relay/`, and restarts on failure.
+
+For an install with no package, copy the binary to `/usr/bin/` and the unit to `/etc/systemd/system/`. Copy `packaging/sysusers.d/musicindex-live-relay.conf` to `/etc/sysusers.d/` and run `sudo systemd-sysusers` to make the user. Five failed starts in 300 seconds stop the restart loop, and systemd marks the unit `failed`. A corrupt state file causes this. `docs/runbooks/reserved-live-items.md` gives the recovery.
 
 The relay serves HTTP/1.1 only (ADR 0008). It closes a connection that does not send a full set of request headers in `HEADER_READ_TIMEOUT_SECS` seconds. The same timeout closes an idle keep-alive connection, one that waits with no new request after a response.
 

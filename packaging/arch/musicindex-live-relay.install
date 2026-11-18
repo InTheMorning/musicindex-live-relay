@@ -1,0 +1,21 @@
+post_install() {
+  cat <<'MESSAGE'
+musicindex-live-relay was installed.
+
+The relay listens on 127.0.0.1:8018. Enable the service:
+  systemctl enable --now musicindex-live-relay.service
+
+Reserved live items need an admin token. The steps are in:
+  /usr/share/doc/musicindex-live-relay/reserved-live-items.md
+MESSAGE
+}
+
+post_upgrade() {
+  cat <<'MESSAGE'
+musicindex-live-relay was upgraded. The package did not restart the service.
+
+A restart removes each ephemeral live item and its broadcaster token.
+Restart the service when no broadcaster is on air:
+  systemctl restart musicindex-live-relay.service
+MESSAGE
+}

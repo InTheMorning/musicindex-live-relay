@@ -1,0 +1,15 @@
+.git
+.claude
+.codex
+target
+docs
+packaging
+tests
+scripts
+systemd
+AGENTS.md
+README.md
+hgh-example-*.json
+*.sqlite3
+*.pkg.tar.zst
+*.deb

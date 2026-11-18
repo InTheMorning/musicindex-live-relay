@@ -3,6 +3,7 @@ name = "musicindex-live-relay"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
+description = "Relay of live metadata to listener apps"
 
 [dependencies]
 async-stream = "0.3"
@@ -34,3 +35,25 @@ musicindex-build-info = { git = "https://github.com/InTheMorning/musicindex-lib"
 http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+
+# The Debian package (ADR 0010). Build it with
+# `cargo deb --target x86_64-unknown-linux-musl`. The binary is static, so the
+# package needs no library of the build host.
+[package.metadata.deb]
+maintainer = "HeyCitizen <4637290+InTheMorning@users.noreply.github.com>"
+section = "net"
+priority = "optional"
+depends = "systemd"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+musicindex-live-relay relays the live metadata of a broadcaster to listener \
+apps. The package installs the systemd unit musicindex-live-relay.service \
+and the system user musicindex-live-relay. It does not enable the unit."""
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/musicindex-live-relay", "usr/bin/", "755"],
+    ["systemd/musicindex-live-relay.service", "usr/lib/systemd/system/", "644"],
+    ["packaging/sysusers.d/musicindex-live-relay.conf", "usr/lib/sysusers.d/", "644"],
+    ["README.md", "usr/share/doc/musicindex-live-relay/", "644"],
+    ["docs/runbooks/reserved-live-items.md", "usr/share/doc/musicindex-live-relay/", "644"],
+]
