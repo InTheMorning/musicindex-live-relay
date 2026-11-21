@@ -152,12 +152,16 @@ The command reads these environment variables:
 | Variable | Default | Value |
 |---|---|---|
 | `RELAY_SSH_HOST` | none | The SSH name of the relay host. It is necessary. |
-| `RELAY_STACK_DIR` | `/srv/stophammer` | The folder of the stack on the relay host. |
+| `RELAY_STACK_DIR` | none | The folder on the relay host that holds the compose file of the relay stack. It is necessary. |
 | `RELAY_ENV_FILE` | `packaging/env/live-relay.compose.env` | The environment file of the service. |
 | `RELAY_URL` | `http://127.0.0.1:8018` | The address of the relay, as the relay host sees it. |
 
+The command stops before SSH when one of the two necessary variables is not
+set. To find the folder of the stack, run `docker compose ls` on the relay
+host. The column `CONFIG FILES` shows the path of the compose file.
+
 Set the variables one time in the shell configuration, for example in
-`~/.zshenv`:
+`~/.zshenv`. Use the values of your host:
 
 ```sh
 export RELAY_SSH_HOST=relay-host

@@ -16,7 +16,7 @@ PROGRAM="relay-event"
 
 # The connection values. Each one comes from an environment variable.
 SSH_HOST="${RELAY_SSH_HOST:-}"
-STACK_DIR="${RELAY_STACK_DIR:-/srv/stophammer}"
+STACK_DIR="${RELAY_STACK_DIR:-}"
 ENV_FILE="${RELAY_ENV_FILE:-packaging/env/live-relay.compose.env}"
 RELAY_URL="${RELAY_URL:-http://127.0.0.1:8018}"
 
@@ -39,8 +39,9 @@ delete   Deletes one reserved event permanently, after a question.
 Environment:
   RELAY_SSH_HOST   The SSH name of the relay host. Necessary. The value
                    "local" runs the curl command on this computer.
-  RELAY_STACK_DIR  The folder of the stack on the relay host.
-                   Default: /srv/stophammer
+  RELAY_STACK_DIR  The folder on the relay host that holds the compose
+                   file of the relay stack. Necessary. The command
+                   "docker compose ls" on the relay host shows it.
   RELAY_ENV_FILE   The environment file that holds the ADMIN_TOKEN line.
                    Default: packaging/env/live-relay.compose.env
   RELAY_URL        The address of the relay, as the relay host sees it.
@@ -251,6 +252,8 @@ main() {
   need_tool jq
   [ -n "$SSH_HOST" ] ||
     die "RELAY_SSH_HOST is not set. Set it to the SSH name of the relay host."
+  [ -n "$STACK_DIR" ] ||
+    die "RELAY_STACK_DIR is not set. Set it to the folder that holds the compose file of the relay stack. The command \"docker compose ls\" on the relay host shows it."
   if [ "$SSH_HOST" = "local" ]; then
     need_tool curl
   else
