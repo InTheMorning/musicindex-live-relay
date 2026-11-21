@@ -10,6 +10,9 @@ The commands use these values. Change them for your host.
 - The state file is `/var/lib/musicindex-live-relay/reserved-items.sqlite3`.
 - The admin header file is `/etc/musicindex-live-relay/admin.header`.
 
+Each section uses the systemd unit. For a relay in Docker Compose, see "The
+Docker Compose Form".
+
 ## Before You Start
 
 A reserved item needs the admin token. Without `ADMIN_TOKEN`, the reserve,
@@ -77,6 +80,110 @@ before you store it, the item is not usable. Delete it and reserve a new item.
 7. Put the event URI into the `podcast:liveValue` block of the RSS feed. See
    `README.md`, section "RSS `podcast:liveValue`".
 8. Delete `reserve.json`: `shred -u reserve.json`
+
+## The Docker Compose Form
+
+Use this section when the relay runs as a service of a Docker Compose stack.
+The stophammer stack is the example. The commands use these values. Change
+them for your host.
+
+- The SSH name of the relay host is `relay-host`.
+- The folder of the stack on the relay host is `/srv/stophammer`.
+- The service is `live-relay`.
+- The environment file of the service is
+  `packaging/env/live-relay.compose.env`. It holds the line
+  `ADMIN_TOKEN=<admin token>` with no quotation marks, and it has the mode
+  `0600`.
+
+No admin header file is necessary. Each command makes the header from the
+environment file and sends it to `curl` through a pipe. The admin token is
+not in a command argument.
+
+### Make Sure That The Container Has A Volume
+
+A container keeps the state file only on a volume. Without a volume at
+`/var/lib/musicindex-live-relay`, a container recreate kills each reserved
+item.
+
+Do not print the output of `docker compose config`. It holds the admin token.
+
+Run these commands on the relay host, in the folder of the stack.
+
+1. Count the volume in the configuration of the stack:
+
+   ```sh
+   docker compose config live-relay | grep -c 'target: /var/lib/musicindex-live-relay$'
+   ```
+
+2. Make sure that the output is `1`. A `0` means that the stack gives the
+   service no volume. Add a named volume in `docker-compose.override.yml`
+   before you reserve an item.
+3. Read the mounts of the container that runs:
+
+   ```sh
+   docker inspect "$(docker compose ps -q live-relay)" --format '{{range .Mounts}}{{.Type}} {{.Name}} {{.Destination}}{{println}}{{end}}'
+   ```
+
+4. Make sure that one line starts with `volume` and ends with
+   `/var/lib/musicindex-live-relay`. No such line means that the container
+   started before the volume was in the configuration. Recreate the service
+   when no show is on air.
+5. Read the startup line:
+
+   ```sh
+   docker compose logs --no-log-prefix live-relay 2>&1 | grep 'restored reserved live items'
+   ```
+
+6. Make sure that the line has the state file path and a count.
+
+### Reserve An Item From The Broadcaster Computer
+
+Run these commands on the computer that has the publisher, not on the relay
+host. The response goes through SSH into a private file on that computer, so
+the broadcaster token is not in a file on the relay host.
+
+1. Set a file mask that keeps new files private: `umask 077`
+2. Reserve the item:
+
+   ```sh
+   ssh relay-host 'cd /srv/stophammer && sed -n "s/^ADMIN_TOKEN=/Authorization: Bearer /p" packaging/env/live-relay.compose.env | curl -sS -X POST -H @- -H "Content-Type: application/json" -d "{\"label\":\"weekly show\"}" http://127.0.0.1:8018/v1/liveitems/reserved' > "$HOME/reserve.json"
+   ```
+
+3. Make sure that the response has the two keys. This command does not print
+   the token:
+
+   ```sh
+   jq 'has("event_id") and has("broadcaster_token")' "$HOME/reserve.json"
+   ```
+
+4. Make sure that the output is `true`. If it is not, read the error code:
+   `jq .error "$HOME/reserve.json"`. The error code `label_already_reserved` means that another
+   reserved item has the label.
+5. Write the token to the token file of the publisher target:
+
+   ```sh
+   jq -r .broadcaster_token "$HOME/reserve.json" > "$HOME/.config/musicindex-live-publisher/mixxx/tokens/default.token"
+   ```
+
+6. Read the event identifier: `jq -r .event_id "$HOME/reserve.json"`
+7. Delete the response file: `shred -u "$HOME/reserve.json"`
+8. Continue with steps 5 to 7 of "Reserve An Item And Store The Broadcaster
+   Token".
+
+### The Other Procedures
+
+- For a list or a delete, use the same pipe on the relay host:
+
+  ```sh
+  sed -n 's/^ADMIN_TOKEN=/Authorization: Bearer /p' packaging/env/live-relay.compose.env | curl -sS -H @- http://127.0.0.1:8018/v1/liveitems/reserved
+  ```
+
+- For a stop, a start or a restart, use `docker compose stop live-relay`,
+  `docker compose start live-relay` or `docker compose restart live-relay`.
+- For the log, use `docker compose logs --tail 20 live-relay`.
+- The state file is in the volume. Copy it with
+  `docker compose cp live-relay:/var/lib/musicindex-live-relay/reserved-items.sqlite3 FILE`
+  while the service is stopped.
 
 ## Back Up The State File
 

@@ -29,7 +29,7 @@ packet.
   later identity decision, only the operator makes a reserved event, with the
   admin token (ADR 0001).
 - `docs/runbooks/reserved-live-items.md` holds the operator procedures for
-  reserved events. A corrupt state file stops the relay at startup, and the
+  reserved events, for a systemd unit and for Docker Compose. A corrupt state file stops the relay at startup, and the
   unit stops after five failed starts.
 - The relay runs on `api.musicindex.org`, and the operator's station uses a
   reserved event there. HitIt has no packet yet to reserve an event from
@@ -115,9 +115,10 @@ packet.
   - On the VPS, `ADMIN_TOKEN` is set.
   - The service `live-relay` has a volume at
     `/var/lib/musicindex-live-relay`.
-  - The operator runs this check in the folder of the stack:
-    `docker compose config | grep -n -B2 -A2 "/var/lib/musicindex-live-relay"`
-  - An empty output means that a container recreate loses the reserved
+  - The operator does the procedure "Make Sure That The Container Has A
+    Volume" of `docs/runbooks/reserved-live-items.md`. Its first command
+    counts the volume and does not print the admin token.
+  - A count of `0` means that a container recreate loses the reserved
     items.
   - Each report about a deploy or a release of the relay reminds the
     operator of this check. When the operator gives the result, delete this
