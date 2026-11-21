@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# relay-event: reserve, list and delete the reserved events of a relay that
+# runs in Docker Compose. The procedure is in
+# docs/runbooks/reserved-live-items.md, section "The Operator Command".
+#
+# The command runs on the operator computer and sends one curl command to
+# the relay host through SSH. The admin token stays on the relay host. The
+# broadcaster token goes through SSH into the token file only. The command
+# never prints a token.
+
+set -u
+set -o pipefail
+umask 077
+
+PROGRAM="relay-event"
+
+# The connection values. Each one comes from an environment variable.
+SSH_HOST="${RELAY_SSH_HOST:-}"
+STACK_DIR="${RELAY_STACK_DIR:-/srv/stophammer}"
+ENV_FILE="${RELAY_ENV_FILE:-packaging/env/live-relay.compose.env}"
+RELAY_URL="${RELAY_URL:-http://127.0.0.1:8018}"
+
+# The token file that this run made and has not filled. A failure removes it.
+CLAIMED_FILE=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  relay-event reserve SHOW_NAME TOKEN_FILE
+  relay-event list
+  relay-event delete EVENT_ID
+
+reserve  Reserves an event with the label SHOW_NAME. Writes the broadcaster
+         token to TOKEN_FILE and prints the event ID. Refuses a TOKEN_FILE
+         that exists.
+list     Prints the reserved events.
+delete   Deletes one reserved event permanently, after a question.
+
+Environment:
+  RELAY_SSH_HOST   The SSH name of the relay host. Necessary. The value
+                   "local" runs the curl command on this computer.
+  RELAY_STACK_DIR  The folder of the stack on the relay host.
+                   Default: /srv/stophammer
+  RELAY_ENV_FILE   The environment file that holds the ADMIN_TOKEN line.
+                   Default: packaging/env/live-relay.compose.env
+  RELAY_URL        The address of the relay, as the relay host sees it.
+                   Default: http://127.0.0.1:8018
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  if [ -n "$CLAIMED_FILE" ]; then
+    rm -f -- "$CLAIMED_FILE"
+  fi
+}
+trap cleanup EXIT
+
+need_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "The tool $1 is necessary. Install it."
+}
+
+# Prints the argument in single quotation marks for a POSIX shell.
+shell_quote() {
+  local value=$1
+  printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+# Sends one request to the relay. The arguments are the method, the path and
+# an optional JSON body. Sets HTTP_STATUS and HTTP_BODY.
+#
+# The far shell makes the Authorization header from the environment file and
+# gives it to curl through a pipe. Thus the admin token is not in a command
+# argument and does not come to this computer.
+relay_request() {
+  local method=$1 path=$2 body=${3:-}
+  local command output
+
+  command="cd $(shell_quote "$STACK_DIR") && sed -n 's/^ADMIN_TOKEN=/Authorization: Bearer /p' $(shell_quote "$ENV_FILE")"
+  command+=" | curl -sS -X $method -H @- -w '\\n%{http_code}'"
+  if [ -n "$body" ]; then
+    command+=" -H 'Content-Type: application/json' -d $(shell_quote "$body")"
+  fi
+  command+=" $(shell_quote "$RELAY_URL$path")"
+
+  if [ "$SSH_HOST" = "local" ]; then
+    output=$(sh -c "$command" </dev/null) ||
+      die "The request to the relay at $RELAY_URL failed. Read the error above."
+  else
+    output=$(ssh -T "$SSH_HOST" "$command" </dev/null) ||
+      die "The request through $SSH_HOST failed. Read the error above."
+  fi
+
+  HTTP_STATUS=${output##*$'\n'}
+  HTTP_BODY=""
+  if [ "$output" != "$HTTP_STATUS" ]; then
+    HTTP_BODY=${output%$'\n'*}
+  fi
+}
+
+# Stops with a message for an answer that is not the expected status. The
+# message holds the error code of the relay, and never the full body.
+require_status() {
+  local expected=$1 code
+  [ "$HTTP_STATUS" = "$expected" ] && return 0
+
+  code=$(printf '%s' "$HTTP_BODY" | jq -r '.error? // empty' 2>/dev/null) || code=""
+  case "$HTTP_STATUS:$code" in
+    401:*)
+      die "The relay answered 401. Make sure that $ENV_FILE in $STACK_DIR has an ADMIN_TOKEN line."
+      ;;
+    403:*)
+      die "The relay answered 403. The ADMIN_TOKEN in $ENV_FILE is not the token of the relay that runs."
+      ;;
+    *:reserved_items_disabled)
+      die "The relay has no admin token. Set ADMIN_TOKEN for the service and restart it."
+      ;;
+    *:label_already_reserved)
+      die "A reserved event has this show name. Use a different name, or delete that event first."
+      ;;
+    *:event_not_found)
+      die "No reserved event has this event ID."
+      ;;
+    *)
+      die "The relay answered ${HTTP_STATUS}${code:+ with the error code $code}."
+      ;;
+  esac
+}
+
+# Makes sure that the folder of the token file is private. Makes the folder
+# when it does not exist.
+prepare_folder() {
+  local folder=$1 mode
+  if [ -d "$folder" ]; then
+    mode=$(stat -c '%a' -- "$folder") || die "Cannot read the mode of the folder $folder."
+    [ "$mode" = "700" ] ||
+      die "The folder $folder has the mode $mode. Set the mode 700 (chmod 700 '$folder'), or use a different folder."
+  else
+    mkdir -p -m 700 -- "$folder" || die "Cannot make the folder $folder."
+  fi
+}
+
+cmd_reserve() {
+  [ $# -eq 2 ] || { usage >&2; exit 2; }
+  local show_name=$1 token_file=$2
+  local folder body event_id token
+
+  [ -n "$show_name" ] || die "The show name is empty."
+  [ -n "$token_file" ] || die "The path of the token file is empty."
+  if [ -e "$token_file" ] || [ -L "$token_file" ]; then
+    die "The token file $token_file exists. This command does not write over a token file. Use a different path."
+  fi
+
+  folder=$(dirname -- "$token_file")
+  prepare_folder "$folder"
+
+  # Make the token file before the reserve, so a path that is not usable
+  # stops the command while no event exists. The noclobber option makes the
+  # shell refuse a file that exists.
+  set -o noclobber
+  if ! { exec 3>"$token_file"; } 2>/dev/null; then
+    die "Cannot make the token file $token_file."
+  fi
+  set +o noclobber
+  CLAIMED_FILE=$token_file
+  chmod 600 -- "$token_file" || die "Cannot set the mode of the token file $token_file."
+
+  body=$(jq -cna --arg label "$show_name" '{label: $label}') || die "Cannot make the request body."
+  relay_request POST /v1/liveitems/reserved "$body"
+  require_status 201
+
+  event_id=$(printf '%s' "$HTTP_BODY" | jq -r '.event_id // empty') || event_id=""
+  token=$(printf '%s' "$HTTP_BODY" | jq -r '.broadcaster_token // empty') || token=""
+  HTTP_BODY=""
+  [ -n "$event_id" ] || die "The answer of the relay has no event ID. List the reserved events and delete the new one."
+  [ -n "$token" ] ||
+    die "The answer of the relay has no token. The event $event_id is not usable. Delete it."
+
+  if ! printf '%s\n' "$token" >&3; then
+    die "Cannot write the token file. The event $event_id is not usable. Delete it."
+  fi
+  exec 3>&-
+  token=""
+  CLAIMED_FILE=""
+
+  printf 'Reserved the event for "%s".\n' "$show_name" >&2
+  printf 'The token file is %s.\n' "$token_file" >&2
+  printf '%s\n' "$event_id"
+}
+
+cmd_list() {
+  [ $# -eq 0 ] || { usage >&2; exit 2; }
+  relay_request GET /v1/liveitems/reserved
+  require_status 200
+  printf '%s' "$HTTP_BODY" | jq -r '
+    ["EVENT_ID", "LABEL", "CREATED_AT", "LAST_PUBLISH_AT"],
+    (.reserved[] | [.event_id, .label // "-", .created_at // "-", .last_publish_at // "-"])
+    | @tsv' || die "Cannot read the list from the relay."
+}
+
+cmd_delete() {
+  [ $# -eq 1 ] || { usage >&2; exit 2; }
+  local event_id=$1 label answer
+
+  [[ "$event_id" =~ ^[A-Za-z0-9_-]+$ ]] ||
+    die "The event ID can hold only letters, digits, - and _."
+
+  relay_request GET /v1/liveitems/reserved
+  require_status 200
+  label=$(printf '%s' "$HTTP_BODY" | jq -r --arg id "$event_id" '
+    .reserved[] | select(.event_id == $id) | (.label // "no label") | @json') ||
+    die "Cannot read the list from the relay."
+  [ -n "$label" ] || die "No reserved event has the event ID $event_id."
+
+  printf 'The event %s has the label %s.\n' "$event_id" "$label" >&2
+  printf 'A delete is permanent, and the broadcaster token becomes invalid.\n' >&2
+  printf 'Delete this event? Type yes to delete it: ' >&2
+  answer=""
+  read -r answer || true
+  if [ "$answer" != "yes" ]; then
+    printf 'Did not delete the event.\n' >&2
+    exit 1
+  fi
+
+  relay_request DELETE "/v1/liveitems/reserved/$event_id"
+  require_status 204
+  printf 'Deleted the event %s.\n' "$event_id" >&2
+}
+
+main() {
+  [ $# -ge 1 ] || { usage >&2; exit 2; }
+  local subcommand=$1
+  shift
+
+  case "$subcommand" in
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+    reserve | list | delete) ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+
+  need_tool jq
+  [ -n "$SSH_HOST" ] ||
+    die "RELAY_SSH_HOST is not set. Set it to the SSH name of the relay host."
+  if [ "$SSH_HOST" = "local" ]; then
+    need_tool curl
+  else
+    need_tool ssh
+  fi
+
+  "cmd_$subcommand" "$@"
+}
+
+main "$@"

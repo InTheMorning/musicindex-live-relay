@@ -136,6 +136,84 @@ Run these commands on the relay host, in the folder of the stack.
 
 6. Make sure that the line has the state file path and a count.
 
+### The Operator Command
+
+`tools/relay-event` reserves, lists and deletes the reserved items with one
+command. Run it on the operator computer, not on the relay host. It needs
+`bash`, `jq` and `ssh` on the operator computer, and `curl` on the relay
+host.
+
+The command sends one `curl` command to the relay host through SSH. The
+admin token stays on the relay host. The broadcaster token goes through SSH
+into the token file only. The command prints no token.
+
+The command reads these environment variables:
+
+| Variable | Default | Value |
+|---|---|---|
+| `RELAY_SSH_HOST` | none | The SSH name of the relay host. It is necessary. |
+| `RELAY_STACK_DIR` | `/srv/stophammer` | The folder of the stack on the relay host. |
+| `RELAY_ENV_FILE` | `packaging/env/live-relay.compose.env` | The environment file of the service. |
+| `RELAY_URL` | `http://127.0.0.1:8018` | The address of the relay, as the relay host sees it. |
+
+Set the variables one time in the shell configuration, for example in
+`~/.zshenv`:
+
+```sh
+export RELAY_SSH_HOST=relay-host
+export RELAY_STACK_DIR=/srv/stophammer
+```
+
+Run each command below in the folder of this repository.
+
+To reserve an item:
+
+1. Reserve the item with a show name and a path for the token file:
+
+   ```sh
+   tools/relay-event reserve "weekly show" "$HOME/relay-tokens/weekly-show.token"
+   ```
+
+2. Make sure that the last output line is the event identifier. The show
+   name is the label of the item.
+3. Give the token file and the event identifier to the broadcaster through a
+   private channel. The token file is the only copy of the token.
+4. Continue with steps 6 and 7 of "Reserve An Item And Store The Broadcaster
+   Token".
+
+The command makes the token file with the mode `0600`. It makes the folder
+with the mode `0700` when the folder does not exist. It stops before the
+reserve in these two conditions:
+
+- The token file exists. The command never writes over a token file, so the
+  token of a different item stays safe.
+- The folder exists and its mode is not `0700`.
+
+To list the reserved items:
+
+```sh
+tools/relay-event list
+```
+
+To delete a reserved item:
+
+1. Read "Delete A Reserved Item And Tell Listeners". A delete is permanent.
+2. Delete the item with its event identifier:
+
+   ```sh
+   tools/relay-event delete EVENT_ID
+   ```
+
+3. Read the label that the command shows. Type `yes` only when the label is
+   that of the item to delete. Each other answer keeps the item.
+4. Continue with steps 6 to 8 of "Delete A Reserved Item And Tell Listeners".
+
+For a test against a relay on the operator computer, set
+`RELAY_SSH_HOST=local`. The command then runs `curl` on that computer and
+uses no SSH.
+
+The steps below do the same work by hand.
+
 ### Reserve An Item From The Broadcaster Computer
 
 Run these commands on the computer that has the publisher, not on the relay

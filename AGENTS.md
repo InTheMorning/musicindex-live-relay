@@ -31,6 +31,10 @@ packet.
 - `docs/runbooks/reserved-live-items.md` holds the operator procedures for
   reserved events, for a systemd unit and for Docker Compose. A corrupt state file stops the relay at startup, and the
   unit stops after five failed starts.
+- `tools/relay-event` is the operator command for the Docker Compose form.
+  It reserves, lists and deletes a reserved event through SSH. Only the
+  operator reserves an event, and gives the token file to a broadcaster by
+  hand (operator choice of 2026-11-21). No test in the gate runs the command.
 - The relay runs on `api.musicindex.org`, and the operator's station uses a
   reserved event there. HitIt has no packet yet to reserve an event from
   the app.
