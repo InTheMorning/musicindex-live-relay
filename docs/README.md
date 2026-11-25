@@ -47,6 +47,10 @@ station runs continuously.
   — Accepted. An Arch PKGBUILD, a `.deb` from cargo-deb and a Docker image,
   for musicindex ADR 0084. The unit runs as a system user. A tag `v*` starts
   the release workflow
+- [ADR 0011: The relay keeps each image that the listener timeline names](adr/0011-listener-timeline-image-retention.md)
+  — Implemented. An event keeps each image that a pending listener update
+  or the present listener value names, in the limit `MAX_EVENT_IMAGES`, for
+  publisher ADR 0034
 
 ## Plans
 
@@ -134,6 +138,11 @@ Packet for the state file mode plan. ADR 0009 governs it. Ready -
 - [001 — The private state file](tasks/state-file-mode-task-001-private-state-file.md)
   — Implemented - 2026-10-21
 
+Packet for ADR 0011, the listener images.
+
+- [001 — The listener images](tasks/image-retention-task-001-listener-images.md)
+  — Implemented - 2026-11-25
+
 ## Runbooks
 
 - [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
@@ -161,6 +170,9 @@ Packet for the state file mode plan. ADR 0009 governs it. Ready -
   named artifact for the `Implemented` status of ADR 0008
 - [ADR 0009 review checklist](reviews/adr-0009-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0009
+
+- [ADR 0011 review checklist](reviews/adr-0011-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0011
 
 ## Research
 

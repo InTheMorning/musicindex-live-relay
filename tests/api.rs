@@ -1943,12 +1943,21 @@ mod reserved {
         state_file: &Path,
         clock: &Arc<AtomicU64>,
     ) -> Result<RelayState, musicindex_live_relay::store::StoreError> {
+        reserved_state_at_with_image_limit(state_file, clock, 2)
+    }
+
+    fn reserved_state_at_with_image_limit(
+        state_file: &Path,
+        clock: &Arc<AtomicU64>,
+        max_event_images: usize,
+    ) -> Result<RelayState, musicindex_live_relay::store::StoreError> {
         RelayState::try_with_clock(
             AppConfig {
                 admin_token: Some(AdminToken::new(ADMIN_TOKEN)),
                 state_file: state_file.to_path_buf(),
                 ttl: Duration::from_secs(10),
                 lease: Duration::from_secs(10),
+                max_event_images,
                 ..AppConfig::for_tests()
             },
             {
@@ -3312,10 +3321,17 @@ mod reserved {
         /// Builds a relay with an admin token, a lease of 10 seconds, and a
         /// clock at 100. Keep the `TempDir` until the test ends.
         fn display_app() -> (axum::Router, RelayState, Arc<AtomicU64>, TempDir, PathBuf) {
+            display_app_with_image_limit(2)
+        }
+
+        fn display_app_with_image_limit(
+            max_event_images: usize,
+        ) -> (axum::Router, RelayState, Arc<AtomicU64>, TempDir, PathBuf) {
             let dir = tempfile::tempdir().expect("tempdir");
             let state_file = dir.path().join("reserved-items.sqlite3");
             let clock = Arc::new(AtomicU64::new(100));
-            let state = reserved_state_at(&state_file, &clock).expect("open state");
+            let state = reserved_state_at_with_image_limit(&state_file, &clock, max_event_images)
+                .expect("open state");
             (app(state.clone()), state, clock, dir, state_file)
         }
 
@@ -5071,7 +5087,7 @@ mod reserved {
 
             #[tokio::test]
             async fn a_lease_expiry_with_a_snapshot_removes_the_images() {
-                let (router, state, clock, _dir, _) = display_app();
+                let (router, state, clock, _dir, _) = display_app_with_image_limit(3);
                 let reserved = reserve_ok(router.clone(), None).await;
                 let response = publish(
                     router.clone(),
@@ -5085,17 +5101,35 @@ mod reserved {
                 let state_with_image = track(json!({ "sha256": named, "mime": "image/jpeg" }));
                 publish_display_ok(router.clone(), &reserved, &state_with_image).await;
                 let unnamed = upload_ok(router.clone(), &reserved, &png_bytes(1)).await;
+                let listener_image = upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await;
+                let listener_url = format!(
+                    "https://host/v1/liveitems/{}/artwork/{listener_image}",
+                    reserved.event_id
+                );
+                assert_eq!(
+                    publish(
+                        router.clone(),
+                        &reserved.event_id,
+                        Some(&reserved.broadcaster_token),
+                        json!({"image": listener_url}),
+                    )
+                    .await
+                    .status(),
+                    StatusCode::OK
+                );
 
                 // Before the lease ends, the images stay.
                 clock.store(109, Ordering::SeqCst);
                 assert_eq!(state.expire_leases().await, 0);
                 assert_held(router.clone(), &reserved.event_id, &named).await;
                 assert_held(router.clone(), &reserved.event_id, &unnamed).await;
+                assert_held(router.clone(), &reserved.event_id, &listener_image).await;
 
                 clock.store(110, Ordering::SeqCst);
                 assert_eq!(state.expire_leases().await, 1);
                 assert_not_held(router.clone(), &reserved.event_id, &named).await;
                 assert_not_held(router.clone(), &reserved.event_id, &unnamed).await;
+                assert_not_held(router.clone(), &reserved.event_id, &listener_image).await;
                 assert_eq!(
                     read_display(router.clone(), &reserved.event_id).await,
                     json!({ "track": null })
@@ -5276,6 +5310,172 @@ mod reserved {
 
                 let restarted = app(reserved_state_at(&state_file, &clock).expect("restart"));
                 assert_not_held(restarted, &reserved.event_id, &sha256).await;
+            }
+
+            #[tokio::test]
+            async fn pending_listener_images_survive_display_publishes_until_the_timeline_moves_on()
+            {
+                let (router, state, clock, _dir, _) = display_app_with_image_limit(8);
+                let reserved = reserve_ok(router.clone(), None).await;
+                let auth = Some(reserved.broadcaster_token.as_str());
+                let image_a = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                let image_url = format!(
+                    "https://any-host/v1/liveitems/{}/artwork/{image_a}",
+                    reserved.event_id
+                );
+                assert_eq!(
+                    publish_with_listener_delay(
+                        router.clone(),
+                        &reserved.event_id,
+                        auth,
+                        &["20"],
+                        json!({"image": image_url, "track": "A"})
+                    )
+                    .await
+                    .status(),
+                    StatusCode::OK
+                );
+                for seed in 2..=3 {
+                    let sha = upload_ok(router.clone(), &reserved, &jpeg_bytes(seed)).await;
+                    publish_display_ok(
+                        router.clone(),
+                        &reserved,
+                        &track(json!({"sha256": sha, "mime": "image/jpeg"})),
+                    )
+                    .await;
+                    assert_held(router.clone(), &reserved.event_id, &image_a).await;
+                }
+                clock.store(121, Ordering::SeqCst);
+                assert_eq!(state.release_listener_updates().await, 1);
+                let value_response = get(
+                    router.clone(),
+                    format!("/v1/liveitems/{}/remoteValue", reserved.event_id),
+                )
+                .await;
+                assert_eq!(read_json::<Value>(value_response).await["image"], image_url);
+                let third = upload_ok(router.clone(), &reserved, &jpeg_bytes(4)).await;
+                publish_display_ok(
+                    router.clone(),
+                    &reserved,
+                    &track(json!({"sha256": third, "mime": "image/jpeg"})),
+                )
+                .await;
+                assert_held(router.clone(), &reserved.event_id, &image_a).await;
+
+                clock.store(141, Ordering::SeqCst);
+                state.release_listener_updates().await;
+                publish(
+                    router.clone(),
+                    &reserved.event_id,
+                    auth,
+                    json!({"title": "different"}),
+                )
+                .await;
+                let next = upload_ok(router.clone(), &reserved, &jpeg_bytes(5)).await;
+                publish_display_ok(
+                    router.clone(),
+                    &reserved,
+                    &track(json!({"sha256": next, "mime": "image/jpeg"})),
+                )
+                .await;
+                assert_not_held(router, &reserved.event_id, &image_a).await;
+            }
+
+            #[tokio::test]
+            async fn eviction_prefers_unreferenced_then_listener_then_previous_display_images() {
+                let (router, _state, _clock, _dir, _) = display_app_with_image_limit(4);
+                let reserved = reserve_ok(router.clone(), None).await;
+                let first = upload_ok(router.clone(), &reserved, &jpeg_bytes(1)).await;
+                publish_display_ok(
+                    router.clone(),
+                    &reserved,
+                    &track(json!({"sha256": first, "mime": "image/jpeg"})),
+                )
+                .await;
+                let second = upload_ok(router.clone(), &reserved, &jpeg_bytes(2)).await;
+                publish_display_ok(
+                    router.clone(),
+                    &reserved,
+                    &track(json!({"sha256": second, "mime": "image/jpeg"})),
+                )
+                .await;
+                let listener_bytes = jpeg_bytes(3);
+                let listener = upload_ok(router.clone(), &reserved, &listener_bytes).await;
+                let listener_url = format!(
+                    "https://host/v1/liveitems/{}/artwork/{listener}",
+                    reserved.event_id
+                );
+                publish(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&reserved.broadcaster_token),
+                    json!({"image": listener_url}),
+                )
+                .await;
+                let unnamed = upload_ok(router.clone(), &reserved, &jpeg_bytes(4)).await;
+                let fifth = upload_ok(router.clone(), &reserved, &jpeg_bytes(5)).await;
+                assert_not_held(router.clone(), &reserved.event_id, &unnamed).await;
+                assert_held(router.clone(), &reserved.event_id, &listener).await;
+                assert_held(router.clone(), &reserved.event_id, &first).await;
+                assert_held(router.clone(), &reserved.event_id, &second).await;
+                assert_held(router.clone(), &reserved.event_id, &fifth).await;
+            }
+
+            #[tokio::test]
+            async fn a_payload_that_names_an_image_the_event_does_not_hold_is_accepted() {
+                let (router, _state, _clock, _dir, _) = display_app_with_image_limit(8);
+                let reserved = reserve_ok(router.clone(), None).await;
+                let missing = "0".repeat(64);
+                let url = format!(
+                    "https://host/v1/liveitems/{}/artwork/{missing}",
+                    reserved.event_id
+                );
+                let response = publish(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&reserved.broadcaster_token),
+                    json!({"image": url}),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_not_held(router, &reserved.event_id, &missing).await;
+            }
+
+            #[tokio::test]
+            async fn listener_image_is_evicted_before_the_earlier_display_image() {
+                let (router, _state, _clock, _dir, _) = display_app_with_image_limit(3);
+                let reserved = reserve_ok(router.clone(), None).await;
+                let previous = upload_ok(router.clone(), &reserved, &jpeg_bytes(11)).await;
+                publish_display_ok(
+                    router.clone(),
+                    &reserved,
+                    &track(json!({"sha256": previous, "mime": "image/jpeg"})),
+                )
+                .await;
+                let present = upload_ok(router.clone(), &reserved, &jpeg_bytes(12)).await;
+                publish_display_ok(
+                    router.clone(),
+                    &reserved,
+                    &track(json!({"sha256": present, "mime": "image/jpeg"})),
+                )
+                .await;
+                let listener = upload_ok(router.clone(), &reserved, &jpeg_bytes(13)).await;
+                let url = format!(
+                    "https://host/v1/liveitems/{}/artwork/{listener}",
+                    reserved.event_id
+                );
+                publish(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&reserved.broadcaster_token),
+                    json!({"image": url}),
+                )
+                .await;
+                let next = upload_ok(router.clone(), &reserved, &jpeg_bytes(14)).await;
+                assert_not_held(router.clone(), &reserved.event_id, &listener).await;
+                assert_held(router.clone(), &reserved.event_id, &previous).await;
+                assert_held(router.clone(), &reserved.event_id, &present).await;
+                assert_held(router, &reserved.event_id, &next).await;
             }
         }
     }

@@ -2,7 +2,7 @@ pub mod server;
 pub mod store;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fmt::Write as _,
     future::Future,
@@ -104,8 +104,10 @@ const MAX_ALBUM_CHARS: usize = 1_024;
 const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 /// The default body limit of an image upload, in bytes (ADR 0003).
 const DEFAULT_ARTWORK_MAX_BYTES: usize = 512 * 1024;
-/// The maximum count of images that one event holds (ADR 0003 §Invariants).
-const MAX_EVENT_IMAGES: usize = 2;
+/// The default maximum count of images that one event holds (ADR 0011).
+const DEFAULT_MAX_EVENT_IMAGES: usize = 8;
+/// The lowest accepted maximum count of images (ADR 0011).
+const MIN_EVENT_IMAGES: usize = 2;
 /// The first bytes of a JPEG image.
 const JPEG_MAGIC: &[u8] = &[0xFF, 0xD8, 0xFF];
 /// The first bytes of a PNG image.
@@ -213,6 +215,8 @@ pub struct AppConfig {
     pub max_reserved_items: usize,
     /// The body limit of an image upload, in bytes (ADR 0003).
     pub artwork_max_bytes: usize,
+    /// The maximum count of images that one event holds (ADR 0011).
+    pub max_event_images: usize,
     /// The highest delay that a publish can set with the
     /// `Listener-Delay-Secs` header, in seconds (ADR 0004).
     pub max_listener_delay_secs: u64,
@@ -261,6 +265,7 @@ impl AppConfig {
             state_file: env_parse("STATE_FILE", PathBuf::from(DEFAULT_STATE_FILE))?,
             max_reserved_items: env_parse("MAX_RESERVED_ITEMS", DEFAULT_MAX_RESERVED_ITEMS)?,
             artwork_max_bytes: parse_artwork_max_bytes()?,
+            max_event_images: parse_max_event_images()?,
             max_listener_delay_secs: env_parse(
                 "MAX_LISTENER_DELAY_SECS",
                 DEFAULT_MAX_LISTENER_DELAY_SECS,
@@ -297,6 +302,7 @@ impl AppConfig {
             state_file: PathBuf::from(DEFAULT_STATE_FILE),
             max_reserved_items: DEFAULT_MAX_RESERVED_ITEMS,
             artwork_max_bytes: DEFAULT_ARTWORK_MAX_BYTES,
+            max_event_images: DEFAULT_MAX_EVENT_IMAGES,
             max_listener_delay_secs: DEFAULT_MAX_LISTENER_DELAY_SECS,
             max_pending_listener_updates: DEFAULT_MAX_PENDING_LISTENER_UPDATES,
             trusted_proxies: default_trusted_proxies(),
@@ -330,6 +336,20 @@ fn parse_admin_token() -> Result<Option<AdminToken>, ConfigError> {
 /// Reads `ARTWORK_MAX_BYTES`, the body limit of an image upload.
 fn parse_artwork_max_bytes() -> Result<usize, ConfigError> {
     env_parse("ARTWORK_MAX_BYTES", DEFAULT_ARTWORK_MAX_BYTES)
+}
+
+/// Reads `MAX_EVENT_IMAGES`, the highest count of images that one event
+/// holds (ADR 0011 §The Limit).
+fn parse_max_event_images() -> Result<usize, ConfigError> {
+    let count = env_parse("MAX_EVENT_IMAGES", DEFAULT_MAX_EVENT_IMAGES)?;
+    if count < MIN_EVENT_IMAGES {
+        return Err(ConfigError {
+            key: "MAX_EVENT_IMAGES",
+            value: count.to_string(),
+            message: format!("must be {MIN_EVENT_IMAGES} or more"),
+        });
+    }
+    Ok(count)
 }
 
 fn parse_lease_secs() -> Result<u64, ConfigError> {
@@ -1187,9 +1207,10 @@ impl RelayState {
     /// holds the images, so no upload and no lease expiry can remove that
     /// image between the check and the state change (ADR 0003).
     ///
-    /// The display lock is the only lock held during the update. It is
-    /// released before the update goes to the subscribers. The live value
-    /// lock is never taken.
+    /// The relay copies the listener images under the live value lock and
+    /// releases it. Then it takes the display lock. It never holds the two
+    /// locks at the same time. It releases the display lock before the
+    /// update goes to the subscribers.
     ///
     /// # Errors
     ///
@@ -1222,8 +1243,12 @@ impl RelayState {
         }
         event.touch(now);
 
+        let listener_images = {
+            let inner = event.inner.read().await;
+            inner.listener_artwork(event_id)
+        };
         let mut inner = event.display.write().await;
-        let update = inner.publish(display)?;
+        let update = inner.publish(display, &listener_images)?;
         drop(inner);
         let seq = update.seq;
         let _ = event.display_sender.send(update);
@@ -1263,10 +1288,13 @@ impl RelayState {
     /// bytes only.
     ///
     /// An image that the event holds already gives `stored: false` and no
-    /// change. An event holds at most two images. When it holds two, a new
-    /// image first removes one image that is not the image of the present
-    /// display state: the image of the state before it, else the earlier
-    /// upload. The display lock is the only lock held during the change.
+    /// change. An event holds at most `MAX_EVENT_IMAGES` images. At the
+    /// limit, a new image first removes one image in the order of ADR 0011
+    /// §The Limit. The image of the present display state stays.
+    ///
+    /// The relay copies the listener images under the live value lock and
+    /// releases it. Then it takes the display lock. It never holds the two
+    /// locks at the same time.
     ///
     /// # Errors
     ///
@@ -1312,8 +1340,13 @@ impl RelayState {
             mime,
             bytes: Bytes::copy_from_slice(&body),
         };
+        let listener_images = {
+            let inner = event.inner.read().await;
+            inner.listener_artwork(event_id)
+        };
         let mut display = event.display.write().await;
-        let added = display.store_image(image);
+        let added =
+            display.store_image(image, &listener_images, self.inner.config.max_event_images);
         drop(display);
 
         Ok(UploadArtworkResponse {
@@ -2162,6 +2195,21 @@ struct PendingListenerUpdate {
 }
 
 impl LiveEventInner {
+    /// Returns the hash of each listener image of the event: each image
+    /// that the present listener value or a pending update names (ADR 0011
+    /// §How A Payload Names An Image).
+    fn listener_artwork(&self, event_id: &str) -> HashSet<String> {
+        std::iter::once(&self.listener_value)
+            .chain(
+                self.pending_listener_updates
+                    .iter()
+                    .map(|update| &update.value),
+            )
+            .filter_map(|value| payload_artwork_sha256(value, event_id))
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Applies one update to the listener timeline (ADR 0004 §Two
     /// Timelines, §The Order On The Listener Timeline, §The Pending
     /// Updates). Only one function implements the publish rule. A publish
@@ -2238,7 +2286,7 @@ struct DisplayInner {
     /// The present display state. It is always a validated display state.
     state: Value,
     replay: VecDeque<DisplayUpdate>,
-    /// The images of the event, oldest first. At most `MAX_EVENT_IMAGES`.
+    /// The images of the event, oldest first. At most `max_event_images`.
     images: Vec<StoredImage>,
     /// The `artwork.sha256` of the display state before the present one.
     previous_sha256: Option<String>,
@@ -2257,7 +2305,7 @@ impl DisplayInner {
             seq: 0,
             state: null_display_state(),
             replay: VecDeque::with_capacity(REPLAY_CAPACITY),
-            images: Vec::with_capacity(MAX_EVENT_IMAGES),
+            images: Vec::new(),
             previous_sha256: None,
         }
     }
@@ -2269,27 +2317,45 @@ impl DisplayInner {
     /// Adds `image` and returns `true`, or returns `false` when the event
     /// holds it already.
     ///
-    /// When the event holds `MAX_EVENT_IMAGES` images, this first removes
-    /// one image that the present display state does not name. It prefers
-    /// the image of the state before the present one, else the oldest
-    /// image. The image of the present state stays.
-    fn store_image(&mut self, image: StoredImage) -> bool {
+    /// When the event holds `max_event_images` images, this first removes
+    /// one image (ADR 0011 §The Limit). It selects the first group that has
+    /// an image, and in that group the earliest upload: an image that no
+    /// display state and no listener value names, then a listener image
+    /// that is not a display image, then the image of the earlier display
+    /// state. The image of the present state stays.
+    fn store_image(
+        &mut self,
+        image: StoredImage,
+        listener_images: &HashSet<String>,
+        max_event_images: usize,
+    ) -> bool {
         if self.image(&image.sha256).is_some() {
             return false;
         }
-        if self.images.len() >= MAX_EVENT_IMAGES {
+        if self.images.len() >= max_event_images {
             let present = artwork_sha256(&self.state);
             let previous = self.previous_sha256.as_deref();
-            let candidates = || {
-                self.images
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, held)| Some(held.sha256.as_str()) != present)
-            };
-            let evict = candidates()
-                .find(|(_, held)| Some(held.sha256.as_str()) == previous)
-                .or_else(|| candidates().next())
-                .map(|(index, _)| index);
+            let evict = self
+                .images
+                .iter()
+                .position(|held| {
+                    Some(held.sha256.as_str()) != present
+                        && Some(held.sha256.as_str()) != previous
+                        && !listener_images.contains(&held.sha256)
+                })
+                .or_else(|| {
+                    self.images.iter().position(|held| {
+                        Some(held.sha256.as_str()) != present
+                            && Some(held.sha256.as_str()) != previous
+                            && listener_images.contains(&held.sha256)
+                    })
+                })
+                .or_else(|| {
+                    self.images.iter().position(|held| {
+                        Some(held.sha256.as_str()) == previous
+                            && Some(held.sha256.as_str()) != present
+                    })
+                });
             if let Some(index) = evict {
                 self.images.remove(index);
             }
@@ -2301,15 +2367,21 @@ impl DisplayInner {
     /// Publishes a validated display state.
     ///
     /// An `artwork.sha256` must name a held image, and its `mime` must be
-    /// the stored type. After the change, the event keeps only the image of
-    /// the present state and the image of the most recent earlier state that
+    /// the stored type. After the change, the event keeps each display
+    /// image and each image of `listener_images`, and removes each other
+    /// image (ADR 0011 §The Retention Rule). A display image is the image of
+    /// the present state, or the image of the most recent earlier state that
     /// had a relay image.
     ///
     /// # Errors
     ///
     /// Returns `409 artwork_missing` or `400 invalid_display`. An error
     /// changes nothing.
-    fn publish(&mut self, state: Value) -> Result<DisplayUpdate, ApiError> {
+    fn publish(
+        &mut self,
+        state: Value,
+        listener_images: &HashSet<String>,
+    ) -> Result<DisplayUpdate, ApiError> {
         if let Some(sha256) = artwork_sha256(&state) {
             let image = self
                 .image(sha256)
@@ -2330,7 +2402,7 @@ impl DisplayInner {
         let previous = self.previous_sha256.as_deref();
         self.images.retain(|image| {
             let held = Some(image.sha256.as_str());
-            held == present || held == previous
+            held == present || held == previous || listener_images.contains(&image.sha256)
         });
         Ok(update)
     }
@@ -2374,6 +2446,19 @@ fn null_display_state() -> Value {
 /// Returns the `artwork.sha256` of a validated display state, if it has one.
 fn artwork_sha256(state: &Value) -> Option<&str> {
     state["track"]["artwork"]["sha256"].as_str()
+}
+
+/// Returns the hash of the image of event `event_id` that a live value
+/// names, if it names one (ADR 0011 §How A Payload Names An Image). The
+/// top-level `image` string must end with
+/// `/v1/liveitems/{event_id}/artwork/{sha256}`, and the hash must be 64
+/// lowercase hexadecimal characters. The start of the URL has no check,
+/// because the relay does not know its public address.
+fn payload_artwork_sha256<'a>(value: &'a Value, event_id: &str) -> Option<&'a str> {
+    let image = value.get("image")?.as_str()?;
+    let suffix = format!("/v1/liveitems/{event_id}/artwork/");
+    let (_, hash) = image.rsplit_once(&suffix)?;
+    is_sha256_hex(hash).then_some(hash)
 }
 
 /// Returns the SHA-256 of `bytes` as 64 lowercase hexadecimal characters.
@@ -4834,6 +4919,43 @@ mod tests {
             parse_artwork_max_bytes().expect("the default"),
             DEFAULT_ARTWORK_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn max_event_images_has_a_default_reads_the_environment_and_rejects_low_values() {
+        assert_eq!(DEFAULT_MAX_EVENT_IMAGES, 8);
+        assert_eq!(AppConfig::for_tests().max_event_images, 8);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::set_var("MAX_EVENT_IMAGES", "5") };
+        let set = parse_max_event_images();
+        unsafe { std::env::remove_var("MAX_EVENT_IMAGES") };
+        assert_eq!(set.expect("valid value"), 5);
+        assert_eq!(parse_max_event_images().expect("default"), 8);
+        for value in ["0", "1"] {
+            unsafe { std::env::set_var("MAX_EVENT_IMAGES", value) };
+            assert!(parse_max_event_images().is_err(), "{value}");
+        }
+        unsafe { std::env::remove_var("MAX_EVENT_IMAGES") };
+    }
+
+    #[test]
+    fn payload_artwork_sha256_accepts_only_the_event_image_suffix() {
+        let event_id = "event-1";
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let valid = json!({ "image": format!("any-start/v1/liveitems/{event_id}/artwork/{hash}") });
+        assert_eq!(payload_artwork_sha256(&valid, event_id), Some(hash));
+        for value in [
+            json!({ "image": format!("/v1/liveitems/other/artwork/{hash}") }),
+            json!({ "image": format!("/v1/liveitems/{event_id}/artwork/{}A", &hash[..63]) }),
+            json!({ "image": format!("/v1/liveitems/{event_id}/artwork/{}?x=1", hash) }),
+            json!({ "image": 4 }),
+            json!({ "title": "no image" }),
+            json!({ "image": format!("/v1/liveitems/{event_id}/artwork/{}", &hash[..63]) }),
+        ] {
+            assert_eq!(payload_artwork_sha256(&value, event_id), None, "{value}");
+        }
     }
 
     // ADR 0004, payment safety: the listener value and its Socket.IO emit

@@ -44,8 +44,8 @@ packet.
     `GET /v1/liveitems/{event_id}/display` and the SSE stream
     `/display/events`.
   - It has an artwork store, with `PUT` and
-    `GET /v1/liveitems/{event_id}/artwork/{sha256}`. An event holds two
-    images at most.
+    `GET /v1/liveitems/{event_id}/artwork/{sha256}`. ADR 0011 owns the
+    count of images that an event holds.
   - A display publish gives `409 artwork_missing` for an image that the
     event does not hold.
   - An ephemeral event gets `409 event_not_reserved`.
@@ -110,6 +110,12 @@ packet.
     open checks until the first tag.
   - On a GitHub runner, `tests/adr_links.rs` does not run the ADR guard.
   - The deploy on `api.musicindex.org` does not use these files.
+- ADR 0011, the listener images, has the status `Implemented`. The artifact
+  is `docs/reviews/adr-0011-review-checklist.md`. An event keeps each image
+  that its present listener value or a pending listener update names, for
+  the payload image of publisher ADR 0034. `MAX_EVENT_IMAGES` (default 8) is
+  the limit for each event. The relay on `api.musicindex.org` does not have
+  this change until the operator deploys it.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in
@@ -220,8 +226,8 @@ This service carries payment routing to listener apps.
   or after the idle TTL. A reserved event survives both. After a restart it
   serves no snapshot until the next publish: `remoteValue` gives `{}` and the
   metadata route gives `404 metadata_not_found` (ADR 0001).
-- The display state and the images of a reserved event (ADR 0003) live in
-  memory only. A restart gives `{"track": null}` and no image. A lease expiry
+- The display state and the images of a reserved event (ADR 0003, ADR 0011)
+  live in memory only. A restart gives `{"track": null}` and no image. A lease expiry
   sets the state to `{"track": null}` and removes the images.
 - Consumers depend on those two death modes and work around them. A change to
   either one is an interoperability change. Record it in

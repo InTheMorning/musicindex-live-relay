@@ -782,20 +782,30 @@ Status codes:
 
 #### Image Retention
 
-An item holds two images at most. So the images that the relay holds use at
-most `MAX_RESERVED_ITEMS` multiplied by two images of `ARTWORK_MAX_BYTES`.
+An item holds at most `MAX_EVENT_IMAGES` images. The relay holds at most
+`MAX_RESERVED_ITEMS` multiplied by `MAX_EVENT_IMAGES` images of
+`ARTWORK_MAX_BYTES`.
 
-- After a display publish, the item keeps the image of the present display
-  state and the image of the most recent earlier state with a relay image. A
-  state with no relay image, such as `null` or a URL, does not remove that
-  image. The relay removes every other image.
-- An upload never makes the item hold more than two images. An upload can
-  add a new image to an item that holds two images. The relay then first
-  removes one image that the present display state does not name. It removes the
-  image of the state before the present state, if the item holds it. Else it
-  removes the earlier upload.
-- An upload never removes the image of the present display state.
-- A lease expiry removes every image of the item.
+- A display image is the image of the present display state, or the image
+  of the most recent earlier state with a relay image. A state with no relay
+  image, such as `null` or a URL, does not remove that image.
+- A listener image is an image that the listener timeline names (ADR 0011).
+  The present listener value can name it, or a pending listener update. A
+  payload names an image when its top-level `image` string ends with
+  `/v1/liveitems/{event_id}/artwork/{sha256}`, with the identifier of the
+  same item. The hash has 64 lowercase hexadecimal characters. The relay
+  does not compare the start of the URL.
+- A display publish keeps each display image and each listener image. It
+  removes each other image.
+- An upload does not make the item hold more than `MAX_EVENT_IMAGES` images.
+  At the limit, the relay first removes one image, the earliest upload of
+  the first group that has an image:
+  1. an image that is not a display image and not a listener image,
+  2. a listener image that is not a display image,
+  3. the image of the earlier display state.
+- An upload does not remove the image of the present display state.
+- A lease expiry removes each image of the item, also each listener image.
+- The relay accepts a payload that names an image that it does not hold.
 
 An image can go before a display state names it. A broadcaster that gets
 `409 artwork_missing` uploads the image again and publishes again.
@@ -1012,7 +1022,8 @@ Configuration is read from environment variables.
 | `ADMIN_TOKEN` | not set | The operator credential for the reserve, list and delete routes of reserved items. It must have 16 bytes or more. When it is not set, these routes answer `404` and the relay opens no state file. |
 | `STATE_FILE` | `/var/lib/musicindex-live-relay/reserved-items.sqlite3` | The SQLite file for reserved items. The relay opens it and restores the reserved items only when `ADMIN_TOKEN` is set. The parent directory must exist and be writable. |
 | `MAX_RESERVED_ITEMS` | `100` | Maximum number of reserved items in the state file. |
-| `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. A reserved item holds two images at most. See "Image Retention" above. |
+| `ARTWORK_MAX_BYTES` | `524288` | The body limit of an image upload, in bytes. See "Image Retention" above. |
+| `MAX_EVENT_IMAGES` | `8` | The highest count of images that one reserved item holds (ADR 0011). Must be 2 or more. See "Image Retention" above. |
 | `MAX_LISTENER_DELAY_SECS` | `300` | The highest value of the `Listener-Delay-Secs` header that a publish can send (ADR 0004). See "Publish Metadata" above. |
 | `MAX_PENDING_LISTENER_UPDATES` | `64` | The highest count of pending listener updates that the relay keeps for each event (ADR 0004). Must be 1 or more. See "The Listener Timeline" above. |
 | `TRUSTED_PROXIES` | `127.0.0.1,::1` | A comma-separated list of addresses and CIDR ranges that the relay trusts to set `X-Real-IP` (ADR 0007). See "The Client Address" below. |

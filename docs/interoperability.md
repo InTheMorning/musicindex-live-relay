@@ -252,17 +252,29 @@ A consumer must know these facts:
 
 Image retention keeps the memory in its limit:
 
-- An item holds two images at most.
-- After a display publish, the item keeps the image of the present state and
-  the image of the most recent earlier state with a relay image. The relay
-  removes every other image. A client that is behind the stream can thus
-  still load the image of the last track after a `null` state.
-- An upload to an item that holds two images first removes one image that
-  the present state does not name. That is the image of the state before the
-  present state, else the earlier upload. An upload never removes the image
-  of the present state. Added 2026-10-04 by the task 002 review, so that many
-  uploads with no publish cannot hold more than two images (ADR 0003
-  §Invariants).
+- An event holds at most `MAX_EVENT_IMAGES` images. Its default is 8, and
+  its lowest accepted value is 2.
+- A display image is the image of the present display state, or the image
+  of the most recent earlier state with a relay image. A client that is
+  behind the stream can thus still load the image of the last track after a
+  `null` state.
+- A listener image is an image that the present listener value or a pending
+  listener update names (ADR 0011). The relay reads the top-level `image`
+  key of the payload. The URL must end with
+  `/v1/liveitems/{event_id}/artwork/{sha256}`, with the identifier of the
+  same event. The hash has 64 lowercase hexadecimal characters. The relay
+  does not compare the start of the URL, and it does not change the payload.
+  `musicindex-live-publisher` ADR 0034 sends such a URL.
+- After a display publish, the event keeps each display image and each
+  listener image. The relay removes each other image.
+- At the image limit, an upload first removes the earliest image that no
+  display state and no listener value names. If no such image exists, it
+  removes the earliest listener image that is not a display image. If no
+  such image exists, it removes the image of the earlier display state.
+- An upload does not remove the image of the present display state. A lease
+  expiry removes each image, also each listener image.
+- A payload can name an image that the relay does not hold. The relay accepts
+  that payload, and the image read gives `404 artwork_not_found`.
 - So an image can go before a display state names it. The broadcaster then
   gets `409 artwork_missing`, uploads the image again and publishes again.
   `musicindex-live-publisher` display task 004 does this one time.
