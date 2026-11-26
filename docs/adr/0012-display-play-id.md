@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted - 2026-11-26.
+Implemented - 2026-11-26.
+
+Implemented 2026-11-26. The task packet is done, and the relay at commit
+`d1dd6b3` runs on `api.musicindex.org`. The named artifact is
+`docs/reviews/adr-0012-review-checklist.md`, which has no open gates.
 
 Accepted 2026-11-26 by the operator, as written. The two items of §Before
 Acceptance are done: the operator accepted publisher ADR 0038 on 2026-11-26

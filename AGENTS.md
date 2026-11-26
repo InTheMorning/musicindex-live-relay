@@ -114,14 +114,10 @@ packet.
   is `docs/reviews/adr-0011-review-checklist.md`. An event keeps each image
   that its present listener value or a pending listener update names, for
   the payload image of publisher ADR 0034. `MAX_EVENT_IMAGES` (default 8) is
-  the limit for each event. The relay on `api.musicindex.org` does not have
-  this change until the operator deploys it.
+  the limit for each event.
 - ADR 0012, the optional display track key `playId`, has the status
-  `Accepted`. Its task packet is done. A display track can also have
-  `playId`, a string or `null`. ADR 0012 becomes `Implemented` when the
-  deployment gate of `docs/reviews/adr-0012-review-checklist.md` closes: the
-  relay on `api.musicindex.org` has this change before a publisher sends
-  `playId`.
+  `Implemented`. The artifact is `docs/reviews/adr-0012-review-checklist.md`.
+  A display track can also have `playId`, a string or `null`.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in

@@ -1,7 +1,7 @@
 # ADR 0012 Display Play Identifier: Review Checklist
 
-Status: open - 2026-11-26. The deployment item remains. When it closes, this
-checklist is the named artifact for the `Implemented` status of ADR 0012.
+Status: closed - 2026-11-26. Each item passes. This checklist is the named
+artifact for the `Implemented` status of ADR 0012.
 
 ## Invariants Of ADR 0012
 
@@ -35,5 +35,17 @@ checklist is the named artifact for the `Implemented` status of ADR 0012.
 
 ## Deployment
 
-- [ ] The operator deploys this relay on `api.musicindex.org` before a
-  publisher sends `playId`. Record the deployed commit here.
+- [x] The operator deploys this relay on `api.musicindex.org` before a
+  publisher sends `playId`.
+
+## Deployment Result
+
+The operator deployed the relay on `api.musicindex.org` on 2026-11-26.
+
+- `GET https://api.musicindex.org/v1/liveitems/info` gave
+  `{"version":"0.1.0","git_revision":"d1dd6b3","built_at":"2026-11-26T05:04:18Z"}`
+  on 2026-11-26. The relay session made this read.
+- The publisher session reported that the publisher on the test station sent
+  display states with `playId` at 2026-11-26 05:07:06 UTC, and that the relay
+  accepted each one. The record is publisher station log step 52, publisher
+  commit `6819fb1`. The relay session did not make this check.

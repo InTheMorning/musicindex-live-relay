@@ -56,6 +56,7 @@ ADR 0011 has no visual item. The app check of the payload image belongs to
 
 ## Deployment
 
-The relay on `api.musicindex.org` does not have this change until the
-operator deploys it. That is not a gate of ADR 0011. Publisher ADR 0034
-needs the deployed relay before its app check.
+The deployment is not a gate of ADR 0011. Publisher ADR 0034 needs the
+deployed relay before its app check. On 2026-11-26 the relay on
+`api.musicindex.org` gave the revision `d1dd6b3` on
+`GET /v1/liveitems/info`. That revision includes this change.
