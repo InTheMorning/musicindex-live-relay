@@ -2,13 +2,15 @@
 
 ## Status
 
-Accepted - 2026-11-26.
+Implemented - 2026-11-26.
+
+Implemented 2026-11-26. The two task packets are done, and the relay at
+commit `1dec0b3` runs on `api.musicindex.org`. The named artifact is
+`docs/reviews/adr-0013-review-checklist.md`, which has no open gates.
 
 Accepted 2026-11-26. The operator accepted this record on 2026-11-26, as
 written, and then publisher ADR 0042 and publisher ADR 0043 (publisher
-commit `2e517df`). The two task packets are done. This record gets the
-status `Implemented` when the deployment gate of
-`docs/reviews/adr-0013-review-checklist.md` closes.
+commit `2e517df`).
 
 Changed 2026-11-26, after the operator acceptance and before the status
 `Accepted`. The table gets the key `funding` for publisher ADR 0043, by the

@@ -1,7 +1,7 @@
 # ADR 0013 Optional Keys Of The Display Track: Review Checklist
 
-Status: open - 2026-11-26. The deployment item remains. When it closes, this
-checklist is the named artifact for the `Implemented` status of ADR 0013.
+Status: closed - 2026-11-26. Each item passes. This checklist is the named
+artifact for the `Implemented` status of ADR 0013.
 
 ## Invariants Of ADR 0013
 
@@ -55,5 +55,20 @@ checklist is the named artifact for the `Implemented` status of ADR 0013.
 
 ## Deployment
 
-- [ ] The operator deploys this relay on `api.musicindex.org` before a
-  publisher sends `pubDate` or `funding`. Record the deployed commit here.
+- [x] The operator deploys this relay on `api.musicindex.org` before a
+  publisher sends `pubDate` or `funding`.
+
+## Deployment Result
+
+The operator deployed the relay on `api.musicindex.org` on 2026-11-26.
+
+- `GET https://api.musicindex.org/v1/liveitems/info` gave
+  `{"version":"0.1.0","git_revision":"1dec0b3","built_at":"2026-11-26T19:27:56Z"}`
+  on 2026-11-26. The relay session made this read.
+- `GET /v1/liveitems/Nx7Pcae5FVqzwZtMDZiXFw/display` gave a track with
+  `funding`, one entry with `label` and `url`, and with `playId`
+  `ls-1795725140990-5`, on 2026-11-26. The relay session made this read.
+- The publisher session reported that the same route gave `pubDate`
+  `2026-11-12` for the play `ls-1795725060190-4-30665`, and that the
+  publisher got no `400`. The record is publisher station log step 62,
+  publisher commit `0a884e1`. The relay session did not make this check.

@@ -46,8 +46,8 @@ station runs continuously.
   or the present listener value names, in the limit `MAX_EVENT_IMAGES`, for
   publisher ADR 0034
 - [ADR 0013: The optional keys of the display track](adr/0013-display-track-optional-keys.md)
-  — Accepted. One record for the optional track keys `songLine`, `value`,
-  `album`, `playId`, `pubDate` and `funding`. The deployment gate is open
+  — Implemented. One record for the optional track keys `songLine`,
+  `value`, `album`, `playId`, `pubDate` and `funding`
 
 ## Archived ADRs
 
@@ -197,8 +197,8 @@ Packet for ADR 0012, the play identifier. ADR 0013 owns its rules.
 - [ADR 0012 review checklist](reviews/adr-0012-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0012
 
-- [ADR 0013 review checklist](reviews/adr-0013-review-checklist.md) — open.
-  The deployment item remains
+- [ADR 0013 review checklist](reviews/adr-0013-review-checklist.md) — the
+  named artifact for the `Implemented` status of ADR 0013
 
 ## Research
 

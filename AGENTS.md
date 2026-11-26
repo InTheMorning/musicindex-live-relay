@@ -111,14 +111,12 @@ packet.
   the payload image of publisher ADR 0034. `MAX_EVENT_IMAGES` (default 8) is
   the limit for each event.
 - ADR 0013, the optional keys of the display track, has the status
-  `Accepted`. Its two task packets are done. A display track has `artist`,
+  `Implemented`. The artifact is
+  `docs/reviews/adr-0013-review-checklist.md`. A display track has `artist`,
   `title` and `artwork`, and can also have `songLine`, `value`, `album`,
   `playId`, `pubDate` and `funding`. ADR 0013 owns the shape and the limit
   of each optional key, and its section "The Next Key" owns how a key is
-  added. ADR 0013 becomes `Implemented` when the deployment gate of
-  `docs/reviews/adr-0013-review-checklist.md` closes: the relay on
-  `api.musicindex.org` has this change before a publisher sends `pubDate`
-  or `funding`.
+  added.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in
