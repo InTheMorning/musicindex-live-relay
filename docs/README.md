@@ -54,6 +54,10 @@ station runs continuously.
 - [ADR 0012: The display track carries the play identifier](adr/0012-display-play-id.md)
   — Implemented. One optional track key, `playId`, for the HLS segment
   frame of publisher ADR 0038
+- [ADR 0013: The optional keys of the display track](adr/0013-display-track-optional-keys.md)
+  — Proposed. One record for the optional track keys, with the new key
+  `pubDate` for publisher ADR 0042. At acceptance it supersedes ADR 0005,
+  ADR 0006 and ADR 0012
 
 ## Plans
 
