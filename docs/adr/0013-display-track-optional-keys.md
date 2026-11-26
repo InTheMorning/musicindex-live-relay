@@ -9,6 +9,12 @@ The operator accepted this record on 2026-11-26, as written. Item 2 of
 status `Proposed`. This record gets the status `Accepted` when item 1 is
 done.
 
+Changed 2026-11-26, after the operator acceptance and before the status
+`Accepted`. The table gets the key `funding` for publisher ADR 0043, by the
+rule of §The Next Key. The operator chose on 2026-11-26 that the display
+state carries the funding links of the track. The orchestrator session
+relayed that choice.
+
 Proposed 2026-11-26. The orchestrator session relayed the request of
 `musicindex-live-publisher` ADR 0042 for the key `pubDate`. The operator
 chose on 2026-11-26 that an episode sends its publication date in the display
@@ -39,11 +45,16 @@ record for the display track. Publisher ADR 0042 asks for that fifth key,
 publisher writes the `pubDate` of the feed item into the file as the UTC day.
 A player shows the day with the episode.
 
-This record thus does two things:
+Publisher ADR 0043 asks for a sixth key, `funding`. It is the list of the
+funding links of the track, from the tag `podcast:funding` of the feed. A
+player shows the links, and a listener opens them.
+
+This record thus does three things:
 
 - It restates each live rule of ADR 0005, ADR 0006 and ADR 0012, with no
   change.
 - It adds the key `pubDate`.
+- It adds the key `funding`.
 
 ## Decision
 
@@ -59,6 +70,7 @@ states them. It can also have these keys:
 | `album` | A string: the album of the track | 1 to 1,024 characters | Not valid |
 | `playId` | A string: the play identifier of the segment | 1 to 128 characters | Valid |
 | `pubDate` | A string: a calendar day in the form `YYYY-MM-DD` | Exactly 10 characters | Not valid |
+| `funding` | An array of entries: the funding links of the track | 1 to 3 entries | Not valid |
 
 - Each key is optional. A track with none of these keys is valid.
 - Each other key gives `400 invalid_display`.
@@ -81,6 +93,32 @@ states them. It can also have these keys:
 - The relay accepts `pubDate` on each track. It does not know if a track is
   an episode. The publisher sends the key only for an episode.
 
+### The Form Of `funding`
+
+Each entry of `funding` is an object with these keys and no other key:
+
+| Key | Shape | Limit |
+|---|---|---|
+| `url` | A string, necessary | 1 to 512 characters |
+| `label` | A string, optional | 1 to 128 characters |
+
+- `null` and an empty array give `400 invalid_display`. A sender with no
+  link sends no key.
+- A fourth entry gives `400 invalid_display`.
+- The scheme of `url` is `http` or `https`. The relay ignores the case of
+  the scheme, as for `artwork.url`.
+- `url` has a host: after `://`, one character or more comes before the
+  first `/`, `?` or `#`. `https:///support` gives `400 invalid_display`.
+- `url` has no white space and no control character.
+- `label` has no white space at its start or at its end. An entry with no
+  label text has no `label` key.
+- Two entries with the same `url` give `400 invalid_display`. The relay
+  compares the two strings character by character.
+- One incorrect entry makes the full display state invalid. The relay does
+  not remove an entry.
+- The relay does not request a `url`, and it does not compare a `url` with a
+  feed.
+
 ### Pass-Through
 
 - `GET /display` and `/display/events` give the track with its keys, without
@@ -93,7 +131,10 @@ states them. It can also have these keys:
   state two times for one play.
 - The body limit of 8 KiB for a display publish does not change.
 - Socket.IO and the live value routes do not change. The live value payload
-  does not get `pubDate`.
+  does not get `pubDate` or `funding`.
+- Three entries of `funding` at their limits use about 2 KiB of ASCII text,
+  and more with other characters. The publisher owns the fit in the body
+  limit (publisher ADR 0043 §The Publisher).
 
 ### The Next Key
 
@@ -119,7 +160,9 @@ These rules apply while this decision is current.
 
 - No check that `value` names a real block.
 - No check that `playId` has the form of the producer.
-- No check that `album` or `pubDate` agrees with a payload or a feed.
+- No check that `album`, `pubDate` or `funding` agrees with a payload or a
+  feed.
+- No request to a `url` of `funding`.
 - No read of a display state by `playId` or by `pubDate`.
 - No key with free content, such as `extra`. Such a key has no limit that a
   test can check.
@@ -128,6 +171,10 @@ These rules apply while this decision is current.
 
 1. **Publisher ADR 0042** is accepted. It is the only sender of `pubDate`.
 2. **The operator** accepts this record.
+
+The key `funding` has its own condition for the build: publisher ADR 0043 is
+accepted. It is the only sender of `funding`. That condition does not hold
+the status of this record or the build of `pubDate`.
 
 ## Changes At Acceptance
 
@@ -160,10 +207,30 @@ For `pubDate`:
   - `2026-11-12T00:00:00Z`.
 - An SSE subscriber of `/display/events` receives `pubDate`.
 
+For `funding`:
+
+- A track with two entries, one with `label` and one with no `label`, is
+  accepted, and `GET /display` gives the array without a change.
+- A track with three entries is accepted.
+- A track with `funding`, `pubDate`, `playId`, `album`, `songLine` and
+  `value` is accepted.
+- A `url` of 512 characters and a `label` of 128 characters are accepted.
+- Each of these gives `400 invalid_display`:
+  - `funding` that is `null`, an empty array, an object or a string,
+  - four entries,
+  - an entry that is not an object, an entry with no `url`, and an entry
+    with a third key,
+  - a `url` with the scheme `ftp`, `https:///support`, a `url` of 513
+    characters, an empty `url` and a `url` with a space,
+  - an empty `label`, a `label` of 129 characters, a `label` with a space at
+    its end, and a `label` that is `null`,
+  - two entries with the same `url`.
+- An SSE subscriber of `/display/events` receives `funding`.
+
 Deployment. The review checklist has this gate:
 
-- This relay is deployed before a publisher sends `pubDate`. An older relay
-  gives `400 invalid_display` for each such state.
+- This relay is deployed before a publisher sends `pubDate` or `funding`. An
+  older relay gives `400 invalid_display` for each such state.
 
 ## Alternatives Considered
 
@@ -201,8 +268,14 @@ Positive:
 
 Negative and risks:
 
-- The display state grows by about 25 bytes.
-- An older relay refuses `pubDate`. The deployment order matters.
+- The display state grows by about 25 bytes for `pubDate`. For `funding`
+  it grows by about 2 KiB of ASCII text at most.
+- An older relay refuses `pubDate` and `funding`. The deployment order
+  matters.
+- A listener opens a `url` of `funding`. The text comes from a feed that a
+  third party writes. The relay checks only the scheme, the host and the
+  characters. A player must show the host before it opens the link, or
+  accept that risk.
 - The relay is stricter for `pubDate` than for `album`. A publisher that
   sends a day that does not exist loses the full display state of that
   track, not only the date.
@@ -216,5 +289,6 @@ Negative and risks:
 - `docs/adr/0006-display-album.md`
 - `docs/adr/0012-display-play-id.md`
 - `musicindex-live-publisher`: `docs/adr/0042-an-episode-sends-its-publication-date.md`
+- `musicindex-live-publisher`: `docs/adr/0043-the-display-state-carries-the-funding-links.md`
 - `musicindex-live-publisher`: `docs/adr/0038-the-hls-stream-marks-each-segment.md`
 - `musicindex-live-publisher`: `docs/adr/0039-the-display-state-pairs-with-its-value-block.md`

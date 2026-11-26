@@ -55,8 +55,9 @@ station runs continuously.
   — Implemented. One optional track key, `playId`, for the HLS segment
   frame of publisher ADR 0038
 - [ADR 0013: The optional keys of the display track](adr/0013-display-track-optional-keys.md)
-  — Proposed. One record for the optional track keys, with the new key
-  `pubDate` for publisher ADR 0042. At acceptance it supersedes ADR 0005,
+  — Proposed. One record for the optional track keys, with the new keys
+  `pubDate` for publisher ADR 0042 and `funding` for publisher ADR 0043. At
+  acceptance it supersedes ADR 0005,
   ADR 0006 and ADR 0012
 
 ## Plans
@@ -154,6 +155,12 @@ Packet for ADR 0013, the publication date. It starts when ADR 0013 has the
 status `Accepted`.
 
 - [001 — The `pubDate` key](tasks/display-pub-date-task-001-pub-date-key.md)
+  — Ready - 2026-11-26
+
+Packet for ADR 0013, the funding links. It starts when ADR 0013 has the
+status `Accepted` and publisher ADR 0043 is accepted.
+
+- [001 — The `funding` key](tasks/display-funding-task-001-funding-key.md)
   — Ready - 2026-11-26
 
 Packet for ADR 0012, the play identifier.

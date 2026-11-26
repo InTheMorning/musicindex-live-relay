@@ -119,11 +119,14 @@ packet.
   `Implemented`. The artifact is `docs/reviews/adr-0012-review-checklist.md`.
   A display track can also have `playId`, a string or `null`.
 - ADR 0013, one record for the optional display track keys, has the status
-  `Proposed`. It adds the key `pubDate` for publisher ADR 0042. The relay
-  refuses `pubDate` at this time. The operator accepted ADR 0013. It gets
+  `Proposed`. It adds the key `pubDate` for publisher ADR 0042 and the key
+  `funding` for publisher ADR 0043. The relay refuses the two keys at this
+  time. The operator accepted ADR 0013. It gets
   the status `Accepted` when publisher ADR 0042 is accepted. Do not build
   the packet `docs/tasks/display-pub-date-task-001-pub-date-key.md` before
-  that.
+  that. Do not build the packet
+  `docs/tasks/display-funding-task-001-funding-key.md` before publisher
+  ADR 0043 is also accepted.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in
