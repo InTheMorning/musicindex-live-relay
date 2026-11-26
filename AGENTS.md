@@ -116,6 +116,10 @@ packet.
   the payload image of publisher ADR 0034. `MAX_EVENT_IMAGES` (default 8) is
   the limit for each event. The relay on `api.musicindex.org` does not have
   this change until the operator deploys it.
+- ADR 0012, the optional display track key `playId`, has the status
+  `Proposed`. No code implements it. The relay refuses a track with
+  `playId`. The build waits for the acceptance of publisher ADR 0038 and of
+  the operator.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in

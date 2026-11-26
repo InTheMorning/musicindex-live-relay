@@ -4,6 +4,8 @@
 
 Implemented - 2026-10-06.
 
+- Changed by: ADR 0012
+
 Implemented 2026-10-06: task 001 is done, and the relay is deployed before
 the publisher. The named artifact is
 `docs/reviews/adr-0005-review-checklist.md`, with no open item.

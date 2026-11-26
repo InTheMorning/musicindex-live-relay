@@ -51,6 +51,9 @@ station runs continuously.
   — Implemented. An event keeps each image that a pending listener update
   or the present listener value names, in the limit `MAX_EVENT_IMAGES`, for
   publisher ADR 0034
+- [ADR 0012: The display track carries the play identifier](adr/0012-display-play-id.md)
+  — Proposed. One optional track key, `playId`, for the HLS segment frame of
+  publisher ADR 0038. No code implements it
 
 ## Plans
 
