@@ -4,6 +4,11 @@
 
 Proposed - 2026-11-26.
 
+The operator accepted this record on 2026-11-26, as written. Item 2 of
+§Before Acceptance is done. Item 1 is open: publisher ADR 0042 has the
+status `Proposed`. This record gets the status `Accepted` when item 1 is
+done.
+
 Proposed 2026-11-26. The orchestrator session relayed the request of
 `musicindex-live-publisher` ADR 0042 for the key `pubDate`. The operator
 chose on 2026-11-26 that an episode sends its publication date in the display

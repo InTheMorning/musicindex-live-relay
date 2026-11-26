@@ -120,8 +120,10 @@ packet.
   A display track can also have `playId`, a string or `null`.
 - ADR 0013, one record for the optional display track keys, has the status
   `Proposed`. It adds the key `pubDate` for publisher ADR 0042. The relay
-  refuses `pubDate` at this time. Do not build it before the operator
-  accepts ADR 0013.
+  refuses `pubDate` at this time. The operator accepted ADR 0013. It gets
+  the status `Accepted` when publisher ADR 0042 is accepted. Do not build
+  the packet `docs/tasks/display-pub-date-task-001-pub-date-key.md` before
+  that.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in

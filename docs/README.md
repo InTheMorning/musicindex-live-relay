@@ -150,6 +150,12 @@ Packet for ADR 0011, the listener images.
 - [001 — The listener images](tasks/image-retention-task-001-listener-images.md)
   — Implemented - 2026-11-25
 
+Packet for ADR 0013, the publication date. It starts when ADR 0013 has the
+status `Accepted`.
+
+- [001 — The `pubDate` key](tasks/display-pub-date-task-001-pub-date-key.md)
+  — Ready - 2026-11-26
+
 Packet for ADR 0012, the play identifier.
 
 - [001 — The `playId` key](tasks/display-play-id-task-001-play-id-key.md)
