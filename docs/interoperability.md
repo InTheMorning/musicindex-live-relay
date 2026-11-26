@@ -241,6 +241,9 @@ A consumer must know these facts:
   Publisher ADR 0012 sends `songLine` and `value`. Publisher ADR 0013 sends
   `album`. Deploy the relay before a publisher sends these keys, because an
   older relay refuses each such track.
+- A display track can also have `playId` (ADR 0012). Publisher ADR 0038 sends
+  this key. The relay stores and sends it as received. Deploy the relay before
+  a publisher sends this key, because an older relay refuses the track.
 - An `artwork.sha256` in a display state must name an image that the item
   holds. Else the publish gets `409 artwork_missing`. Its `mime` must be the
   stored type, else the publish gets `400 invalid_display`. The relay gets

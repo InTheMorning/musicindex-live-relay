@@ -100,6 +100,8 @@ const MAX_SONG_LINE_CHARS: usize = 1_024;
 const MAX_VALUE_GUID_CHARS: usize = 128;
 /// The maximum length of a display track `album`, in characters (ADR 0006).
 const MAX_ALBUM_CHARS: usize = 1_024;
+/// The maximum length of a display track `playId`, in characters (ADR 0012).
+const MAX_PLAY_ID_CHARS: usize = 128;
 /// The image types that an `artwork.mime` can name (ADR 0003).
 const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 /// The default body limit of an image upload, in bytes (ADR 0003).
@@ -2605,9 +2607,11 @@ impl Drop for DisplaySubscription {
 /// Validates a display state body (ADR 0003 §The Display State).
 ///
 /// The body is an object with the one key `track`. `track` is `null`, or an
-/// object with exactly the keys `artist`, `title` and `artwork`. `artist` and
-/// `title` are strings. `artwork` is `null`, `{"sha256", "mime"}` or
-/// `{"url"}`. Returns the body as the relay stores it.
+/// object with the required keys `artist`, `title` and `artwork`, and the
+/// optional keys `songLine`, `value`, `album` and `playId` (ADR 0005, ADR 0006
+/// and ADR 0012). `playId` is a string of 1 to 128 characters or `null`.
+/// The `artwork` key is `null`, `{"sha256", "mime"}` or `{"url"}`.
+/// Returns the body as the relay stores it.
 ///
 /// # Errors
 ///
@@ -2626,9 +2630,12 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     }
 
     let track = track.as_object().ok_or_else(invalid)?;
-    // `artist`, `title` and `artwork` are required. `songLine`, `value` and
-    // `album` are optional (ADR 0005, ADR 0006). Any other key makes the state invalid.
-    let known_keys = ["artist", "title", "artwork", "songLine", "value", "album"];
+    // `artist`, `title` and `artwork` are required. `songLine`, `value`, `album`
+    // and `playId` are optional (ADR 0005, ADR 0006 and ADR 0012). Any other
+    // key makes the state invalid.
+    let known_keys = [
+        "artist", "title", "artwork", "songLine", "value", "album", "playId",
+    ];
     if !track.keys().all(|key| known_keys.contains(&key.as_str())) {
         return Err(invalid());
     }
@@ -2657,6 +2664,12 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     }
     if let Some(album) = track.get("album")
         && !is_text_of_length(album, MAX_ALBUM_CHARS)
+    {
+        return Err(invalid());
+    }
+    if let Some(play_id) = track.get("playId")
+        && !play_id.is_null()
+        && !is_text_of_length(play_id, MAX_PLAY_ID_CHARS)
     {
         return Err(invalid());
     }

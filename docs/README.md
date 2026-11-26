@@ -52,8 +52,8 @@ station runs continuously.
   or the present listener value names, in the limit `MAX_EVENT_IMAGES`, for
   publisher ADR 0034
 - [ADR 0012: The display track carries the play identifier](adr/0012-display-play-id.md)
-  — Proposed. One optional track key, `playId`, for the HLS segment frame of
-  publisher ADR 0038. No code implements it
+  — Accepted. One optional track key, `playId`, for the HLS segment frame of
+  publisher ADR 0038. The deployment gate is open
 
 ## Plans
 
@@ -146,6 +146,11 @@ Packet for ADR 0011, the listener images.
 - [001 — The listener images](tasks/image-retention-task-001-listener-images.md)
   — Implemented - 2026-11-25
 
+Packet for ADR 0012, the play identifier.
+
+- [001 — The `playId` key](tasks/display-play-id-task-001-play-id-key.md)
+  — Implemented - 2026-11-26
+
 ## Runbooks
 
 - [Reserved live items](runbooks/reserved-live-items.md) — reserve, back up,
@@ -176,6 +181,9 @@ Packet for ADR 0011, the listener images.
 
 - [ADR 0011 review checklist](reviews/adr-0011-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0011
+
+- [ADR 0012 review checklist](reviews/adr-0012-review-checklist.md) — open.
+  The deployment item remains
 
 ## Research
 

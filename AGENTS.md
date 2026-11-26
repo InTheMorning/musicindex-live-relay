@@ -117,9 +117,11 @@ packet.
   the limit for each event. The relay on `api.musicindex.org` does not have
   this change until the operator deploys it.
 - ADR 0012, the optional display track key `playId`, has the status
-  `Proposed`. No code implements it. The relay refuses a track with
-  `playId`. The build waits for the acceptance of publisher ADR 0038 and of
-  the operator.
+  `Accepted`. Its task packet is done. A display track can also have
+  `playId`, a string or `null`. ADR 0012 becomes `Implemented` when the
+  deployment gate of `docs/reviews/adr-0012-review-checklist.md` closes: the
+  relay on `api.musicindex.org` has this change before a publisher sends
+  `playId`.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in

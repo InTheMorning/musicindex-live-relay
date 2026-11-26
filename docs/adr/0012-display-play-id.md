@@ -2,12 +2,14 @@
 
 ## Status
 
-Proposed - 2026-11-26.
+Accepted - 2026-11-26.
+
+Accepted 2026-11-26 by the operator, as written. The two items of §Before
+Acceptance are done: the operator accepted publisher ADR 0038 on 2026-11-26
+(publisher commit `cf5ebe8`), and then this record.
 
 Proposed 2026-11-26. The orchestrator session relayed the request of
-`musicindex-live-publisher` ADR 0038, which has the status Proposed. No code
-implements this record. The build starts after the acceptance of §Before
-Acceptance.
+`musicindex-live-publisher` ADR 0038.
 
 - Changes: ADR 0005 items "an unknown key gives `400 invalid_display`", for
   the key `playId` only.
