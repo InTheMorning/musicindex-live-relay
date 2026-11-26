@@ -11,7 +11,7 @@ relay validates them and passes them through without a change.
 
 ## Files To Inspect
 
-- `docs/adr/0005-display-song-line-and-value.md`
+- `docs/archive/adr/0005-display-song-line-and-value.md`
 - `docs/adr/0003-display-state-and-artwork.md` (§The Display State)
 - `src/lib.rs`: `validate_display`, `is_valid_artwork_url`
 - `tests/api.rs` (the display tests)
@@ -91,7 +91,7 @@ You are implementing one bounded task from a larger plan.
 Implement only this task. Do not redesign the architecture.
 
 Read:
-- docs/adr/0005-display-song-line-and-value.md
+- docs/archive/adr/0005-display-song-line-and-value.md
 - docs/adr/0003-display-state-and-artwork.md
 - docs/tasks/display-pairing-task-001-song-line-and-value.md
 - src/lib.rs

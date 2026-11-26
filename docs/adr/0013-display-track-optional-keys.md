@@ -2,12 +2,13 @@
 
 ## Status
 
-Proposed - 2026-11-26.
+Accepted - 2026-11-26.
 
-The operator accepted this record on 2026-11-26, as written. Item 2 of
-§Before Acceptance is done. Item 1 is open: publisher ADR 0042 has the
-status `Proposed`. This record gets the status `Accepted` when item 1 is
-done.
+Accepted 2026-11-26. The operator accepted this record on 2026-11-26, as
+written, and then publisher ADR 0042 and publisher ADR 0043 (publisher
+commit `2e517df`). The two task packets are done. This record gets the
+status `Implemented` when the deployment gate of
+`docs/reviews/adr-0013-review-checklist.md` closes.
 
 Changed 2026-11-26, after the operator acceptance and before the status
 `Accepted`. The table gets the key `funding` for publisher ADR 0043, by the
@@ -20,8 +21,8 @@ Proposed 2026-11-26. The orchestrator session relayed the request of
 chose on 2026-11-26 that an episode sends its publication date in the display
 state only.
 
-- Supersedes: ADR 0005, ADR 0006 and ADR 0012, at the time that this record
-  gets the status `Accepted`. Until then, the three records stay current.
+- Supersedes: ADR 0005, ADR 0006 and ADR 0012. The three records are in
+  `docs/archive/adr/`.
 - Bar: crosses repositories. The publisher sends the keys, this relay
   validates them and passes them through, and Rainbrook and the HLS tagger
   read them. Without the record, an agent can let the relay refuse a key, or
@@ -285,9 +286,9 @@ Negative and risks:
 ## References
 
 - `docs/adr/0003-display-state-and-artwork.md`
-- `docs/adr/0005-display-song-line-and-value.md`
-- `docs/adr/0006-display-album.md`
-- `docs/adr/0012-display-play-id.md`
+- `docs/archive/adr/0005-display-song-line-and-value.md`
+- `docs/archive/adr/0006-display-album.md`
+- `docs/archive/adr/0012-display-play-id.md`
 - `musicindex-live-publisher`: `docs/adr/0042-an-episode-sends-its-publication-date.md`
 - `musicindex-live-publisher`: `docs/adr/0043-the-display-state-carries-the-funding-links.md`
 - `musicindex-live-publisher`: `docs/adr/0038-the-hls-stream-marks-each-segment.md`

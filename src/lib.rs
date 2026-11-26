@@ -93,15 +93,21 @@ const MAX_LABEL_CHARS: usize = 200;
 const DISPLAY_BODY_LIMIT_BYTES: usize = 8 * 1024;
 /// The maximum length of an `artwork.url`, in characters (ADR 0003).
 const MAX_ARTWORK_URL_CHARS: usize = 2_048;
-/// The maximum length of a display track `songLine`, in characters (ADR 0005).
+/// The maximum length of a display track `songLine`, in characters (ADR 0013).
 const MAX_SONG_LINE_CHARS: usize = 1_024;
 /// The maximum length of a display track `eventGuid` or `blockGuid`, in
-/// characters (ADR 0005).
+/// characters (ADR 0013).
 const MAX_VALUE_GUID_CHARS: usize = 128;
-/// The maximum length of a display track `album`, in characters (ADR 0006).
+/// The maximum length of a display track `album`, in characters (ADR 0013).
 const MAX_ALBUM_CHARS: usize = 1_024;
-/// The maximum length of a display track `playId`, in characters (ADR 0012).
+/// The maximum length of a display track `playId`, in characters (ADR 0013).
 const MAX_PLAY_ID_CHARS: usize = 128;
+/// The maximum number of funding entries (ADR 0013).
+const MAX_FUNDING_ENTRIES: usize = 3;
+/// The maximum length of a funding URL, in characters (ADR 0013).
+const MAX_FUNDING_URL_CHARS: usize = 512;
+/// The maximum length of a funding label, in characters (ADR 0013).
+const MAX_FUNDING_LABEL_CHARS: usize = 128;
 /// The image types that an `artwork.mime` can name (ADR 0003).
 const ARTWORK_MIME_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 /// The default body limit of an image upload, in bytes (ADR 0003).
@@ -2608,8 +2614,10 @@ impl Drop for DisplaySubscription {
 ///
 /// The body is an object with the one key `track`. `track` is `null`, or an
 /// object with the required keys `artist`, `title` and `artwork`, and the
-/// optional keys `songLine`, `value`, `album` and `playId` (ADR 0005, ADR 0006
-/// and ADR 0012). `playId` is a string of 1 to 128 characters or `null`.
+/// optional keys `songLine`, `value`, `album`, `playId`, `pubDate` and
+/// `funding` (ADR 0013). `playId` is a string of 1 to 128 characters or
+/// `null`. `pubDate` is a calendar day in the form `YYYY-MM-DD`. `funding` is
+/// an array of one to three funding entries.
 /// The `artwork` key is `null`, `{"sha256", "mime"}` or `{"url"}`.
 /// Returns the body as the relay stores it.
 ///
@@ -2630,11 +2638,11 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     }
 
     let track = track.as_object().ok_or_else(invalid)?;
-    // `artist`, `title` and `artwork` are required. `songLine`, `value`, `album`
-    // and `playId` are optional (ADR 0005, ADR 0006 and ADR 0012). Any other
-    // key makes the state invalid.
+    // `artist`, `title` and `artwork` are required. `songLine`, `value`,
+    // `album`, `playId`, `pubDate` and `funding` are optional (ADR 0013). Any other key
+    // makes the state invalid.
     let known_keys = [
-        "artist", "title", "artwork", "songLine", "value", "album", "playId",
+        "artist", "title", "artwork", "songLine", "value", "album", "playId", "pubDate", "funding",
     ];
     if !track.keys().all(|key| known_keys.contains(&key.as_str())) {
         return Err(invalid());
@@ -2673,6 +2681,16 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     {
         return Err(invalid());
     }
+    if let Some(pub_date) = track.get("pubDate")
+        && !is_calendar_day(pub_date)
+    {
+        return Err(invalid());
+    }
+    if let Some(funding) = track.get("funding")
+        && !is_valid_funding(funding)
+    {
+        return Err(invalid());
+    }
 
     let artwork = track.get("artwork").ok_or_else(invalid)?;
     if artwork.is_null() {
@@ -2703,17 +2721,93 @@ fn validate_display(body: &[u8]) -> Result<Value, ApiError> {
     Ok(state)
 }
 
-/// Returns `true` for an `http` or `https` URL of at most
-/// `MAX_ARTWORK_URL_CHARS` characters with a part after the scheme.
-fn is_valid_artwork_url(url: &str) -> bool {
-    if url.chars().count() > MAX_ARTWORK_URL_CHARS {
-        return false;
-    }
-    let Some((scheme, rest)) = url.split_once("://") else {
+/// Returns `true` for a calendar day in the form `YYYY-MM-DD` (ADR 0013 §The Form Of `pubDate`).
+fn is_calendar_day(value: &Value) -> bool {
+    let Some(value) = value.as_str() else {
         return false;
     };
-    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        && !rest.is_empty()
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[0..4].parse::<i32>();
+    let month = value[5..7].parse::<u8>();
+    let day = value[8..10].parse::<u8>();
+    match (year, month, day) {
+        (Ok(year), Ok(month), Ok(day)) => time::Month::try_from(month)
+            .ok()
+            .and_then(|month| time::Date::from_calendar_date(year, month, day).ok())
+            .is_some(),
+        _ => false,
+    }
+}
+
+/// Returns the text after `://` for an `http` or `https` URL within its limit.
+fn http_url_rest(url: &str, max_chars: usize) -> Option<&str> {
+    if url.chars().count() > max_chars {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")).then_some(rest)
+}
+
+/// Returns `true` for an artwork URL with a part after its scheme.
+fn is_valid_artwork_url(url: &str) -> bool {
+    http_url_rest(url, MAX_ARTWORK_URL_CHARS).is_some_and(|rest| !rest.is_empty())
+}
+
+/// Returns `true` when a funding value has the form in ADR 0013 §The Form Of `funding`.
+fn is_valid_funding(value: &Value) -> bool {
+    let Some(entries) = value.as_array() else {
+        return false;
+    };
+    if !(1..=MAX_FUNDING_ENTRIES).contains(&entries.len()) {
+        return false;
+    }
+    let mut urls = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            return false;
+        };
+        if !(1..=2).contains(&object.len()) || !object.contains_key("url") {
+            return false;
+        }
+        if object.keys().any(|key| key != "url" && key != "label") {
+            return false;
+        }
+        let Some(url) = object.get("url").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(rest) = http_url_rest(url, MAX_FUNDING_URL_CHARS) else {
+            return false;
+        };
+        let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if host_end == 0
+            || url
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return false;
+        }
+        if urls.contains(&url) {
+            return false;
+        }
+        urls.push(url);
+        if let Some(label) = object.get("label")
+            && (!is_text_of_length(label, MAX_FUNDING_LABEL_CHARS)
+                || label.as_str().is_some_and(|text| text.trim() != text))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Returns `true` for a string of 1 to `max_chars` characters.
@@ -3935,6 +4029,22 @@ mod tests {
     /// holds this lock for its whole body: the set, the read, and the
     /// remove.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn calendar_day_requires_a_real_ascii_date() {
+        assert!(!is_calendar_day(&json!("2025-02-29")));
+        assert!(!is_calendar_day(&json!("２026-11-1")));
+    }
+
+    #[test]
+    fn funding_rejects_newlines_and_tabs_in_urls() {
+        assert!(!is_valid_funding(
+            &json!([{"url":"https://example.com/\n"}])
+        ));
+        assert!(!is_valid_funding(
+            &json!([{"url":"https://example.com/\t"}])
+        ));
+    }
 
     fn test_state(now: u64) -> (RelayState, Arc<AtomicU64>) {
         test_state_with_lease(now, DEFAULT_LEASE_SECS)

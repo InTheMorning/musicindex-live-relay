@@ -236,14 +236,14 @@ A consumer must know these facts:
   Socket.IO and the metadata route do not send a display state. The display
   `seq` and the live value `seq` are different counters.
 - A display track has the keys `artist`, `title` and `artwork`, and can also
-  have `songLine`, `value` and `album` (ADR 0005, ADR 0006). Other keys get
-  `400 invalid_display`. The relay stores and sends the track as received.
-  Publisher ADR 0012 sends `songLine` and `value`. Publisher ADR 0013 sends
-  `album`. Deploy the relay before a publisher sends these keys, because an
-  older relay refuses each such track.
-- A display track can also have `playId` (ADR 0012). Publisher ADR 0038 sends
-  this key. The relay stores and sends it as received. Deploy the relay before
-  a publisher sends this key, because an older relay refuses the track.
+  have `songLine`, `value`, `album`, `playId`, `pubDate` and `funding` (ADR 0013).
+  Other keys get `400 invalid_display`.
+- The relay stores and sends each display track as received. Publisher ADR 0012
+  sends `songLine` and `value`. Publisher ADR 0013 sends `album`. Publisher
+  ADR 0038 sends `playId`. Publisher ADR 0042 sends `pubDate`. Publisher
+  ADR 0043 sends `funding`.
+- Deploy the relay before a publisher sends `pubDate` or `funding`. An older
+  relay refuses the track.
 - An `artwork.sha256` in a display state must name an image that the item
   holds. Else the publish gets `409 artwork_missing`. Its `mime` must be the
   stored type, else the publish gets `400 invalid_display`. The relay gets

@@ -1,7 +1,6 @@
 # Display Publication Date Task 001: The `pubDate` Key
 
-Status: Ready - 2026-11-26. Do not start before ADR 0013 has the status
-`Accepted`.
+Status: Implemented - 2026-11-26.
 
 Every criterion is mechanical. The deployment order is a gate of the review
 checklist, not of this packet.
@@ -158,3 +157,14 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-11-26. The full gate passes.
+
+- A ChatGPT run made the change from this packet. The main session read each
+  line of the diff and ran the gate.
+- `validate_display` accepts `pubDate` only when `is_calendar_day` gives
+  `true`. No other function reads the key.
+- No existing test changed its assertions.
+- The review found no defect.

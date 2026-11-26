@@ -62,11 +62,6 @@ packet.
   - SSE, `GET /metadata`, and the display routes are instant.
   - A lease expiry joins the listener timeline with the delay of the
     event's last publish, so its `{}` never arrives before the last block.
-- ADR 0005, two optional display track keys for the HLS tagger, has the
-  status `Implemented`. A display track has `artist`, `title` and `artwork`,
-  and can also have `songLine` and `value`.
-- ADR 0006, the optional display track key `album`, has the status
-  `Implemented`. A display track can also have `album`.
 - ADR 0007, listener connection limits for each client, has the status
   `Implemented`. The artifact is `docs/reviews/adr-0007-review-checklist.md`.
   The relay limits the listener connections of each client address, and the
@@ -115,18 +110,15 @@ packet.
   that its present listener value or a pending listener update names, for
   the payload image of publisher ADR 0034. `MAX_EVENT_IMAGES` (default 8) is
   the limit for each event.
-- ADR 0012, the optional display track key `playId`, has the status
-  `Implemented`. The artifact is `docs/reviews/adr-0012-review-checklist.md`.
-  A display track can also have `playId`, a string or `null`.
-- ADR 0013, one record for the optional display track keys, has the status
-  `Proposed`. It adds the key `pubDate` for publisher ADR 0042 and the key
-  `funding` for publisher ADR 0043. The relay refuses the two keys at this
-  time. The operator accepted ADR 0013. It gets
-  the status `Accepted` when publisher ADR 0042 is accepted. Do not build
-  the packet `docs/tasks/display-pub-date-task-001-pub-date-key.md` before
-  that. Do not build the packet
-  `docs/tasks/display-funding-task-001-funding-key.md` before publisher
-  ADR 0043 is also accepted.
+- ADR 0013, the optional keys of the display track, has the status
+  `Accepted`. Its two task packets are done. A display track has `artist`,
+  `title` and `artwork`, and can also have `songLine`, `value`, `album`,
+  `playId`, `pubDate` and `funding`. ADR 0013 owns the shape and the limit
+  of each optional key, and its section "The Next Key" owns how a key is
+  added. ADR 0013 becomes `Implemented` when the deployment gate of
+  `docs/reviews/adr-0013-review-checklist.md` closes: the relay on
+  `api.musicindex.org` has this change before a publisher sends `pubDate`
+  or `funding`.
 - On `api.musicindex.org`, `ADMIN_TOKEN` is set, and the service
   `live-relay` keeps the state file on the named volume
   `stophammer_live-relay-state`. The procedure for the check is in

@@ -539,7 +539,9 @@ A display state is one JSON object:
     "songLine": "Artist - Title",
     "value": { "eventGuid": "event123", "blockGuid": "block456" },
     "album": "Album Name",
-    "playId": "ls-1795656378730-2-30665"
+    "playId": "ls-1795656378730-2-30665",
+    "pubDate": "2026-11-12",
+    "funding": [{ "url": "https://example.org/support", "label": "Support" }]
   }
 }
 ```
@@ -547,18 +549,30 @@ A display state is one JSON object:
 - The object has only the key `track`.
 - `track` is `null` when nothing plays. Send `null` explicitly.
 - A `track` object has the required keys `artist`, `title` and `artwork`.
-  It can optionally have `songLine`, `value`, `album` and `playId`. `artist`
-  and `title` are strings.
+  It can also have `songLine`, `value`, `album`, `playId`, `pubDate` and
+  `funding`.
+  `artist` and `title` are strings.
 - `songLine` is an optional string of 1 to 1,024 characters. It is the ICY
-  title line that the broadcaster sends (ADR 0005).
+  title line that the broadcaster sends (ADR 0013).
 - `value` is an optional object with only the keys `eventGuid` and
   `blockGuid`. Each is a string of 1 to 128 characters. It names the live
-  value block of the track (ADR 0005).
+  value block of the track (ADR 0013).
 - `album` is an optional string of 1 to 1,024 characters. It is the album of
-  the track (ADR 0006).
-- `playId` is an optional string of 1 to 128 characters or `null` (ADR 0012).
+  the track (ADR 0013).
+- `playId` is an optional string of 1 to 128 characters or `null` (ADR 0013).
   The relay passes it through without a change. An empty string gives
   `400 invalid_display`.
+- `pubDate` is an optional 10-character string in `YYYY-MM-DD` format
+  (ADR 0013). Each digit is an ASCII digit. The date must be a calendar day.
+  `null` and an invalid date give `400 invalid_display`. The relay passes it
+  through without a change and does not compare it with its clock.
+- `funding` is an optional array of 1 to 3 entries. Each entry has a `url`
+  string of 1 to 512 characters and can have a `label` string of 1 to 128
+  characters. The URL uses `http` or `https`, has a host, and has no white
+  space or control character. A label has no white space at either end.
+  Entries cannot repeat a URL or have other keys. `null`, an empty array and
+  an array with one incorrect entry give `400 invalid_display`. The relay
+  passes the array through without a change (ADR 0013).
 - `artwork` has one of three forms:
   - `{"sha256": "…", "mime": "…"}`. `sha256` is 64 lowercase hexadecimal
     characters. `mime` is `image/jpeg` or `image/png`. The relay must hold

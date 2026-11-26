@@ -27,12 +27,6 @@ station runs continuously.
 - [ADR 0004: A delayed listener timeline for Socket.IO](adr/0004-listener-timeline-delay.md)
   — Accepted. The broadcaster sends the delay with each publish. Socket.IO and
   `GET /remoteValue` wait for it. SSE and the other reads are instant
-- [ADR 0005: The display state carries the song line and the value identity](adr/0005-display-song-line-and-value.md)
-  — Implemented. Two optional track keys, `songLine` and `value`, for the HLS
-  tagger of publisher ADR 0009
-- [ADR 0006: The display track carries the album](adr/0006-display-album.md)
-  — Implemented. One optional track key, `album`, so an app shows the album of
-  each track
 - [ADR 0007: Listener connection limits for each client](adr/0007-listener-connection-limits.md)
   — Implemented. A limit for each client address on open listener connections
   and on new connects, a global Socket.IO limit, and trust of `X-Real-IP`
@@ -51,14 +45,20 @@ station runs continuously.
   — Implemented. An event keeps each image that a pending listener update
   or the present listener value names, in the limit `MAX_EVENT_IMAGES`, for
   publisher ADR 0034
-- [ADR 0012: The display track carries the play identifier](adr/0012-display-play-id.md)
-  — Implemented. One optional track key, `playId`, for the HLS segment
-  frame of publisher ADR 0038
 - [ADR 0013: The optional keys of the display track](adr/0013-display-track-optional-keys.md)
-  — Proposed. One record for the optional track keys, with the new keys
-  `pubDate` for publisher ADR 0042 and `funding` for publisher ADR 0043. At
-  acceptance it supersedes ADR 0005,
-  ADR 0006 and ADR 0012
+  — Accepted. One record for the optional track keys `songLine`, `value`,
+  `album`, `playId`, `pubDate` and `funding`. The deployment gate is open
+
+## Archived ADRs
+
+These records are superseded. Read them for research only.
+
+- [ADR 0005: The display state carries the song line and the value identity](archive/adr/0005-display-song-line-and-value.md)
+  — Superseded by ADR 0013
+- [ADR 0006: The display track carries the album](archive/adr/0006-display-album.md)
+  — Superseded by ADR 0013
+- [ADR 0012: The display track carries the play identifier](archive/adr/0012-display-play-id.md)
+  — Superseded by ADR 0013
 
 ## Plans
 
@@ -112,13 +112,13 @@ sequential. Ready - 2026-10-06.
 - [002 — The listener timeline](tasks/listener-timeline-task-002-listener-timeline.md)
 - [003 — Expiry, delete and documents](tasks/listener-timeline-task-003-expiry-delete-and-docs.md)
 
-Packet for the display pairing plan. ADR 0005 governs it. Ready -
+Packet for the display pairing plan. ADR 0005 governed it, and ADR 0013 owns its rules. Ready -
 2026-10-06.
 
 - [001 — The song line and the value identity](tasks/display-pairing-task-001-song-line-and-value.md)
   — Implemented - 2026-10-06
 
-Packet for the display album plan. ADR 0006 governs it. Ready - 2026-10-06.
+Packet for the display album plan. ADR 0006 governed it, and ADR 0013 owns its rules. Ready - 2026-10-06.
 
 - [001 — The album key](tasks/display-album-task-001-album-key.md)
   — Implemented - 2026-10-06
@@ -151,19 +151,14 @@ Packet for ADR 0011, the listener images.
 - [001 — The listener images](tasks/image-retention-task-001-listener-images.md)
   — Implemented - 2026-11-25
 
-Packet for ADR 0013, the publication date. It starts when ADR 0013 has the
-status `Accepted`.
+Packets for ADR 0013, the publication date and the funding links.
 
 - [001 — The `pubDate` key](tasks/display-pub-date-task-001-pub-date-key.md)
-  — Ready - 2026-11-26
-
-Packet for ADR 0013, the funding links. It starts when ADR 0013 has the
-status `Accepted` and publisher ADR 0043 is accepted.
-
+  — Implemented - 2026-11-26
 - [001 — The `funding` key](tasks/display-funding-task-001-funding-key.md)
-  — Ready - 2026-11-26
+  — Implemented - 2026-11-26
 
-Packet for ADR 0012, the play identifier.
+Packet for ADR 0012, the play identifier. ADR 0013 owns its rules.
 
 - [001 — The `playId` key](tasks/display-play-id-task-001-play-id-key.md)
   — Implemented - 2026-11-26
@@ -201,6 +196,9 @@ Packet for ADR 0012, the play identifier.
 
 - [ADR 0012 review checklist](reviews/adr-0012-review-checklist.md) — the
   named artifact for the `Implemented` status of ADR 0012
+
+- [ADR 0013 review checklist](reviews/adr-0013-review-checklist.md) — open.
+  The deployment item remains
 
 ## Research
 

@@ -2,6 +2,8 @@
 
 ## Status
 
+Superseded by ADR 0013 - 2026-11-26.
+
 Implemented - 2026-11-26.
 
 Implemented 2026-11-26. The task packet is done, and the relay at commit

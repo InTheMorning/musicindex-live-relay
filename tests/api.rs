@@ -4253,7 +4253,9 @@ mod reserved {
                     "playId": "play-1",
                     "album": "Album",
                     "songLine": "Artist - Title",
-                    "value": { "eventGuid": "event123", "blockGuid": "block456" }
+                    "value": { "eventGuid": "event123", "blockGuid": "block456" },
+                    "pubDate": "2026-11-12",
+                    "funding": [{"url":"https://example.com/support","label":"Support"}]
                 }
             });
             publish_display_ok(router.clone(), &reserved, &state).await;
@@ -4329,6 +4331,159 @@ mod reserved {
             let chunk = next_sse_chunk(&mut body).await;
             assert!(chunk.contains("event: display"), "{chunk}");
             assert_eq!(chunk_data(&chunk), state);
+        }
+
+        #[tokio::test]
+        async fn a_track_with_pub_date_is_accepted_and_passed_through() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let state = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-11-12"}});
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                state
+            );
+        }
+
+        #[tokio::test]
+        async fn a_leap_day_pub_date_is_accepted() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let state = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2024-02-29"}});
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                state
+            );
+        }
+
+        #[tokio::test]
+        async fn a_track_with_pub_date_and_other_optional_keys_is_accepted() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let state = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-11-12","playId":"play-1","album":"Album","songLine":"Artist - Title","value":{"eventGuid":"event123","blockGuid":"block456"}}});
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                state
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_pub_date_gives_400() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+            let wrong: Vec<String> = [
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":""}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":null}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":123}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-02-30"}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-13-01"}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-00-10"}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-1-5"}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"20261112"}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026/11/12"}}),
+                json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-11-12T00:00:00Z"}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect();
+
+            for body in wrong {
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&authorization),
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(error_code(response).await, "invalid_display", "{body}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_subscriber_receives_pub_date() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            let first_state = next_sse_chunk(&mut body).await;
+            assert!(first_state.contains("event: display"), "{first_state}");
+            let state = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"pubDate":"2026-11-12"}});
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            let chunk = next_sse_chunk(&mut body).await;
+            assert!(chunk.contains("event: display"), "{chunk}");
+            assert_eq!(chunk_data(&chunk), state);
+        }
+
+        #[tokio::test]
+        async fn funding_is_passed_through_and_sent_to_subscribers() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let mut body = open_display_stream(router.clone(), &reserved.event_id, None).await;
+            let _ = next_sse_chunk(&mut body).await;
+            let state = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"funding":[{"url":"https://example.com/support","label":"Support"},{"url":"HTTPS://example.org/help"}]}});
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                state
+            );
+            assert_eq!(chunk_data(&next_sse_chunk(&mut body).await), state);
+        }
+
+        #[tokio::test]
+        async fn funding_accepts_three_entries_at_length_limits() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let state = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"funding":[{"url":format!("https://{}", "a".repeat(504)),"label":"l".repeat(128)},{"url":"http://example.org"},{"url":"https://example.net"}]}});
+            publish_display_ok(router.clone(), &reserved, &state).await;
+            assert_eq!(
+                read_display(router.clone(), &reserved.event_id).await,
+                state
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_funding_gives_400() {
+            let (router, _state, _clock, _dir, _) = display_app();
+            let reserved = reserve_ok(router.clone(), None).await;
+            let authorization = format!("Bearer {}", reserved.broadcaster_token);
+            let wrong = [
+                json!(null),
+                json!([]),
+                json!({}),
+                json!("x"),
+                json!([{"url":"https://a"},{"url":"https://b"},{"url":"https://c"},{"url":"https://d"}]),
+                json!(["x"]),
+                json!([{"label":"x"}]),
+                json!([{"url":"https://a","other":"x"}]),
+                json!([{"url":"ftp://example.com"}]),
+                json!([{"url":"https:///support"}]),
+                json!([{"url":"https://?a"}]),
+                json!([{"url":format!("https://{}", "a".repeat(505))}]),
+                json!([{"url":""}]),
+                json!([{"url":123}]),
+                json!([{"url":"https://example.com/a b"}]),
+                json!([{"url":"https://example.com","label":""}]),
+                json!([{"url":"https://example.com","label":"l".repeat(129)}]),
+                json!([{"url":"https://example.com","label":" x"}]),
+                json!([{"url":"https://example.com","label":"x "}]),
+                json!([{"url":"https://example.com","label":null}]),
+                json!([{"url":"https://example.com"},{"url":"https://example.com"}]),
+            ];
+            for funding in wrong {
+                let body = json!({"track":{"artist":"Artist","title":"Title","artwork":null,"funding":funding}}).to_string();
+                let response = post_display(
+                    router.clone(),
+                    &reserved.event_id,
+                    Some(&authorization),
+                    body.clone(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(error_code(response).await, "invalid_display", "{body}");
+            }
         }
 
         #[tokio::test]

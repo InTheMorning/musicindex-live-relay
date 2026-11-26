@@ -21,8 +21,8 @@ A track of a display state can have the optional key `playId`: a string of
 
 ## Files To Inspect
 
-- `docs/adr/0012-display-play-id.md`
-- `docs/adr/0006-display-album.md`
+- `docs/archive/adr/0012-display-play-id.md`
+- `docs/archive/adr/0006-display-album.md`
 - `docs/tasks/display-album-task-001-album-key.md`
 - `src/lib.rs`: `validate_display`, `is_text_of_length`, `MAX_ALBUM_CHARS`,
   `MAX_VALUE_GUID_CHARS`
@@ -110,7 +110,7 @@ Implement only this task. Do not redesign the architecture.
 
 Read:
 - AGENTS.md
-- docs/adr/0012-display-play-id.md
+- docs/archive/adr/0012-display-play-id.md
 - docs/tasks/display-play-id-task-001-play-id-key.md
 - the files of §Files To Inspect of the packet
 

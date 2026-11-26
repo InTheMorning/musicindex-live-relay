@@ -11,8 +11,8 @@ through without a change.
 
 ## Files To Inspect
 
-- `docs/adr/0006-display-album.md`
-- `docs/adr/0005-display-song-line-and-value.md`
+- `docs/archive/adr/0006-display-album.md`
+- `docs/archive/adr/0005-display-song-line-and-value.md`
 - `src/lib.rs`: `validate_display`, `is_text_of_length`,
   `MAX_SONG_LINE_CHARS`
 - `tests/api.rs`: the tests of `songLine` and `value`
@@ -84,8 +84,8 @@ You are implementing one bounded task from a larger plan.
 Implement only this task. Do not redesign the architecture.
 
 Read:
-- docs/adr/0006-display-album.md
-- docs/adr/0005-display-song-line-and-value.md
+- docs/archive/adr/0006-display-album.md
+- docs/archive/adr/0005-display-song-line-and-value.md
 - docs/tasks/display-album-task-001-album-key.md
 - src/lib.rs
 - tests/api.rs

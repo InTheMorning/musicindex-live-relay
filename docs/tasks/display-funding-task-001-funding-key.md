@@ -1,7 +1,6 @@
 # Display Funding Task 001: The `funding` Key
 
-Status: Ready - 2026-11-26. Do not start before ADR 0013 has the status
-`Accepted` and publisher ADR 0043 is accepted.
+Status: Implemented - 2026-11-26.
 
 Every criterion is mechanical. The deployment order is a gate of the review
 checklist, not of this packet.
@@ -181,3 +180,17 @@ At the end, report:
 3. behavior changed
 4. deviations from task
 5. unresolved concerns
+
+## Review Result
+
+Reviewed 2026-11-26. The full gate passes.
+
+- A ChatGPT run made the change from this packet. The main session read each
+  line of the diff and ran the gate.
+- `http_url_rest` holds the scheme check and the length check for
+  `artwork.url` and for the `funding` URL. The rule of `artwork.url` did not
+  change.
+- `validate_display` accepts `funding` only when `is_valid_funding` gives
+  `true`. No other function reads the key.
+- The main session changed the test URL of 514 characters to 513 characters,
+  and added two rules to the `README.md` text.
