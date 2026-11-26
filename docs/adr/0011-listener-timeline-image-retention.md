@@ -10,8 +10,9 @@ Implemented 2026-11-25. The named artifact is
 Accepted 2026-11-25. The operator chose the relay copy of the picture as the
 payload image fallback on 2026-11-25 (publisher ADR 0034). The orchestrator
 session relayed the task and left the design of the retention rule to this
-repository. The operator can change the limit of §The Limit and the rule of
-§The Lease End with an amendment.
+repository. The operator read a summary of this record on 2026-11-26 and
+agreed with it. The limit of §The Limit and the rule of §The Lease End stay
+as written.
 
 Proposed 2026-11-25.
 
